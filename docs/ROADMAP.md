@@ -257,12 +257,12 @@ Every module validated against real golden block data (Python cbor2 cross-checke
 - [x] Handshake: v15 accepted with magic=2
 
 **Proven via plutuz conformance suite:**
-- [x] plutuz 982/999 conformance tests PASS (98.3%)
-- 17 failures are UPSTREAM plutuz bugs (not our integration):
-  - 4 BLS12-381 multiScalarMul edge cases: plutuz succeeds where Haskell fails (consensus-critical — plutuz would accept scripts Haskell rejects)
-  - 13 valueData/unValueData budget mismatches: correct results but wrong cost accounting (Conway-era builtins with outdated cost coefficients)
-- These need upstream fixes in plutuz or patches we contribute
-- 98.3% of all known Plutus programs evaluate identically to the Haskell node
+- [x] plutuz 999/999 conformance tests PASS (100%)
+- We fixed 17 upstream plutuz bugs:
+  - 4 BLS12-381 multiScalarMul: added scalar bounds validation per Haskell BLS12_381/Bounds.hs (4096-bit signed range check)
+  - 13 valueData/unValueData: corrected cost model coefficients from builtinCostModelC.json (intercept/slope fixes)
+- Every known Plutus program now evaluates identically to the Haskell node
+- Fixes are in our local reference-plutuz (to be submitted upstream to rvcas)
 
 **Deferred to later phases (require chain state):**
 - [ ] Compute script_data_hash (needs genesis cost model — Phase 7)
