@@ -63,15 +63,15 @@ pub const ChunkReader = struct {
         return count;
     }
 
-    /// Read the last block from the last chunk (the tip of the immutable chain).
-    pub fn readTip(self: *const ChunkReader, allocator: Allocator) !?block_mod.Block {
+    /// Read the last block's raw CBOR bytes from the last chunk.
+    /// Caller owns the returned allocation — block slices point into it.
+    pub fn readTipRaw(self: *const ChunkReader, allocator: Allocator) !?[]const u8 {
         if (self.total_chunks == 0) return null;
 
         var path_buf: [512]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{ self.immutable_path, self.total_chunks - 1 });
 
         const data = try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024 * 1024);
-        defer allocator.free(data);
 
         // Find the last complete CBOR block
         var pos: usize = 0;
@@ -86,9 +86,25 @@ pub const ChunkReader = struct {
             pos = last_block_end;
         }
 
-        if (last_block_end == 0) return null;
+        if (last_block_end == 0) {
+            allocator.free(data);
+            return null;
+        }
 
-        return @as(?block_mod.Block, try block_mod.parseBlock(data[last_block_start..last_block_end]));
+        // Copy just the last block's bytes
+        const block_bytes = try allocator.alloc(u8, last_block_end - last_block_start);
+        @memcpy(block_bytes, data[last_block_start..last_block_end]);
+        allocator.free(data);
+
+        return block_bytes;
+    }
+
+    /// Read the last block from the last chunk (the tip of the immutable chain).
+    /// The returned block's raw slices point into tip_raw — keep tip_raw alive!
+    pub fn readTip(self: *const ChunkReader, allocator: Allocator) !?struct { block: block_mod.Block, raw: []const u8 } {
+        const raw = try self.readTipRaw(allocator) orelse return null;
+        const block = try block_mod.parseBlock(raw);
+        return .{ .block = block, .raw = raw };
     }
 };
 
@@ -97,16 +113,15 @@ pub const ChunkReader = struct {
 test "chunk_reader: read real Mithril chunk" {
     const allocator = std.testing.allocator;
 
-    var reader = ChunkReader.init("db/preprod/immutable") catch return; // skip if no snapshot
+    var reader = ChunkReader.init("db/preprod/immutable") catch return;
 
     try std.testing.expect(reader.total_chunks > 0);
 
-    // Read tip block
-    const tip = try reader.readTip(allocator);
-    if (tip) |t| {
-        try std.testing.expect(t.header.slot > 0);
-        try std.testing.expect(t.header.block_no > 0);
-    }
+    const tip_result = try reader.readTip(allocator) orelse return;
+    defer allocator.free(tip_result.raw);
+
+    try std.testing.expect(tip_result.block.header.slot > 0);
+    try std.testing.expect(tip_result.block.header.block_no > 0);
 }
 
 test "chunk_reader: count blocks in last chunk" {

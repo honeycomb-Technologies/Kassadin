@@ -68,6 +68,7 @@ pub const node = struct {
     pub const mithril = @import("node/mithril.zig");
     pub const snapshot_restore = @import("node/snapshot_restore.zig");
     pub const chunk_reader = @import("node/chunk_reader.zig");
+    pub const bootstrap_sync = @import("node/bootstrap_sync.zig");
 };
 
 pub fn main() !void {
@@ -128,14 +129,36 @@ pub fn main() !void {
             };
             std.debug.print("Bootstrap complete! Run 'kassadin sync' to continue from tip.\n", .{});
         }
+    } else if (args.len > 1 and std.mem.eql(u8, args[1], "bootstrap-sync")) {
+        // Sync forward from Mithril snapshot tip
+        std.debug.print("Kassadin — Bootstrap Sync (preprod)\n\n", .{});
+
+        const result = node.bootstrap_sync.bootstrapSync(
+            std.heap.page_allocator,
+            "db/preprod/immutable",
+            "preprod-node.play.dev.cardano.org",
+            3001,
+            network.protocol.NetworkMagic.preprod,
+            100, // max 100 blocks forward
+        ) catch |err| {
+            std.debug.print("Bootstrap sync failed: {}\n", .{err});
+            return;
+        };
+
+        std.debug.print("\nBootstrap sync complete:\n", .{});
+        std.debug.print("  Snapshot tip: block={}, slot={}\n", .{ result.snapshot_tip_block, result.snapshot_tip_slot });
+        std.debug.print("  Headers synced forward: {}\n", .{result.headers_synced_forward});
+        std.debug.print("  Network tip: block={}, slot={}\n", .{ result.network_tip_block, result.network_tip_slot });
+        std.debug.print("  Rollbacks: {}\n", .{result.rollbacks});
     } else {
         std.debug.print("Kassadin — Cardano Node in Zig\n", .{});
         std.debug.print("Version: 0.1.0\n", .{});
         std.debug.print("\nUsage:\n", .{});
-        std.debug.print("  kassadin bootstrap    Show latest Mithril snapshot info\n", .{});
-        std.debug.print("  kassadin bootstrap --download    Download and restore snapshot\n", .{});
-        std.debug.print("  kassadin sync         Sync headers from preview network\n", .{});
-        std.debug.print("  kassadin              Show this help\n", .{});
+        std.debug.print("  kassadin bootstrap           Show latest Mithril snapshot info\n", .{});
+        std.debug.print("  kassadin bootstrap --download Download and restore snapshot\n", .{});
+        std.debug.print("  kassadin bootstrap-sync       Sync forward from Mithril snapshot\n", .{});
+        std.debug.print("  kassadin sync                 Sync headers from preview network\n", .{});
+        std.debug.print("  kassadin                      Show this help\n", .{});
     }
 }
 
