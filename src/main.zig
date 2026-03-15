@@ -31,6 +31,10 @@ pub const storage = struct {
     pub const chaindb = @import("storage/chaindb.zig");
 };
 
+pub const ledger = struct {
+    pub const block = @import("ledger/block.zig");
+};
+
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     try stdout.print("Kassadin — Cardano Node in Zig\n", .{});
