@@ -49,6 +49,8 @@ pub const ledger = struct {
 
 pub const consensus = struct {
     pub const praos = @import("consensus/praos.zig");
+    pub const leader = @import("consensus/leader.zig");
+    pub const header_validation = @import("consensus/header_validation.zig");
 };
 
 pub const mempool = @import("mempool/mempool.zig");
