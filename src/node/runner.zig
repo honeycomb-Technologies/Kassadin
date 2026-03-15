@@ -51,7 +51,7 @@ pub const RunResult = struct {
     genesis_loaded: bool,
 };
 
-/// Run the node: load config, connect, sync.
+/// Run the node: load config, optionally restore from snapshot, connect, sync.
 pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     var result = RunResult{
         .headers_synced = 0,
