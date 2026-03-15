@@ -120,7 +120,23 @@ pub fn bootstrapSync(
                 result.network_tip_slot = rf.tip.slot;
                 result.network_tip_block = rf.tip.block_no;
 
-                if (synced <= 5 or synced % 100 == 0) {
+                // Parse the header — now safe since peer keeps response alive
+                if (rf.header_raw.len > 2) {
+                    var hdr_dec = Decoder.init(rf.header_raw);
+                    if (hdr_dec.decodeArrayLen() catch null) |arr_len| {
+                        if (arr_len == 2) {
+                            // HFC wrapped header: [era_tag, inner_header]
+                            if (hdr_dec.decodeUint() catch null) |era_tag| {
+                                result.blocks_parsed += 1;
+                                if (synced <= 5 or synced % 100 == 0) {
+                                    std.debug.print("  Header {}: era={} tip_slot={}\n", .{
+                                        synced, era_tag, rf.tip.slot,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                } else if (synced <= 5 or synced % 100 == 0) {
                     std.debug.print("  Header {}: tip_slot={}, tip_block={}\n", .{
                         synced, rf.tip.slot, rf.tip.block_no,
                     });

@@ -15,6 +15,7 @@ pub const Peer = struct {
     stream: std.net.Stream,
     bearer: mux.Bearer,
     negotiated_version: ?u64,
+    last_cs_response: ?[]u8 = null,
 
     /// Connect to a Cardano node via TCP and perform N2N handshake.
     pub fn connect(allocator: Allocator, host: []const u8, port: u16, magic: u32) !Peer {
@@ -41,12 +42,13 @@ pub const Peer = struct {
     }
 
     pub fn close(self: *Peer) void {
+        if (self.last_cs_response) |resp| self.allocator.free(resp);
         self.stream.close();
     }
 
     // ── Chain-Sync operations ──
 
-    /// Send MsgFindIntersect with empty points (start from genesis).
+    /// Send MsgFindIntersect.
     pub fn chainSyncFindIntersect(self: *Peer, points: []const chainsync.Point) !chainsync.ChainSyncMsg {
         const msg_bytes = try chainsync.encodeMsg(self.allocator, .{
             .find_intersect = .{ .points = points },
@@ -59,16 +61,23 @@ pub const Peer = struct {
             msg_bytes,
         );
 
+        if (self.last_cs_response) |prev| {
+            self.allocator.free(prev);
+        }
+
         const response = try self.bearer.readProtocolMessage(
             @intFromEnum(protocol.MiniProtocolNum.chain_sync),
             self.allocator,
         );
-        defer self.allocator.free(response);
+        self.last_cs_response = response;
 
         return chainsync.decodeMsg(response);
     }
 
     /// Send MsgRequestNext and read the response.
+    /// Note: The returned ChainSyncMsg may contain slices (header_raw) that point
+    /// into an internal buffer. These are only valid until the next call to
+    /// chainSyncRequestNext. For long-lived header data, copy it immediately.
     pub fn chainSyncRequestNext(self: *Peer) !chainsync.ChainSyncMsg {
         const msg_bytes = try chainsync.encodeMsg(self.allocator, .request_next);
         defer self.allocator.free(msg_bytes);
@@ -79,11 +88,16 @@ pub const Peer = struct {
             msg_bytes,
         );
 
+        // Free previous response if any
+        if (self.last_cs_response) |prev| {
+            self.allocator.free(prev);
+        }
+
         const response = try self.bearer.readProtocolMessage(
             @intFromEnum(protocol.MiniProtocolNum.chain_sync),
             self.allocator,
         );
-        defer self.allocator.free(response);
+        self.last_cs_response = response;
 
         return chainsync.decodeMsg(response);
     }
