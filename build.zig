@@ -95,4 +95,21 @@ pub fn build(b: *std.Build) void {
     run_live.step.dependOn(b.getInstallStep());
     const live_step = b.step("test-live", "Run live network tests (requires internet)");
     live_step.dependOn(&run_live.step);
+
+    // --- Phase 3 block validation test ---
+    const block_test = b.addExecutable(.{
+        .name = "test-blocks",
+        .root_source_file = b.path("tests/test_real_blocks.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    block_test.root_module.addImport("kassadin", kassadin_mod);
+    block_test.linkSystemLibrary("sodium");
+    block_test.linkLibC();
+    b.installArtifact(block_test);
+
+    const run_blocks = b.addRunArtifact(block_test);
+    run_blocks.step.dependOn(b.getInstallStep());
+    const blocks_step = b.step("test-blocks", "Run real block parsing validation");
+    blocks_step.dependOn(&run_blocks.step);
 }

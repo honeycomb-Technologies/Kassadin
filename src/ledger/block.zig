@@ -57,27 +57,57 @@ pub const Block = struct {
 };
 
 /// Parse a Cardano block from raw CBOR bytes.
-/// Supports both HFC-wrapped blocks (era tag) and raw Shelley+ blocks.
+/// Supports:
+/// - N2N format: tag(24) + bytes([era_id, block]) — ouroboros-consensus golden files
+/// - HFC-wrapped: [era_id, block] — direct HFC encoding
+/// - Raw block: array(4) or array(5) — era-specific block without wrapping
 pub fn parseBlock(data: []const u8) !Block {
     var dec = Decoder.init(data);
 
-    // Check if this is an HFC-wrapped block: array(2) with era tag
-    const first_byte = try dec.peekByte();
-
     var era: Era = .shelley;
+
+    // Check for CBOR tag 24 wrapping (N2N serialization)
+    const first_byte = try dec.peekByte();
+    if (first_byte == 0xd8) {
+        // Tag follows — check if it's tag 24
+        const tag = try dec.decodeTag();
+        if (tag == 24) {
+            // CBOR-in-CBOR: decode inner bytestring
+            const inner_bytes = try dec.decodeBytes();
+            // Recurse on the inner bytes
+            return parseBlock(inner_bytes);
+        }
+        // Other tags — not supported yet
+        return error.InvalidCbor;
+    }
 
     if (first_byte == 0x82) {
         // array(2) — HFC wrapping: [era_id, era_block]
         _ = try dec.decodeArrayLen();
         const era_id = try dec.decodeUint();
-        era = @enumFromInt(@as(u8, @intCast(era_id)));
+        // N2N era IDs are offset: Byron=0, Shelley=1, Allegra=2, Mary=3, Alonzo=4, Babbage=5, Conway=6
+        // But ouroboros-consensus uses: Shelley=2, Allegra=3, Mary=4, Alonzo=5, Babbage=6, Conway=7
+        // Map to our internal Era enum
+        if (era_id <= 7) {
+            era = switch (era_id) {
+                0 => .byron,
+                1 => .shelley,
+                2 => .shelley, // N2N Shelley can be tagged as 2
+                3 => .allegra,
+                4 => .mary,
+                5 => .alonzo,
+                6 => .babbage,
+                7 => .conway,
+                else => return error.InvalidCbor,
+            };
+        } else {
+            return error.InvalidCbor;
+        }
         // The remaining data is the era-specific block
     } else if (first_byte == 0x85) {
-        // array(5) — raw Alonzo+ block (no HFC wrapping)
-        era = .alonzo; // Default to Alonzo for 5-element blocks
+        era = .alonzo; // array(5) = Alonzo+
     } else if (first_byte == 0x84) {
-        // array(4) — raw Shelley block (no HFC wrapping)
-        era = .shelley;
+        era = .shelley; // array(4) = pre-Alonzo
     }
 
     // Parse block structure: [header, tx_bodies, tx_witnesses, aux_data, ?invalid_txs]
@@ -125,11 +155,10 @@ pub fn parseBlock(data: []const u8) !Block {
     var vrf_vkey: [32]u8 = undefined;
     @memcpy(&vrf_vkey, vrf_vkey_bytes);
 
-    // VRF result(s) — pre-Babbage has 2 (leader + nonce), Babbage+ has 1
-    try hb_dec.skipValue(); // VRF result 1 (leader VRF or single result)
+    // VRF result(s) — pre-Babbage (15 fields) has 2 VRF results, Babbage+ (10 fields) has 1
+    try hb_dec.skipValue(); // VRF result 1
     if (hb_len >= 15) {
-        // Pre-Babbage: 15 fields means two VRF results
-        try hb_dec.skipValue(); // VRF result 2 (nonce VRF)
+        try hb_dec.skipValue(); // VRF result 2 (nonce VRF, pre-Babbage only)
     }
 
     // block_body_size
@@ -141,27 +170,33 @@ pub fn parseBlock(data: []const u8) !Block {
     var body_hash: Hash32 = undefined;
     @memcpy(&body_hash, body_hash_bytes);
 
-    // Operational certificate: [hot_vkey(32), seq_no, kes_period, cold_sig(64)]
-    // In Alonzo it's individual fields, not a sub-array
-    // Skip all opcert fields
-    try hb_dec.skipValue(); // hot_vkey or opcert array
-    try hb_dec.skipValue(); // seq_no
-    try hb_dec.skipValue(); // kes_period
-    try hb_dec.skipValue(); // cold_sig
+    // Operational certificate — format varies by era:
+    // Pre-Babbage (15 fields): 4 separate fields (vkey, seq, period, sig)
+    // Babbage+ (10 fields): 1 array of 4 elements [vkey, seq, period, sig]
+    if (hb_len <= 10) {
+        // Babbage+: opcert is a single array
+        try hb_dec.skipValue(); // [hot_vkey, seq, period, sig]
+    } else {
+        // Pre-Babbage: 4 separate fields
+        try hb_dec.skipValue(); // hot_vkey
+        try hb_dec.skipValue(); // seq_no
+        try hb_dec.skipValue(); // kes_period
+        try hb_dec.skipValue(); // cold_sig
+    }
 
-    // Protocol version: [major, minor] or individual fields
+    // Protocol version — format varies:
+    // Babbage+ (10 fields): array [major, minor]
+    // Pre-Babbage (15 fields): 2 separate uint fields
     var pv_major: u64 = 0;
     var pv_minor: u64 = 0;
     const pv_peek = try hb_dec.peekMajorType();
     if (pv_peek == 4) {
-        // array
         const pv_arr = try hb_dec.decodeArrayLen() orelse return error.InvalidCbor;
         if (pv_arr >= 2) {
             pv_major = try hb_dec.decodeUint();
             pv_minor = try hb_dec.decodeUint();
         }
     } else {
-        // individual fields
         pv_major = try hb_dec.decodeUint();
         pv_minor = try hb_dec.decodeUint();
     }
@@ -232,10 +267,7 @@ test "block: parse real Alonzo golden block" {
     try std.testing.expect(block.invalid_txs_raw != null); // Alonzo has invalid_txs
 }
 
-test "block: era detection" {
-    // array(5) starting byte = 0x85 → Alonzo
-    // We can't construct a full valid block easily, so just verify the parser
-    // handles the golden block correctly
+test "block: era detection — raw Alonzo" {
     const block_data = std.fs.cwd().readFileAlloc(
         std.testing.allocator,
         "tests/vectors/alonzo_block.cbor",
@@ -247,7 +279,39 @@ test "block: era detection" {
     defer std.testing.allocator.free(block_data);
 
     const block = try parseBlock(block_data);
-
-    // The golden block starts with 0x85 (array 5), which we default to Alonzo
     try std.testing.expectEqual(Era.alonzo, block.era);
+}
+
+test "block: parse N2N golden blocks from ouroboros-consensus" {
+    const allocator = std.testing.allocator;
+    const eras = [_]struct { file: []const u8, expected_era: Era }{
+        .{ .file = "tests/vectors/golden_block_shelley.cbor", .expected_era = .shelley },
+        .{ .file = "tests/vectors/golden_block_allegra.cbor", .expected_era = .allegra },
+        .{ .file = "tests/vectors/golden_block_mary.cbor", .expected_era = .mary },
+        .{ .file = "tests/vectors/golden_block_alonzo.cbor", .expected_era = .alonzo },
+        .{ .file = "tests/vectors/golden_block_babbage.cbor", .expected_era = .babbage },
+        .{ .file = "tests/vectors/golden_block_conway.cbor", .expected_era = .conway },
+    };
+
+    for (eras) |era_test| {
+        const data = std.fs.cwd().readFileAlloc(allocator, era_test.file, 10 * 1024 * 1024) catch |err| {
+            if (err == error.FileNotFound) continue;
+            return err;
+        };
+        defer allocator.free(data);
+
+        const block = parseBlock(data) catch |err| {
+            std.debug.print("Failed to parse {s}: {}\n", .{ era_test.file, err });
+            return err;
+        };
+
+        // Verify era detected correctly
+        try std.testing.expectEqual(era_test.expected_era, block.era);
+
+        // Verify basic header fields are populated
+        try std.testing.expect(block.header.issuer_vkey.len == 32);
+        try std.testing.expect(block.header.vrf_vkey.len == 32);
+        try std.testing.expect(block.tx_bodies_raw.len > 0);
+        try std.testing.expect(block.tx_witnesses_raw.len > 0);
+    }
 }
