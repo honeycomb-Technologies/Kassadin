@@ -12,7 +12,7 @@ The Ouroboros network layer runs multiple typed state-machine protocols over a s
 ```
 Byte 0-3: transmission_time (u32, microseconds, monotonic clock lower 32 bits)
 Byte 4-5: protocol_info (u16)
-           Bit 15: direction (1=Initiator, 0=Responder)
+           Bit 15: direction (0=Initiator, 1=Responder)
            Bits 14-0: mini_protocol_num (0-16383)
 Byte 6-7: payload_length (u16, 0-65535)
 Byte 8+:  payload (payload_length bytes)
@@ -41,8 +41,8 @@ pub const MiniProtocolNum = enum(u15) {
 };
 
 pub const Direction = enum(u1) {
-    responder = 0,
-    initiator = 1,
+    initiator = 0,    // bit 15 clear on wire
+    responder = 1,    // bit 15 set (ORed with 0x8000)
 };
 ```
 
