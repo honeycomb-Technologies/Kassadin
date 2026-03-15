@@ -60,6 +60,11 @@ pub fn decodeHeader(bytes: *const [header_length]u8) SDUHeader {
 pub const Bearer = struct {
     stream: std.net.Stream,
 
+    /// Per-protocol ingress buffers for multi-SDU reassembly.
+    /// Following the Haskell mux design (Network/Mux/Ingress.hs):
+    /// one buffer per protocol number for demultiplexing interleaved SDUs.
+    ingress_buffers: [16]IngressBuffer = [_]IngressBuffer{IngressBuffer{}} ** 16,
+
     /// Read one complete SDU (header + payload). Caller must provide buffer.
     /// Returns the decoded header and a slice of the payload within buf.
     pub fn readSDU(self: *Bearer, buf: []u8) !struct { header: SDUHeader, payload: []const u8 } {
@@ -117,34 +122,72 @@ pub const Bearer = struct {
         }
     }
 
-    /// Read a complete protocol message that may span multiple SDUs.
-    /// Reassembles fragments until a complete CBOR value is available.
-    pub fn readProtocolMessage(self: *Bearer, protocol_num: u15, allocator: std.mem.Allocator) ![]u8 {
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(allocator);
+    const IngressBuffer = struct {
+        data: [256 * 1024]u8 = undefined, // 256KB per protocol (enough for large blocks)
+        len: usize = 0,
 
-        var buf: [max_sdu_payload]u8 = undefined;
-
-        while (true) {
-            const sdu = try self.readSDU(&buf);
-
-            // Verify this SDU is for the expected protocol
-            if (sdu.header.protocol_num != protocol_num) {
-                // For now, skip SDUs for other protocols
-                // TODO: proper demuxing with per-protocol queues
-                continue;
-            }
-
-            try result.appendSlice(allocator, sdu.payload);
-
-            // Check if we have a complete CBOR value
-            // A simple heuristic: try to decode the CBOR and see if it consumes all bytes
-            // For now, assume single-SDU messages (most protocol messages fit in one SDU)
-            // Multi-SDU reassembly for large blocks will be improved in peer.zig
-            break;
+        fn append(self: *IngressBuffer, payload: []const u8) !void {
+            if (self.len + payload.len > self.data.len) return error.IngressOverflow;
+            @memcpy(self.data[self.len..][0..payload.len], payload);
+            self.len += payload.len;
         }
 
-        return result.toOwnedSlice(allocator);
+        fn slice(self: *const IngressBuffer) []const u8 {
+            return self.data[0..self.len];
+        }
+
+        fn clear(self: *IngressBuffer) void {
+            self.len = 0;
+        }
+    };
+
+    /// Read a complete protocol message that may span multiple SDUs.
+    ///
+    /// Following the Haskell mux design (Network/Mux.hs, Network/Mux/Ingress.hs):
+    /// 1. Read SDUs from the bearer
+    /// 2. Buffer SDU payloads per protocol (demultiplexing)
+    /// 3. After each SDU, try to parse a complete CBOR value from the buffer
+    /// 4. If complete, return the message bytes
+    /// 5. If incomplete, read more SDUs
+    ///
+    /// The mux does NOT know message boundaries — CBOR framing determines
+    /// when a complete message has been received.
+    pub fn readProtocolMessage(self: *Bearer, protocol_num: u15, allocator: std.mem.Allocator) ![]u8 {
+        const Decoder = @import("../cbor/decoder.zig").Decoder;
+
+        var sdu_buf: [max_sdu_payload]u8 = undefined;
+        const buf_idx: usize = @intCast(@min(protocol_num, 15));
+
+        while (true) {
+            // Check if we already have a complete CBOR value in the buffer
+            const buffered = self.ingress_buffers[buf_idx].slice();
+            if (buffered.len > 0) {
+                var dec = Decoder.init(buffered);
+                if (dec.sliceOfNextValue()) |complete_msg| {
+                    // Found a complete CBOR message
+                    const result = try allocator.alloc(u8, complete_msg.len);
+                    @memcpy(result, complete_msg);
+
+                    // Shift remaining bytes to front of buffer
+                    const remaining = buffered.len - dec.pos;
+                    if (remaining > 0) {
+                        std.mem.copyForwards(u8, self.ingress_buffers[buf_idx].data[0..remaining], buffered[dec.pos..]);
+                    }
+                    self.ingress_buffers[buf_idx].len = remaining;
+
+                    return result;
+                } else |_| {
+                    // Incomplete CBOR — need more data
+                }
+            }
+
+            // Read one SDU from the wire
+            const sdu = try self.readSDU(&sdu_buf);
+
+            // Demux: buffer the payload for its protocol
+            const sdu_buf_idx: usize = @intCast(@min(sdu.header.protocol_num, 15));
+            try self.ingress_buffers[sdu_buf_idx].append(sdu.payload);
+        }
     }
 
     // -- Internal helpers --
