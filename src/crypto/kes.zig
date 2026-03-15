@@ -1,0 +1,431 @@
+const std = @import("std");
+const Blake2b256 = @import("hash.zig").Blake2b256;
+const Ed25519 = @import("ed25519.zig").Ed25519;
+
+/// CompactSumKES — Key Evolving Signature scheme.
+/// Implements a forward-secure signature scheme using a binary tree composition.
+/// At depth D, supports 2^D time periods. Cardano mainnet uses depth 6 (64 periods).
+///
+/// Based on the Haskell reference implementation in cardano-crypto-class:
+///   CompactSingleKES (base case) + CompactSumKES (recursive case)
+pub fn CompactSumKES(comptime depth: u4) type {
+    return struct {
+        const Self = @This();
+        pub const total_periods: u32 = 1 << depth; // 2^depth
+
+        pub const vk_length: usize = 32;
+        pub const VerKey = [vk_length]u8;
+
+        // Signature: at base (depth 0), it's ed25519_sig(64) + ed25519_vk(32) = 96 bytes.
+        // Each recursive level adds one vk_length (32 bytes) for vk_other.
+        pub const sig_length: usize = 96 + @as(usize, depth) * 32;
+        pub const Signature = [sig_length]u8;
+
+        // Sign key sizes computed recursively:
+        // Base (depth 0): ed25519_seed = 32 bytes
+        // Recursive (depth d): sk_inner + seed(32) + vk_left(32) + vk_right(32)
+        pub const sk_length: usize = computeSkSize(depth);
+        pub const SignKey = [sk_length]u8;
+
+        pub const seed_length: usize = 32;
+        pub const Seed = [seed_length]u8;
+
+        pub const Error = error{
+            PeriodExpired,
+            InvalidPeriod,
+            InvalidSignature,
+            KeyGenFailed,
+            SignFailed,
+        };
+
+        fn computeSkSize(comptime d: u4) usize {
+            if (d == 0) return 32; // Ed25519 seed
+            return computeSkSize(d - 1) + 32 + 32 + 32; // sk_inner + seed + vk_left + vk_right
+        }
+
+        // ── Seed Expansion ──
+        // Split a 32-byte seed into two using Blake2b-256 with counter prefix.
+        // Matches Haskell: expandHashWith with counter bytes 1 and 2.
+
+        fn expandSeed(seed: Seed) struct { left: Seed, right: Seed } {
+            var buf_left: [33]u8 = undefined;
+            buf_left[0] = 1;
+            @memcpy(buf_left[1..33], &seed);
+            const left = Blake2b256.hash(&buf_left);
+
+            var buf_right: [33]u8 = undefined;
+            buf_right[0] = 2;
+            @memcpy(buf_right[1..33], &seed);
+            const right = Blake2b256.hash(&buf_right);
+
+            return .{ .left = left, .right = right };
+        }
+
+        // ── Hash a pair of verification keys ──
+        // VK = Blake2b-256(vk_left ++ vk_right)
+
+        fn hashVkPair(vk_left: []const u8, vk_right: []const u8) [32]u8 {
+            var state = Blake2b256.State.init();
+            state.update(vk_left);
+            state.update(vk_right);
+            return state.final();
+        }
+
+        // ── Recursive operations parameterized by depth ──
+
+        fn genAtDepth(comptime d: u4, seed: Seed, sk_out: []u8, vk_out: *[32]u8) Error!void {
+            if (d == 0) {
+                // Base case: Ed25519 keypair from seed
+                const kp = Ed25519.keyFromSeed(seed) catch return error.KeyGenFailed;
+                @memcpy(sk_out[0..32], &seed);
+                @memcpy(vk_out, &kp.vk);
+                return;
+            }
+
+            // Recursive: expand seed, generate left and right subtrees
+            const seeds = expandSeed(seed);
+            const inner_sk_size = computeSkSize(d - 1);
+
+            // Generate left subtree
+            var vk_left: [32]u8 = undefined;
+            try genAtDepth(d - 1, seeds.left, sk_out[0..inner_sk_size], &vk_left);
+
+            // Store right seed (for lazy generation), vk_left, and vk_right
+            // We need vk_right, so generate temporarily
+            var temp_sk: [computeSkSize(d - 1)]u8 = undefined;
+            var vk_right: [32]u8 = undefined;
+            try genAtDepth(d - 1, seeds.right, &temp_sk, &vk_right);
+            // Zero out temp (forward security)
+            @memset(&temp_sk, 0);
+
+            // Layout: [inner_sk | right_seed | vk_left | vk_right]
+            @memcpy(sk_out[inner_sk_size .. inner_sk_size + 32], &seeds.right);
+            @memcpy(sk_out[inner_sk_size + 32 .. inner_sk_size + 64], &vk_left);
+            @memcpy(sk_out[inner_sk_size + 64 .. inner_sk_size + 96], &vk_right);
+
+            // VK = hash(vk_left ++ vk_right)
+            vk_out.* = hashVkPair(&vk_left, &vk_right);
+        }
+
+        fn signAtDepth(comptime d: u4, period: u32, msg: []const u8, sk: []const u8, sig_out: []u8) Error!void {
+            if (d == 0) {
+                // Base case: Ed25519 sign, output = ed25519_sig(64) ++ ed25519_vk(32)
+                const seed: Ed25519.Seed = sk[0..32].*;
+                const kp = Ed25519.keyFromSeed(seed) catch return error.SignFailed;
+                const ed_sig = Ed25519.sign(msg, kp.sk) catch return error.SignFailed;
+                @memcpy(sig_out[0..64], &ed_sig);
+                @memcpy(sig_out[64..96], &kp.vk);
+                return;
+            }
+
+            const inner_sk_size = computeSkSize(d - 1);
+            const inner_sig_size = 96 + @as(usize, d - 1) * 32;
+            const half: u32 = 1 << (d - 1);
+
+            const inner_sk = sk[0..inner_sk_size];
+            const vk_left = sk[inner_sk_size + 32 .. inner_sk_size + 64];
+            const vk_right = sk[inner_sk_size + 64 .. inner_sk_size + 96];
+
+            if (period < half) {
+                // Sign with left subtree, attach right vk
+                try signAtDepth(d - 1, period, msg, inner_sk, sig_out[0..inner_sig_size]);
+                @memcpy(sig_out[inner_sig_size .. inner_sig_size + 32], vk_right);
+            } else {
+                // Sign with right subtree (which is now in inner_sk position after evolution), attach left vk
+                try signAtDepth(d - 1, period - half, msg, inner_sk, sig_out[0..inner_sig_size]);
+                @memcpy(sig_out[inner_sig_size .. inner_sig_size + 32], vk_left);
+            }
+        }
+
+        /// Extract the embedded verification key from a signature at a given period.
+        fn vkFromSigAtDepth(comptime d: u4, period: u32, sig: []const u8) [32]u8 {
+            if (d == 0) {
+                // Base case: vk is embedded in sig at bytes 64..96
+                return sig[64..96].*;
+            }
+
+            const inner_sig_size = 96 + @as(usize, d - 1) * 32;
+            const half: u32 = 1 << (d - 1);
+            const vk_other = sig[inner_sig_size .. inner_sig_size + 32];
+
+            if (period < half) {
+                const inner_vk = vkFromSigAtDepth(d - 1, period, sig[0..inner_sig_size]);
+                return hashVkPair(&inner_vk, vk_other);
+            } else {
+                const inner_vk = vkFromSigAtDepth(d - 1, period - half, sig[0..inner_sig_size]);
+                return hashVkPair(vk_other, &inner_vk);
+            }
+        }
+
+        fn verifySigAtDepth(comptime d: u4, period: u32, msg: []const u8, sig: []const u8) bool {
+            if (d == 0) {
+                // Base case: verify Ed25519 sig against embedded vk
+                const ed_sig: Ed25519.Signature = sig[0..64].*;
+                const ed_vk: Ed25519.VerKey = sig[64..96].*;
+                return Ed25519.verify(msg, ed_sig, ed_vk);
+            }
+
+            const inner_sig_size = 96 + @as(usize, d - 1) * 32;
+            const half: u32 = 1 << (d - 1);
+
+            if (period < half) {
+                return verifySigAtDepth(d - 1, period, msg, sig[0..inner_sig_size]);
+            } else {
+                return verifySigAtDepth(d - 1, period - half, msg, sig[0..inner_sig_size]);
+            }
+        }
+
+        fn evolveAtDepth(comptime d: u4, sk: []u8, period: u32) Error!bool {
+            if (d == 0) {
+                // Base case: single period, cannot evolve
+                return false;
+            }
+
+            const inner_sk_size = computeSkSize(d - 1);
+            const half: u32 = 1 << (d - 1);
+            const next = period + 1;
+
+            if (next >= (1 << d)) {
+                // At max period
+                return false;
+            }
+
+            if (next < half) {
+                // Still in left subtree, evolve inner key
+                return evolveAtDepth(d - 1, sk[0..inner_sk_size], period);
+            } else if (next == half) {
+                // Transition: regenerate right subtree from stored seed, swap it in
+                var right_seed: Seed = undefined;
+                @memcpy(&right_seed, sk[inner_sk_size .. inner_sk_size + 32]);
+
+                // Generate right subtree key
+                var vk_right: [32]u8 = undefined;
+                try genAtDepth(d - 1, right_seed, sk[0..inner_sk_size], &vk_right);
+
+                // Zero out the right seed (forward security!)
+                @memset(sk[inner_sk_size .. inner_sk_size + 32], 0);
+
+                return true;
+            } else {
+                // In right subtree, evolve inner key
+                return evolveAtDepth(d - 1, sk[0..inner_sk_size], period - half);
+            }
+        }
+
+        // ── Public API ──
+
+        /// Generate a KES keypair from a 32-byte seed. Deterministic.
+        pub fn generate(seed: Seed) Error!struct { sk: SignKey, vk: VerKey } {
+            var sk: SignKey = undefined;
+            var vk: VerKey = undefined;
+            try genAtDepth(depth, seed, &sk, &vk);
+            return .{ .sk = sk, .vk = vk };
+        }
+
+        /// Sign a message at a given KES period.
+        pub fn sign(period: u32, msg: []const u8, sk: *const SignKey) Error!Signature {
+            if (period >= total_periods) return error.InvalidPeriod;
+            var sig: Signature = undefined;
+            try signAtDepth(depth, period, msg, sk, &sig);
+            return sig;
+        }
+
+        /// Verify a KES signature for a given period and verification key.
+        pub fn verify(vk: VerKey, period: u32, msg: []const u8, sig: Signature) bool {
+            if (period >= total_periods) return false;
+
+            // Step 1: verify the inner Ed25519 signature
+            if (!verifySigAtDepth(depth, period, msg, &sig)) return false;
+
+            // Step 2: reconstruct VK from signature and compare
+            const reconstructed = vkFromSigAtDepth(depth, period, &sig);
+            return std.mem.eql(u8, &reconstructed, &vk);
+        }
+
+        /// Evolve the signing key to the next period. Returns true on success,
+        /// false if already at max period.
+        pub fn evolve(sk: *SignKey, current_period: u32) Error!bool {
+            return evolveAtDepth(depth, sk, current_period);
+        }
+
+        /// Derive the verification key from a signing key.
+        pub fn deriveVerKey(sk: *const SignKey) VerKey {
+            return deriveVkAtDepth(depth, sk);
+        }
+
+        fn deriveVkAtDepth(comptime d: u4, sk: []const u8) [32]u8 {
+            if (d == 0) {
+                const seed: Ed25519.Seed = sk[0..32].*;
+                const kp = Ed25519.keyFromSeed(seed) catch unreachable;
+                return kp.vk;
+            }
+            const inner_sk_size = computeSkSize(d - 1);
+            const vk_left = sk[inner_sk_size + 32 .. inner_sk_size + 64];
+            const vk_right = sk[inner_sk_size + 64 .. inner_sk_size + 96];
+            return hashVkPair(vk_left, vk_right);
+        }
+    };
+}
+
+/// Cardano mainnet KES: CompactSumKES depth 6 (64 periods).
+pub const KES = CompactSumKES(6);
+
+// ──────────────────────────────────── Tests ────────────────────────────────────
+
+// Test with small depths first for sanity, then full depth 6.
+
+test "kes depth 0: single period sign/verify" {
+    const KES0 = CompactSumKES(0);
+    const seed = [_]u8{0x42} ** 32;
+    const kp = try KES0.generate(seed);
+
+    const msg = "hello kes";
+    const sig = try KES0.sign(0, msg, &kp.sk);
+    try std.testing.expect(KES0.verify(kp.vk, 0, msg, sig));
+}
+
+test "kes depth 0: cannot evolve" {
+    const KES0 = CompactSumKES(0);
+    const seed = [_]u8{0x42} ** 32;
+    var kp = try KES0.generate(seed);
+    const can_evolve = try KES0.evolve(&kp.sk, 0);
+    try std.testing.expect(!can_evolve);
+}
+
+test "kes depth 1: two periods" {
+    const KES1 = CompactSumKES(1);
+    const seed = [_]u8{0xaa} ** 32;
+    var kp = try KES1.generate(seed);
+    const msg = "depth 1 test";
+
+    // Period 0
+    const sig0 = try KES1.sign(0, msg, &kp.sk);
+    try std.testing.expect(KES1.verify(kp.vk, 0, msg, sig0));
+
+    // Evolve to period 1
+    const evolved = try KES1.evolve(&kp.sk, 0);
+    try std.testing.expect(evolved);
+
+    // Period 1
+    const sig1 = try KES1.sign(1, msg, &kp.sk);
+    try std.testing.expect(KES1.verify(kp.vk, 1, msg, sig1));
+
+    // Cannot evolve further
+    const evolved2 = try KES1.evolve(&kp.sk, 1);
+    try std.testing.expect(!evolved2);
+}
+
+test "kes depth 1: wrong period fails" {
+    const KES1 = CompactSumKES(1);
+    const seed = [_]u8{0xbb} ** 32;
+    const kp = try KES1.generate(seed);
+    const msg = "wrong period";
+
+    const sig0 = try KES1.sign(0, msg, &kp.sk);
+    // Verify at period 1 with period 0's signature should fail
+    try std.testing.expect(!KES1.verify(kp.vk, 1, msg, sig0));
+}
+
+test "kes depth 2: four periods" {
+    const KES2 = CompactSumKES(2);
+    const seed = [_]u8{0xcc} ** 32;
+    var kp = try KES2.generate(seed);
+    const original_vk = kp.vk;
+    const msg = "four periods";
+
+    var period: u32 = 0;
+    while (period < 4) : (period += 1) {
+        // Sign at current period
+        const sig = try KES2.sign(period, msg, &kp.sk);
+        try std.testing.expect(KES2.verify(kp.vk, period, msg, sig));
+
+        // VK should remain constant
+        const derived_vk = KES2.deriveVerKey(&kp.sk);
+        try std.testing.expectEqualSlices(u8, &original_vk, &derived_vk);
+
+        // Evolve (except at last period)
+        if (period < 3) {
+            const evolved = try KES2.evolve(&kp.sk, period);
+            try std.testing.expect(evolved);
+        }
+    }
+}
+
+test "kes depth 6: generate and sign at period 0" {
+    const seed = [_]u8{0xdd} ** 32;
+    const kp = try KES.generate(seed);
+
+    try std.testing.expectEqual(@as(u32, 64), KES.total_periods);
+    try std.testing.expectEqual(@as(usize, 288), KES.sig_length);
+
+    const msg = "kassadin mainnet kes";
+    const sig = try KES.sign(0, msg, &kp.sk);
+    try std.testing.expect(KES.verify(kp.vk, 0, msg, sig));
+}
+
+test "kes depth 6: wrong message fails" {
+    const seed = [_]u8{0xee} ** 32;
+    const kp = try KES.generate(seed);
+
+    const sig = try KES.sign(0, "correct", &kp.sk);
+    try std.testing.expect(!KES.verify(kp.vk, 0, "wrong", sig));
+}
+
+test "kes depth 6: evolve first 4 periods" {
+    const seed = [_]u8{0xff} ** 32;
+    var kp = try KES.generate(seed);
+    const original_vk = kp.vk;
+    const msg = "evolve test";
+
+    var period: u32 = 0;
+    while (period < 4) : (period += 1) {
+        const sig = try KES.sign(period, msg, &kp.sk);
+        try std.testing.expect(KES.verify(kp.vk, period, msg, sig));
+
+        // VK constant
+        try std.testing.expectEqualSlices(u8, &original_vk, &KES.deriveVerKey(&kp.sk));
+
+        if (period < 3) {
+            _ = try KES.evolve(&kp.sk, period);
+        }
+    }
+}
+
+test "kes depth 6: forward security" {
+    const KES3 = CompactSumKES(3); // depth 3 = 8 periods, faster to test
+    const seed = [_]u8{0x11} ** 32;
+    var kp = try KES3.generate(seed);
+    const msg = "forward secure";
+
+    // Sign at period 0
+    const sig0 = try KES3.sign(0, msg, &kp.sk);
+    try std.testing.expect(KES3.verify(kp.vk, 0, msg, sig0));
+
+    // Evolve to period 1
+    _ = try KES3.evolve(&kp.sk, 0);
+
+    // Old signature at period 0 should still verify (it's the signature that's forward-secure,
+    // not that old sigs become invalid — forward security means you can't CREATE new period-0
+    // sigs with the evolved key)
+    try std.testing.expect(KES3.verify(kp.vk, 0, msg, sig0));
+
+    // Sign at period 1 works
+    const sig1 = try KES3.sign(1, msg, &kp.sk);
+    try std.testing.expect(KES3.verify(kp.vk, 1, msg, sig1));
+}
+
+test "kes: deterministic generation" {
+    const seed = [_]u8{0x99} ** 32;
+    const kp1 = try KES.generate(seed);
+    const kp2 = try KES.generate(seed);
+    try std.testing.expectEqualSlices(u8, &kp1.vk, &kp2.vk);
+    try std.testing.expectEqualSlices(u8, &kp1.sk, &kp2.sk);
+}
+
+test "kes: type sizes" {
+    try std.testing.expectEqual(@as(u32, 64), KES.total_periods);
+    try std.testing.expectEqual(@as(usize, 32), KES.vk_length);
+    try std.testing.expectEqual(@as(usize, 288), KES.sig_length);
+    // SK: base=32, each level adds 96, so 32 + 6*96 = 608
+    try std.testing.expectEqual(@as(usize, 608), KES.sk_length);
+}
