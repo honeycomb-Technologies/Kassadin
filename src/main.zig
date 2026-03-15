@@ -34,6 +34,7 @@ pub const storage = struct {
 pub const ledger = struct {
     pub const block = @import("ledger/block.zig");
     pub const transaction = @import("ledger/transaction.zig");
+    pub const rules = @import("ledger/rules.zig");
 };
 
 pub fn main() !void {
