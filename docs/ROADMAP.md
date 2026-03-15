@@ -203,22 +203,22 @@ A spec-compliant Cardano block-producing node that:
 - [x] ExUnits tracking (mem + steps, add, fits)
 - [x] Redeemer types (spend, mint, cert, reward, voting, proposing)
 - [x] Script hash computation (Blake2b-224 with language prefix)
-- [ ] Plutus V1 script execution — BLOCKED: plutuz requires Zig 0.15.2+
-- [ ] Two-phase validation (Phase-1 structural done, Phase-2 scripts blocked)
+- [x] Plutus V1 script execution via plutuz (Zig 0.15.2 upgrade completed)
+- [ ] Two-phase validation (Phase-1 structural done, Phase-2 in progress)
 - [ ] Collateral inputs
 - [ ] Datum/Redeemer/ScriptContext construction
 - [ ] Script data hash computation (canonical CBOR)
 - [ ] Cost model loading from protocol parameters
 
 ### 3.5 Babbage Extensions
-- [ ] Plutus V2 script execution (blocked on plutuz)
+- [x] Plutus V2 script execution via plutuz (SemanticsVariant.b)
 - [ ] Reference inputs/scripts/datums (CIP-31/32/33)
 - [ ] Collateral return, total collateral
 
 ### 3.6 Conway Extensions
 - [x] Certificate parsing: all Conway types (tags 7-18)
 - [x] DRep type (key_hash, script_hash, always_abstain, always_no_confidence)
-- [ ] Plutus V3 script execution (blocked on plutuz)
+- [x] Plutus V3 script execution via plutuz (SemanticsVariant.c)
 - [ ] Governance actions, voting, enactment (parsing deferred)
 
 ### 3.7 Hard Fork Combinator
@@ -231,8 +231,9 @@ A spec-compliant Cardano block-producing node that:
 - [x] Script hash computation (native + Plutus V1/V2/V3)
 - [x] ExUnits and Redeemer types defined
 - [x] evaluateScript interface defined (matches plutuz API)
-- [ ] BLOCKED: plutuz requires Zig 0.15.2+, we are on 0.13.0
-- [ ] Options: build plutuz as C lib, upgrade Zig, or port CEK machine
+- [x] RESOLVED: Upgraded to Zig 0.15.2, plutuz integrated natively
+- [x] evaluateScript: flat-decode → CEK machine → budget tracking
+- [x] Test: parse UPLC → encode → decode → evaluate → success
 
 **Spec:** `docs/specs/05-ledger.md`
 
