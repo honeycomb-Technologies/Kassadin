@@ -52,6 +52,41 @@ pub fn build(b: *std.Build) void {
     addVrfSources(b, lib_tests.root_module);
     const run_tests = b.addRunArtifact(lib_tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
+
+    // --- Live tests (require internet) ---
+    const kassadin_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "plutuz", .module = plutuz_mod },
+        },
+        .link_libc = true,
+    });
+
+    inline for (.{
+        .{ "test-live", "tests/test_live_handshake.zig", "Run live handshake test" },
+        .{ "test-blocks", "tests/test_real_blocks.zig", "Run real block parsing" },
+        .{ "test-fetch", "tests/test_fetch_blocks.zig", "Fetch and parse real blocks" },
+    }) |entry| {
+        const t = b.addExecutable(.{
+            .name = entry[0],
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(entry[1]),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "kassadin", .module = kassadin_mod },
+                },
+                .link_libc = true,
+            }),
+        });
+        addVrfSources(b, t.root_module);
+        b.installArtifact(t);
+        const run = b.addRunArtifact(t);
+        run.step.dependOn(b.getInstallStep());
+        b.step(entry[0], entry[2]).dependOn(&run.step);
+    }
 }
 
 fn addVrfSources(b: *std.Build, mod: *std.Build.Module) void {

@@ -39,6 +39,7 @@ pub const ledger = struct {
     pub const certificates = @import("ledger/certificates.zig");
     pub const scripts = @import("ledger/scripts.zig");
     pub const plutus = @import("ledger/plutus.zig");
+    pub const script_context = @import("ledger/script_context.zig");
     pub const stake = @import("ledger/stake.zig");
     pub const apply = @import("ledger/apply.zig");
     pub const rewards = @import("ledger/rewards.zig");

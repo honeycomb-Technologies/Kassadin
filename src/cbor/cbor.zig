@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 
 pub const enc = @import("encoder.zig");
 pub const dec = @import("decoder.zig");
+pub const canonical = @import("canonical.zig");
 
 pub const Encoder = enc.Encoder;
 pub const Decoder = dec.Decoder;
@@ -380,4 +381,5 @@ test "cbor golden: Alonzo block byte-preserving capture" {
 test {
     _ = enc;
     _ = dec;
+    _ = canonical;
 }
