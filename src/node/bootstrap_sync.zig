@@ -120,10 +120,8 @@ pub fn bootstrapSync(
                 result.network_tip_slot = rf.tip.slot;
                 result.network_tip_block = rf.tip.block_no;
 
-                // N2N chain-sync sends headers, not full blocks
-                // But we can still count and report progress
                 if (synced <= 5 or synced % 100 == 0) {
-                    std.debug.print("  Block {}: tip_slot={}, tip_block={}\n", .{
+                    std.debug.print("  Header {}: tip_slot={}, tip_block={}\n", .{
                         synced, rf.tip.slot, rf.tip.block_no,
                     });
                 }
