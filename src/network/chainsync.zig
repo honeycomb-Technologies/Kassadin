@@ -198,8 +198,9 @@ pub fn decodeMsg(data: []const u8) !ChainSyncMsg {
         5 => {
             const point = try decodePoint(&dec);
             const tip = try decodeTip(&dec);
+            // Genesis (null point) is a valid intersect — use slot 0 with zero hash
             return .{ .intersect_found = .{
-                .point = point orelse return error.InvalidCbor,
+                .point = point orelse Point{ .slot = 0, .hash = [_]u8{0} ** 32 },
                 .tip = tip,
             } };
         },
