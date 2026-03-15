@@ -44,6 +44,7 @@ pub const ledger = struct {
     pub const apply = @import("ledger/apply.zig");
     pub const rewards = @import("ledger/rewards.zig");
     pub const witness = @import("ledger/witness.zig");
+    pub const golden_tests = @import("ledger/golden_tests.zig");
 };
 
 pub const consensus = struct {
