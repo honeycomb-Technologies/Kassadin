@@ -15,6 +15,41 @@ fn loadGoldenBlock(allocator: std.mem.Allocator) ![]const u8 {
     return std.fs.cwd().readFileAlloc(allocator, "tests/vectors/alonzo_block.cbor", 10 * 1024 * 1024);
 }
 
+// ── Real Conway block from Mithril preprod snapshot ──
+
+test "golden: parse REAL Conway block from Mithril preprod snapshot" {
+    const allocator = std.testing.allocator;
+    const data = std.fs.cwd().readFileAlloc(
+        allocator,
+        "tests/vectors/real_conway_block.cbor",
+        10 * 1024 * 1024,
+    ) catch return;
+    defer allocator.free(data);
+
+    const block = try block_mod.parseBlock(data);
+
+    // Verified with Python cbor2 on the same chunk file:
+    try std.testing.expectEqual(block_mod.Era.conway, block.era);
+    try std.testing.expectEqual(@as(u64, 4508849), block.header.block_no);
+    try std.testing.expectEqual(@as(u64, 117828040), block.header.slot);
+    try std.testing.expectEqual(@as(u64, 2468), block.header.block_body_size);
+    try std.testing.expectEqual(@as(u64, 10), block.header.protocol_version_major);
+    try std.testing.expectEqual(@as(u64, 6), block.header.protocol_version_minor);
+
+    // 32-byte keys present
+    try std.testing.expectEqual(@as(usize, 32), block.header.issuer_vkey.len);
+    try std.testing.expectEqual(@as(usize, 32), block.header.vrf_vkey.len);
+
+    // Has transaction data
+    try std.testing.expect(block.tx_bodies_raw.len > 0);
+    try std.testing.expect(block.tx_witnesses_raw.len > 0);
+
+    // Parse transactions
+    var dec = @import("../cbor/decoder.zig").Decoder.init(block.tx_bodies_raw);
+    const num_txs = (try dec.decodeArrayLen()) orelse 0;
+    try std.testing.expectEqual(@as(u64, 3), num_txs); // Python says 3 transactions
+}
+
 // ── Block-level tests ──
 
 test "golden: block header fields" {
