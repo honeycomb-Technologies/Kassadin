@@ -17,7 +17,11 @@ pub const network = struct {
     pub const mux = @import("network/mux.zig");
     pub const handshake = @import("network/handshake.zig");
     pub const chainsync = @import("network/chainsync.zig");
+    pub const blockfetch = @import("network/blockfetch.zig");
+    pub const txsubmission = @import("network/txsubmission.zig");
     pub const keepalive = @import("network/keepalive.zig");
+    pub const peersharing = @import("network/peersharing.zig");
+    pub const peer = @import("network/peer.zig");
 };
 
 pub fn main() !void {

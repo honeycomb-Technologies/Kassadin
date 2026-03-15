@@ -1,0 +1,179 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const mux = @import("mux.zig");
+const protocol = @import("protocol.zig");
+const handshake = @import("handshake.zig");
+const chainsync = @import("chainsync.zig");
+const blockfetch = @import("blockfetch.zig");
+const keepalive = @import("keepalive.zig");
+const txsubmission = @import("txsubmission.zig");
+const peersharing = @import("peersharing.zig");
+
+/// High-level peer connection. Manages TCP, mux, handshake, and protocol sessions.
+pub const Peer = struct {
+    allocator: Allocator,
+    stream: std.net.Stream,
+    bearer: mux.Bearer,
+    negotiated_version: ?u64,
+
+    /// Connect to a Cardano node via TCP and perform N2N handshake.
+    pub fn connect(allocator: Allocator, host: []const u8, port: u16, magic: u32) !Peer {
+        const stream = try std.net.tcpConnectToHost(allocator, host, port);
+        errdefer stream.close();
+
+        var self = Peer{
+            .allocator = allocator,
+            .stream = stream,
+            .bearer = mux.tcpBearer(stream),
+            .negotiated_version = null,
+        };
+
+        // Perform handshake
+        const result = try handshake.performHandshake(allocator, &self.bearer, magic);
+        switch (result) {
+            .accepted => |a| {
+                self.negotiated_version = a.version;
+            },
+            .refused => return error.HandshakeRefused,
+        }
+
+        return self;
+    }
+
+    pub fn close(self: *Peer) void {
+        self.stream.close();
+    }
+
+    // ── Chain-Sync operations ──
+
+    /// Send MsgFindIntersect with empty points (start from genesis).
+    pub fn chainSyncFindIntersect(self: *Peer, points: []const chainsync.Point) !chainsync.ChainSyncMsg {
+        const msg_bytes = try chainsync.encodeMsg(self.allocator, .{
+            .find_intersect = .{ .points = points },
+        });
+        defer self.allocator.free(msg_bytes);
+
+        try self.bearer.writeSDU(
+            @intFromEnum(protocol.MiniProtocolNum.chain_sync),
+            .initiator,
+            msg_bytes,
+        );
+
+        const response = try self.bearer.readProtocolMessage(
+            @intFromEnum(protocol.MiniProtocolNum.chain_sync),
+            self.allocator,
+        );
+        defer self.allocator.free(response);
+
+        return chainsync.decodeMsg(response);
+    }
+
+    /// Send MsgRequestNext and read the response.
+    pub fn chainSyncRequestNext(self: *Peer) !chainsync.ChainSyncMsg {
+        const msg_bytes = try chainsync.encodeMsg(self.allocator, .request_next);
+        defer self.allocator.free(msg_bytes);
+
+        try self.bearer.writeSDU(
+            @intFromEnum(protocol.MiniProtocolNum.chain_sync),
+            .initiator,
+            msg_bytes,
+        );
+
+        const response = try self.bearer.readProtocolMessage(
+            @intFromEnum(protocol.MiniProtocolNum.chain_sync),
+            self.allocator,
+        );
+        defer self.allocator.free(response);
+
+        return chainsync.decodeMsg(response);
+    }
+
+    // ── Keep-Alive operations ──
+
+    /// Send a keep-alive ping and expect a response with matching cookie.
+    pub fn keepAlivePing(self: *Peer, cookie: u16) !u16 {
+        const msg_bytes = try keepalive.encodeMsg(self.allocator, .{ .keep_alive = cookie });
+        defer self.allocator.free(msg_bytes);
+
+        try self.bearer.writeSDU(
+            @intFromEnum(protocol.MiniProtocolNum.keep_alive),
+            .initiator,
+            msg_bytes,
+        );
+
+        const response = try self.bearer.readProtocolMessage(
+            @intFromEnum(protocol.MiniProtocolNum.keep_alive),
+            self.allocator,
+        );
+        defer self.allocator.free(response);
+
+        const resp_msg = try keepalive.decodeMsg(response);
+        switch (resp_msg) {
+            .keep_alive_response => |c| return c,
+            else => return error.UnexpectedMessage,
+        }
+    }
+
+    // ── Block-Fetch operations ──
+
+    /// Request a range of blocks and return the first block's raw CBOR.
+    pub fn blockFetchRange(self: *Peer, from: chainsync.Point, to: chainsync.Point) !?[]const u8 {
+        const msg_bytes = try blockfetch.encodeMsg(self.allocator, .{
+            .request_range = .{ .from = from, .to = to },
+        });
+        defer self.allocator.free(msg_bytes);
+
+        try self.bearer.writeSDU(
+            @intFromEnum(protocol.MiniProtocolNum.block_fetch),
+            .initiator,
+            msg_bytes,
+        );
+
+        // Read response (StartBatch or NoBlocks)
+        const response = try self.bearer.readProtocolMessage(
+            @intFromEnum(protocol.MiniProtocolNum.block_fetch),
+            self.allocator,
+        );
+        defer self.allocator.free(response);
+
+        const resp_msg = try blockfetch.decodeMsg(response);
+        switch (resp_msg) {
+            .start_batch => {
+                // Read the first block
+                const block_response = try self.bearer.readProtocolMessage(
+                    @intFromEnum(protocol.MiniProtocolNum.block_fetch),
+                    self.allocator,
+                );
+                // Don't free — caller owns this
+                return block_response;
+            },
+            .no_blocks => return null,
+            else => return error.UnexpectedMessage,
+        }
+    }
+
+    // ── Tx-Submission operations ──
+
+    /// Send MsgInit for tx-submission protocol.
+    pub fn txSubmissionInit(self: *Peer) !void {
+        const msg_bytes = try txsubmission.encodeMsg(self.allocator, .init);
+        defer self.allocator.free(msg_bytes);
+
+        try self.bearer.writeSDU(
+            @intFromEnum(protocol.MiniProtocolNum.tx_submission),
+            .initiator,
+            msg_bytes,
+        );
+    }
+};
+
+// ──────────────────────────────────── Tests ────────────────────────────────────
+
+test "peer: type has expected fields" {
+    // Structural test — verify Peer struct compiles with all fields
+    const p: Peer = undefined;
+    _ = p.allocator;
+    _ = p.stream;
+    _ = p.bearer;
+    _ = p.negotiated_version;
+}
