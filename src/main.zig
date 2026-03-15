@@ -22,6 +22,11 @@ pub const network = struct {
     pub const keepalive = @import("network/keepalive.zig");
     pub const peersharing = @import("network/peersharing.zig");
     pub const peer = @import("network/peer.zig");
+    pub const unix_bearer = @import("network/unix_bearer.zig");
+    pub const n2c_handshake = @import("network/n2c_handshake.zig");
+    pub const local_tx_submission = @import("network/local_tx_submission.zig");
+    pub const local_tx_monitor = @import("network/local_tx_monitor.zig");
+    pub const local_state_query = @import("network/local_state_query.zig");
 };
 
 pub const storage = struct {
@@ -54,7 +59,10 @@ pub const consensus = struct {
 };
 
 pub const mempool = @import("mempool/mempool.zig");
-pub const node = @import("node/node.zig");
+pub const node = struct {
+    pub const node_mod = @import("node/node.zig");
+    pub const keys = @import("node/keys.zig");
+};
 
 pub fn main() !void {
     var buf: [4096]u8 = undefined;
