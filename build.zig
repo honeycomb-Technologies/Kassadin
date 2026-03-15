@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .{ "test-blocks", "tests/test_real_blocks.zig", "Run real block parsing" },
         .{ "test-fetch", "tests/test_fetch_blocks.zig", "Fetch and parse real blocks" },
         .{ "test-dolos", "tests/test_dolos.zig", "Test N2C with local Dolos node" },
+        .{ "test-blockfetch", "tests/test_block_fetch.zig", "Fetch a real block from preview" },
     }) |entry| {
         const t = b.addExecutable(.{
             .name = entry[0],

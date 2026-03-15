@@ -130,10 +130,11 @@ pub const Peer = struct {
 
     // ── Block-Fetch operations ──
 
-    /// Request a range of blocks and return the first block's raw CBOR.
-    pub fn blockFetchRange(self: *Peer, from: chainsync.Point, to: chainsync.Point) !?[]const u8 {
+    /// Request a single block by its point and return the full block CBOR.
+    /// Returns owned allocation — caller must free.
+    pub fn blockFetchSingle(self: *Peer, point: chainsync.Point) !?[]u8 {
         const msg_bytes = try blockfetch.encodeMsg(self.allocator, .{
-            .request_range = .{ .from = from, .to = to },
+            .request_range = .{ .from = point, .to = point },
         });
         defer self.allocator.free(msg_bytes);
 
@@ -143,23 +144,31 @@ pub const Peer = struct {
             msg_bytes,
         );
 
-        // Read response (StartBatch or NoBlocks)
-        const response = try self.bearer.readProtocolMessage(
+        // Read StartBatch or NoBlocks
+        const response1 = try self.bearer.readProtocolMessage(
             @intFromEnum(protocol.MiniProtocolNum.block_fetch),
             self.allocator,
         );
-        defer self.allocator.free(response);
+        defer self.allocator.free(response1);
 
-        const resp_msg = try blockfetch.decodeMsg(response);
+        const resp_msg = try blockfetch.decodeMsg(response1);
         switch (resp_msg) {
             .start_batch => {
-                // Read the first block
-                const block_response = try self.bearer.readProtocolMessage(
+                // Read the block: [4, block_cbor]
+                const block_msg = try self.bearer.readProtocolMessage(
                     @intFromEnum(protocol.MiniProtocolNum.block_fetch),
                     self.allocator,
                 );
-                // Don't free — caller owns this
-                return block_response;
+                // Don't defer free — caller owns this
+
+                // Read BatchDone
+                const done_msg = try self.bearer.readProtocolMessage(
+                    @intFromEnum(protocol.MiniProtocolNum.block_fetch),
+                    self.allocator,
+                );
+                defer self.allocator.free(done_msg);
+
+                return block_msg;
             },
             .no_blocks => return null,
             else => return error.UnexpectedMessage,
