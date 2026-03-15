@@ -63,14 +63,44 @@ pub const node = struct {
     pub const node_mod = @import("node/node.zig");
     pub const keys = @import("node/keys.zig");
     pub const genesis = @import("node/genesis.zig");
+    pub const sync = @import("node/sync.zig");
+    pub const runner = @import("node/runner.zig");
 };
 
 pub fn main() !void {
-    var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("Kassadin — Cardano Node in Zig\n", .{});
-    try w.interface.print("Version: 0.0.0 (Phase 0: Foundation)\n", .{});
-    try w.interface.print("Status: Crypto + CBOR complete\n", .{});
+
+    const args = try std.process.argsAlloc(std.heap.page_allocator);
+    defer std.process.argsFree(std.heap.page_allocator, args);
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "sync")) {
+        // kassadin sync [--network preview|preprod] [--max-headers N]
+        std.debug.print("Kassadin — Cardano Node in Zig\n", .{});
+        std.debug.print("Syncing from preview network...\n\n", .{});
+
+        const result = node.runner.run(std.heap.page_allocator, .{
+            .network_magic = network.protocol.NetworkMagic.preview,
+            .peer_host = "preview-node.play.dev.cardano.org",
+            .peer_port = 3001,
+            .db_path = "db",
+            .shelley_genesis_path = null,
+            .max_headers = 20,
+        }) catch |err| {
+            std.debug.print("Sync error: {}\n", .{err});
+            return;
+        };
+
+        std.debug.print("Sync complete:\n", .{});
+        std.debug.print("  Headers synced: {}\n", .{result.headers_synced});
+        std.debug.print("  Tip slot: {}\n", .{result.tip_slot});
+        std.debug.print("  Tip block: {}\n", .{result.tip_block_no});
+        std.debug.print("  Rollbacks: {}\n", .{result.rollbacks});
+    } else {
+        std.debug.print("Kassadin — Cardano Node in Zig\n", .{});
+        std.debug.print("Version: 0.1.0\n", .{});
+        std.debug.print("\nUsage:\n", .{});
+        std.debug.print("  kassadin sync    Sync headers from preview network\n", .{});
+        std.debug.print("  kassadin         Show this help\n", .{});
+    }
 }
 
 test {
