@@ -74,4 +74,25 @@ pub fn build(b: *std.Build) void {
     const run_lib_tests = b.addRunArtifact(lib_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
+
+    // --- Live network tests (requires internet) ---
+    const kassadin_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+    });
+
+    const live_test = b.addExecutable(.{
+        .name = "test-live",
+        .root_source_file = b.path("tests/test_live_handshake.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    live_test.root_module.addImport("kassadin", kassadin_mod);
+    live_test.linkSystemLibrary("sodium");
+    live_test.linkLibC();
+    b.installArtifact(live_test);
+
+    const run_live = b.addRunArtifact(live_test);
+    run_live.step.dependOn(b.getInstallStep());
+    const live_step = b.step("test-live", "Run live network tests (requires internet)");
+    live_step.dependOn(&run_live.step);
 }

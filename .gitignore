@@ -6,4 +6,5 @@ zig-cache/
 *.so
 *.dylib
 reference-*/
+data/
 .DS_Store

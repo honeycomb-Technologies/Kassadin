@@ -12,6 +12,14 @@ pub const crypto = struct {
 pub const cbor = @import("cbor/cbor.zig");
 pub const types = @import("types.zig");
 
+pub const network = struct {
+    pub const protocol = @import("network/protocol.zig");
+    pub const mux = @import("network/mux.zig");
+    pub const handshake = @import("network/handshake.zig");
+    pub const chainsync = @import("network/chainsync.zig");
+    pub const keepalive = @import("network/keepalive.zig");
+};
+
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     try stdout.print("Kassadin — Cardano Node in Zig\n", .{});
