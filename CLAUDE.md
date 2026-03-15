@@ -17,7 +17,7 @@ Kassadin is a spec-compliant Cardano block-producing node written in Zig. It mus
 **Phase 4: LAYER 1 COMPLETE** — Consensus algorithms (VRF leader, chain selection, nonce evolution)
 **Phase 5: INDEPENDENT DONE** — Mempool + key file management
 **Phase 6: CODECS DONE** — All 5 N2C protocols + Unix socket + N2C handshake
-**Phase 7: NEXT** — Integration (genesis loading, Mithril bootstrap, full chain sync)
+**Phase 7: IN PROGRESS** — Mithril snapshot downloaded + extracted, real Conway blocks parsed
 
 ## CRITICAL: Deferred Layer 2 Items (Phase 7/8)
 

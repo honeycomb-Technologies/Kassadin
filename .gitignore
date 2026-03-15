@@ -7,4 +7,5 @@ zig-cache/
 *.dylib
 reference-*/
 data/
+db/
 .DS_Store
