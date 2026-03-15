@@ -157,6 +157,95 @@ test "golden: witness VKey prefix and redeemer ExUnits" {
     try std.testing.expectEqual(@as(u64, 5000), ws.redeemers[0].ex_units_steps);
 }
 
+// ── Multi-asset output from real block ──
+
+test "golden: multi-asset output value" {
+    const allocator = std.testing.allocator;
+    const data = loadGoldenBlock(allocator) catch return;
+    defer allocator.free(data);
+    const block = try block_mod.parseBlock(data);
+
+    // Get first tx body, field 1 (outputs)
+    var dec = Decoder.init(block.tx_bodies_raw);
+    _ = try dec.decodeArrayLen();
+    const tx_raw = try dec.sliceOfNextValue();
+
+    var tx_dec = Decoder.init(tx_raw);
+    const map_len = try tx_dec.decodeMapLen() orelse return;
+
+    var i: u64 = 0;
+    while (i < map_len) : (i += 1) {
+        const key = try tx_dec.decodeUint();
+        if (key == 1) {
+            // Outputs array
+            const n_outs = (try tx_dec.decodeArrayLen()) orelse return;
+            try std.testing.expectEqual(@as(u64, 1), n_outs);
+
+            // Parse output with multi-asset parser
+            const out_raw = try tx_dec.sliceOfNextValue();
+            var out_dec = Decoder.init(out_raw);
+            _ = try out_dec.decodeArrayLen(); // [address, value]
+            _ = try out_dec.decodeBytes(); // skip address
+
+            var value = try multiasset_mod.parseValue(allocator, &out_dec);
+            defer multiasset_mod.freeValue(allocator, &value);
+
+            // Python: coin=100, 1 policy with "couttsCoin"=1000
+            try std.testing.expectEqual(@as(u64, 100), value.coin);
+            try std.testing.expect(!value.isCoinOnly());
+            try std.testing.expectEqual(@as(usize, 1), value.multi_assets.len);
+            try std.testing.expectEqual(@as(usize, 1), value.multi_assets[0].assets.len);
+
+            // Asset name: "couttsCoin"
+            try std.testing.expectEqualSlices(u8, "couttsCoin", value.multi_assets[0].assets[0].name.toSlice());
+            try std.testing.expectEqual(@as(i64, 1000), value.multi_assets[0].assets[0].quantity);
+
+            // Policy ID should be a646474b8f5431261506b6c273d307c7569a4eb6c96b42dd4a29520a
+            const expected_pid = [_]u8{
+                0xa6, 0x46, 0x47, 0x4b, 0x8f, 0x54, 0x31, 0x26,
+                0x15, 0x06, 0xb6, 0xc2, 0x73, 0xd3, 0x07, 0xc7,
+                0x56, 0x9a, 0x4e, 0xb6, 0xc9, 0x6b, 0x42, 0xdd,
+                0x4a, 0x29, 0x52, 0x0a,
+            };
+            try std.testing.expectEqualSlices(u8, &expected_pid, &value.multi_assets[0].policy_id);
+            return; // done
+        } else {
+            try tx_dec.skipValue();
+        }
+    }
+}
+
+// ── Plutus V1 script hash from real block ──
+
+test "golden: plutus v1 script hash" {
+    const allocator = std.testing.allocator;
+    const data = loadGoldenBlock(allocator) catch return;
+    defer allocator.free(data);
+    const block = try block_mod.parseBlock(data);
+
+    var ws_dec = Decoder.init(block.tx_witnesses_raw);
+    _ = try ws_dec.decodeArrayLen();
+    const ws_raw = try ws_dec.sliceOfNextValue();
+    var ws = try witness_mod.parseWitnessSet(allocator, ws_raw);
+    defer witness_mod.freeWitnessSet(allocator, &ws);
+
+    // 1 Plutus V1 script, 8 bytes
+    try std.testing.expectEqual(@as(usize, 1), ws.plutus_v1_scripts.len);
+    try std.testing.expectEqual(@as(usize, 8), ws.plutus_v1_scripts[0].len);
+
+    // Script hash: Blake2b-224(0x01 || script_bytes)
+    // Python: 58503a1d89a21fc9fc53d6a7cccef47341175a8f47636f57ccbdca2d
+    const scripts_mod = @import("scripts.zig");
+    const computed_hash = scripts_mod.plutusScriptHash(.plutus_v1, ws.plutus_v1_scripts[0]);
+    const expected_hash = [_]u8{
+        0x58, 0x50, 0x3a, 0x1d, 0x89, 0xa2, 0x1f, 0xc9,
+        0xfc, 0x53, 0xd6, 0xa7, 0xcc, 0xce, 0xf4, 0x73,
+        0x41, 0x17, 0x5a, 0x8f, 0x47, 0x63, 0x6f, 0x57,
+        0xcc, 0xbd, 0xca, 0x2d,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_hash, &computed_hash);
+}
+
 // ── Script data hash verification ──
 
 test "golden: script data hash matches tx field 11" {
