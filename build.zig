@@ -4,6 +4,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // --- VRF C sources from cardano-crypto-praos/cbits ---
+    const vrf_c_sources = [_][]const u8{
+        "vendor/vrf/crypto_vrf.c",
+        "vendor/vrf/private/core_h2c.c",
+        "vendor/vrf/private/ed25519_ref10.c",
+        "vendor/vrf/vrf03/prove.c",
+        "vendor/vrf/vrf03/verify.c",
+        "vendor/vrf/vrf03/vrf.c",
+        "vendor/vrf/vrf13_batchcompat/prove.c",
+        "vendor/vrf/vrf13_batchcompat/verify.c",
+        "vendor/vrf/vrf13_batchcompat/vrf.c",
+    };
+
+    const vrf_c_flags = [_][]const u8{
+        "-DHAVE_TI_MODE", // 128-bit integer support (x86_64)
+        "-I", "vendor/vrf",
+        "-I", "vendor/vrf/private",
+    };
+
     // --- Main executable ---
     const exe = b.addExecutable(.{
         .name = "kassadin",
@@ -12,7 +31,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Link libsodium (system library)
+    for (vrf_c_sources) |src| {
+        exe.addCSourceFile(.{
+            .file = b.path(src),
+            .flags = &vrf_c_flags,
+        });
+    }
+    exe.addIncludePath(b.path("vendor/vrf"));
+    exe.addIncludePath(b.path("vendor/vrf/private"));
     exe.linkSystemLibrary("sodium");
     exe.linkLibC();
 
@@ -33,6 +59,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    for (vrf_c_sources) |src| {
+        lib_tests.addCSourceFile(.{
+            .file = b.path(src),
+            .flags = &vrf_c_flags,
+        });
+    }
+    lib_tests.addIncludePath(b.path("vendor/vrf"));
+    lib_tests.addIncludePath(b.path("vendor/vrf/private"));
     lib_tests.linkSystemLibrary("sodium");
     lib_tests.linkLibC();
 
