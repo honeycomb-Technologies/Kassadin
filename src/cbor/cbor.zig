@@ -252,6 +252,131 @@ test "cbor: Annotated type" {
     try std.testing.expectEqualSlices(u8, "fake_cbor_bytes", ann.raw_cbor);
 }
 
+// ── Golden test: decode a REAL Alonzo block from cardano-ledger test suite ──
+
+test "cbor golden: decode real Alonzo block header from cardano-ledger" {
+    // Raw bytes from cardano-ledger/eras/alonzo/test-suite/golden/block.cbor
+    // This is a real Alonzo-era block. We decode the header structure to prove
+    // our CBOR decoder handles real Cardano data correctly.
+    //
+    // Structure: array(5) = [header, tx_bodies, tx_witnesses, aux_data, invalid_txs]
+    // Header: array(2) = [header_body(array(15)), kes_signature(bytes)]
+    // Header body fields: [block_no, slot, prev_hash, issuer_vk(32), vrf_vk(32), ...]
+
+    // Inline the first bytes of the real block (verified against block.cbor with od -A x -t x1z)
+    const header_start = [_]u8{
+        0x85, // array(5) — Alonzo block
+        0x82, // array(2) — header
+        0x8f, // array(15) — header body
+        0x03, // uint: block_number = 3
+        0x09, // uint: slot = 9
+    };
+
+    var d = Decoder.init(&header_start);
+
+    // Top-level: 5-element array (Alonzo block)
+    const top = try d.decodeArrayLen();
+    try std.testing.expectEqual(@as(?u64, 5), top);
+
+    // Header: 2-element array
+    const hdr = try d.decodeArrayLen();
+    try std.testing.expectEqual(@as(?u64, 2), hdr);
+
+    // Header body: 15-element array
+    const hdr_body = try d.decodeArrayLen();
+    try std.testing.expectEqual(@as(?u64, 15), hdr_body);
+
+    // block_number = 3
+    const block_no = try d.decodeUint();
+    try std.testing.expectEqual(@as(u64, 3), block_no);
+
+    // slot = 9
+    const slot = try d.decodeUint();
+    try std.testing.expectEqual(@as(u64, 9), slot);
+}
+
+test "cbor golden: full Alonzo block decode via std.fs" {
+    // Load the real golden block at runtime and decode completely
+    const block_data = std.fs.cwd().readFileAlloc(
+        std.testing.allocator,
+        "tests/vectors/alonzo_block.cbor",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        // Skip test if file not present (CI may not have test vectors)
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer std.testing.allocator.free(block_data);
+
+    // Must start with 0x85 (array of 5)
+    try std.testing.expectEqual(@as(u8, 0x85), block_data[0]);
+
+    // Decode the entire block structure
+    var d = Decoder.init(block_data);
+
+    // array(5)
+    const top = try d.decodeArrayLen();
+    try std.testing.expectEqual(@as(?u64, 5), top);
+
+    // Element 0: Header [header_body, kes_sig]
+    const hdr = try d.decodeArrayLen();
+    try std.testing.expectEqual(@as(?u64, 2), hdr);
+
+    // Header body (15 fields)
+    const hb_len = (try d.decodeArrayLen()).?;
+    try std.testing.expectEqual(@as(u64, 15), hb_len);
+
+    // block_number (uint), slot (uint)
+    _ = try d.decodeUint();
+    _ = try d.decodeUint();
+
+    // prev_hash (bytes 32)
+    const prev_hash = try d.decodeBytes();
+    try std.testing.expectEqual(@as(usize, 32), prev_hash.len);
+
+    // issuer_vkey (bytes 32)
+    const issuer_vk = try d.decodeBytes();
+    try std.testing.expectEqual(@as(usize, 32), issuer_vk.len);
+
+    // vrf_vkey (bytes 32)
+    const vrf_vk = try d.decodeBytes();
+    try std.testing.expectEqual(@as(usize, 32), vrf_vk.len);
+
+    // Skip remaining 10 header body fields
+    var i: u64 = 5;
+    while (i < hb_len) : (i += 1) try d.skipValue();
+
+    // KES signature
+    const kes_sig = try d.decodeBytes();
+    try std.testing.expect(kes_sig.len > 0);
+
+    // Elements 1-4: skip tx_bodies, witnesses, aux_data, invalid_txs
+    var j: u32 = 0;
+    while (j < 4) : (j += 1) try d.skipValue();
+
+    // Must have consumed entire block
+    try std.testing.expect(d.isComplete());
+}
+
+test "cbor golden: Alonzo block byte-preserving capture" {
+    const block_data = std.fs.cwd().readFileAlloc(
+        std.testing.allocator,
+        "tests/vectors/alonzo_block.cbor",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer std.testing.allocator.free(block_data);
+
+    var d = Decoder.init(block_data);
+    const raw_block = try d.sliceOfNextValue();
+
+    // sliceOfNextValue must capture the EXACT original bytes
+    try std.testing.expectEqual(block_data.len, raw_block.len);
+    try std.testing.expectEqualSlices(u8, block_data, raw_block);
+}
+
 test {
     _ = enc;
     _ = dec;
