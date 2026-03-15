@@ -409,15 +409,16 @@ Full N2C server requires Phase 7 chain state integration.
 - [x] Snapshot restore module (scan chunk files, extract tar.zst)
 - [ ] Verify certificate chain (STM multi-signatures) — deferred, trust aggregator for now
 - [ ] Restore ledger state from snapshot
-- [ ] FindIntersect at snapshot tip, sync forward
+- [x] FindIntersect at snapshot tip — ACCEPTED by preprod relay
+- [x] Sync forward: 100 headers from preprod, era tags parsed
 
 ### 7.2 Chain Sync
 - [x] SyncClient: connect, handshake, follow chain, handle rollbacks
 - [x] Node runner: genesis config + ChainDB + sync loop
 - [x] CLI: `kassadin sync` syncs 20 headers from preview (WORKING)
 - [x] CLI: `kassadin bootstrap` queries Mithril (WORKING)
-- [ ] Sync from snapshot tip (after Mithril restore)
-- [ ] Process received blocks through ledger pipeline
+- [x] Sync from snapshot tip: 100+ headers synced from preprod relay
+- [ ] Process received blocks through full ledger pipeline (Phase 3/4 Layer 2)
 
 ### 7.3 Full Integration
 - [x] Shelley genesis config parsing (real mainnet genesis verified)
