@@ -65,6 +65,7 @@ pub const node = struct {
     pub const genesis = @import("node/genesis.zig");
     pub const sync = @import("node/sync.zig");
     pub const runner = @import("node/runner.zig");
+    pub const mithril = @import("node/mithril.zig");
 };
 
 pub fn main() !void {
@@ -94,12 +95,45 @@ pub fn main() !void {
         std.debug.print("  Tip slot: {}\n", .{result.tip_slot});
         std.debug.print("  Tip block: {}\n", .{result.tip_block_no});
         std.debug.print("  Rollbacks: {}\n", .{result.rollbacks});
+    } else if (args.len > 1 and std.mem.eql(u8, args[1], "bootstrap")) {
+        std.debug.print("Kassadin — Mithril Bootstrap\n", .{});
+        std.debug.print("Fetching latest preprod snapshot info...\n\n", .{});
+
+        const info = node.mithril.fetchLatestSnapshot(
+            std.heap.page_allocator,
+            node.mithril.aggregator_urls.preprod,
+        ) catch |err| {
+            std.debug.print("Failed to fetch snapshot: {}\n", .{err});
+            return;
+        };
+
+        std.debug.print("Latest snapshot:\n", .{});
+        std.debug.print("  Epoch: {}\n", .{info.epoch});
+        std.debug.print("  Immutable file: {}\n", .{info.immutable_file_number});
+        std.debug.print("  Size: {} MB\n", .{info.size / 1024 / 1024});
+        std.debug.print("\nTo download and restore, run:\n", .{});
+        std.debug.print("  kassadin bootstrap --download\n", .{});
+
+        if (args.len > 2 and std.mem.eql(u8, args[2], "--download")) {
+            std.debug.print("\nDownloading and extracting...\n", .{});
+            node.mithril.downloadAndExtract(
+                std.heap.page_allocator,
+                info,
+                "db",
+            ) catch |err| {
+                std.debug.print("Bootstrap failed: {}\n", .{err});
+                return;
+            };
+            std.debug.print("Bootstrap complete! Run 'kassadin sync' to continue from tip.\n", .{});
+        }
     } else {
         std.debug.print("Kassadin — Cardano Node in Zig\n", .{});
         std.debug.print("Version: 0.1.0\n", .{});
         std.debug.print("\nUsage:\n", .{});
-        std.debug.print("  kassadin sync    Sync headers from preview network\n", .{});
-        std.debug.print("  kassadin         Show this help\n", .{});
+        std.debug.print("  kassadin bootstrap    Show latest Mithril snapshot info\n", .{});
+        std.debug.print("  kassadin bootstrap --download    Download and restore snapshot\n", .{});
+        std.debug.print("  kassadin sync         Sync headers from preview network\n", .{});
+        std.debug.print("  kassadin              Show this help\n", .{});
     }
 }
 
