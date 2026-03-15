@@ -247,6 +247,10 @@ test "golden: plutus v1 script hash" {
 }
 
 // ── Script data hash verification ──
+// NOTE: Computing script_data_hash requires the cost model from genesis/protocol params.
+// For standalone golden block testing, we can verify the field value is correctly extracted
+// but can't independently recompute it without the test genesis cost model.
+// Full verification will happen when we apply blocks from a live chain with known state.
 
 test "golden: script data hash matches tx field 11" {
     const allocator = std.testing.allocator;
