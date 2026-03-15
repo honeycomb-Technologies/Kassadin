@@ -37,6 +37,7 @@ pub const ledger = struct {
     pub const rules = @import("ledger/rules.zig");
     pub const multiasset = @import("ledger/multiasset.zig");
     pub const certificates = @import("ledger/certificates.zig");
+    pub const scripts = @import("ledger/scripts.zig");
 };
 
 pub const consensus = struct {
