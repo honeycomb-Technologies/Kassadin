@@ -1,102 +1,124 @@
 const std = @import("std");
 const kassadin = @import("kassadin");
-const peer_mod = kassadin.network.peer;
+const mux = kassadin.network.mux;
+const handshake = kassadin.network.handshake;
+const blockfetch = kassadin.network.blockfetch;
 const chainsync = kassadin.network.chainsync;
 const protocol = kassadin.network.protocol;
 const block_mod = kassadin.ledger.block;
 const tx_mod = kassadin.ledger.transaction;
+const Encoder = kassadin.cbor.enc.Encoder;
 const Decoder = kassadin.cbor.Decoder;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    std.debug.print("=== Kassadin Block Fetch Test ===\n\n", .{});
+    std.debug.print("=== Block Fetch Test ===\n\n", .{});
 
-    // Connect to preview
-    std.debug.print("[1] Connecting to preview...\n", .{});
-    var p = peer_mod.Peer.connect(allocator, "preview-node.play.dev.cardano.org", 3001, protocol.NetworkMagic.preview) catch |err| {
-        std.debug.print("Failed: {}\n", .{err});
-        return;
-    };
-    defer p.close();
-    std.debug.print("  Connected v{}\n", .{p.negotiated_version.?});
+    // Step 1: Connect and handshake
+    std.debug.print("[1] Connecting...\n", .{});
+    const stream = try std.net.tcpConnectToHost(allocator, "preview-node.play.dev.cardano.org", 3001);
+    var bearer = mux.tcpBearer(stream);
 
-    // Chain-sync to find a block point
-    std.debug.print("\n[2] Finding a block point via chain-sync...\n", .{});
-    _ = try p.chainSyncFindIntersect(&[_]chainsync.Point{});
-
-    // Get a few headers to find a real point
-    var found_point: ?chainsync.Point = null;
-    for (0..20) |_| {
-        const msg = try p.chainSyncRequestNext();
-        switch (msg) {
-            .roll_forward => |rf| {
-                if (!rf.tip.is_genesis) {
-                    found_point = .{ .slot = rf.tip.slot, .hash = rf.tip.hash };
-                }
-            },
-            else => {},
-        }
+    const hs_result = try handshake.performHandshake(allocator, &bearer, protocol.NetworkMagic.preview);
+    switch (hs_result) {
+        .accepted => |a| std.debug.print("  Handshake v{}\n", .{a.version}),
+        .refused => {
+            std.debug.print("  Refused\n", .{});
+            return;
+        },
     }
 
-    if (found_point) |point| {
-        std.debug.print("  Found point: slot={}\n", .{point.slot});
+    // Step 2: Chain-sync to discover a point
+    std.debug.print("[2] Chain-sync for point...\n", .{});
+    const find_bytes = try chainsync.encodeMsg(allocator, .{ .find_intersect = .{ .points = &[_]chainsync.Point{} } });
+    defer allocator.free(find_bytes);
+    try bearer.writeSDU(2, .initiator, find_bytes);
+    const find_resp = try bearer.readProtocolMessage(2, allocator);
+    defer allocator.free(find_resp);
+    const find_msg = try chainsync.decodeMsg(find_resp);
 
-        // Block-fetch the full block
-        std.debug.print("\n[3] Fetching full block at slot {}...\n", .{point.slot});
-        const block_data = try p.blockFetchSingle(point);
+    var tip_slot: u64 = 0;
+    var tip_hash: [32]u8 = undefined;
+    switch (find_msg) {
+        .intersect_not_found => |inf| {
+            tip_slot = inf.tip.slot;
+            tip_hash = inf.tip.hash;
+            std.debug.print("  Tip: slot={}\n", .{tip_slot});
+        },
+        .intersect_found => |isf| {
+            tip_slot = isf.tip.slot;
+            tip_hash = isf.tip.hash;
+        },
+        else => return,
+    }
 
-        if (block_data) |data| {
-            defer allocator.free(data);
-            std.debug.print("  Block data received: {} bytes\n", .{data.len});
+    // Get one header to find a block point
+    const req_bytes = try chainsync.encodeMsg(allocator, .request_next);
+    defer allocator.free(req_bytes);
+    try bearer.writeSDU(2, .initiator, req_bytes);
+    const req_resp = try bearer.readProtocolMessage(2, allocator);
+    defer allocator.free(req_resp);
+    const req_msg = try chainsync.decodeMsg(req_resp);
 
-            // The block-fetch response is [4, block_cbor] — extract the block
-            var dec = Decoder.init(data);
-            const arr_len = try dec.decodeArrayLen();
-            if (arr_len) |len| {
-                if (len == 2) {
-                    const tag = try dec.decodeUint();
-                    if (tag == 4) {
-                        const block_cbor = try dec.sliceOfNextValue();
-                        std.debug.print("  Inner block CBOR: {} bytes\n", .{block_cbor.len});
+    switch (req_msg) {
+        .roll_forward => |rf| {
+            tip_slot = rf.tip.slot;
+            tip_hash = rf.tip.hash;
+            std.debug.print("  Got header, tip: slot={}\n", .{tip_slot});
+        },
+        else => {},
+    }
 
-                        // Parse the block
-                        const blk = block_mod.parseBlock(block_cbor) catch |err| {
-                            std.debug.print("  Parse error: {}\n", .{err});
-                            return;
-                        };
+    // Step 3: Block-fetch using the tip point
+    std.debug.print("[3] Block-fetch at slot {}...\n", .{tip_slot});
 
-                        std.debug.print("  Era: {}\n", .{@intFromEnum(blk.era)});
-                        std.debug.print("  Block: {}\n", .{blk.header.block_no});
-                        std.debug.print("  Slot: {}\n", .{blk.header.slot});
-                        std.debug.print("  Body size: {}\n", .{blk.header.block_body_size});
+    const point = chainsync.Point{ .slot = tip_slot, .hash = tip_hash };
+    const bf_bytes = try blockfetch.encodeMsg(allocator, .{
+        .request_range = .{ .from = point, .to = point },
+    });
+    defer allocator.free(bf_bytes);
 
-                        // Parse transactions
-                        var tx_dec = Decoder.init(blk.tx_bodies_raw);
-                        const num_txs = (try tx_dec.decodeArrayLen()) orelse 0;
-                        std.debug.print("  Transactions: {}\n", .{num_txs});
+    std.debug.print("  Sending request ({} bytes)...\n", .{bf_bytes.len});
+    try bearer.writeSDU(3, .initiator, bf_bytes);
 
-                        if (num_txs > 0) {
-                            const tx_raw = try tx_dec.sliceOfNextValue();
-                            var tx = tx_mod.parseTxBody(allocator, tx_raw) catch |err| {
-                                std.debug.print("  Tx parse error: {}\n", .{err});
-                                return;
-                            };
-                            defer tx_mod.freeTxBody(allocator, &tx);
-                            std.debug.print("  Tx 0: {} inputs, {} outputs, fee={}\n", .{
-                                tx.inputs.len, tx.outputs.len, tx.fee,
-                            });
-                        }
+    std.debug.print("  Reading response...\n", .{});
+    const bf_resp1 = try bearer.readProtocolMessage(3, allocator);
+    defer allocator.free(bf_resp1);
 
-                        std.debug.print("\n=== BLOCK FETCH SUCCESS ===\n", .{});
-                        std.debug.print("  Downloaded and parsed a REAL block from the Cardano preview network\n", .{});
-                    }
-                }
+    std.debug.print("  Got {} bytes\n", .{bf_resp1.len});
+    const bf_msg1 = try blockfetch.decodeMsg(bf_resp1);
+
+    switch (bf_msg1) {
+        .start_batch => {
+            std.debug.print("  StartBatch! Reading block...\n", .{});
+            const bf_resp2 = try bearer.readProtocolMessage(3, allocator);
+            defer allocator.free(bf_resp2);
+            std.debug.print("  Got block: {} bytes\n", .{bf_resp2.len});
+
+            // Decode [4, block_cbor]
+            var dec = Decoder.init(bf_resp2);
+            _ = try dec.decodeArrayLen();
+            const tag = try dec.decodeUint();
+            if (tag == 4) {
+                const block_cbor = try dec.sliceOfNextValue();
+                std.debug.print("  Block CBOR: {} bytes\n", .{block_cbor.len});
+
+                const blk = try block_mod.parseBlock(block_cbor);
+                std.debug.print("  Era: {}\n", .{@intFromEnum(blk.era)});
+                std.debug.print("  Block: {}\n", .{blk.header.block_no});
+                std.debug.print("  Slot: {}\n", .{blk.header.slot});
+
+                var tx_dec = Decoder.init(blk.tx_bodies_raw);
+                const num_txs = (try tx_dec.decodeArrayLen()) orelse 0;
+                std.debug.print("  Txs: {}\n", .{num_txs});
+
+                std.debug.print("\n=== BLOCK FETCH SUCCESS ===\n", .{});
             }
-        } else {
-            std.debug.print("  No blocks returned\n", .{});
-        }
-    } else {
-        std.debug.print("  No points found\n", .{});
+        },
+        .no_blocks => std.debug.print("  NoBlocks\n", .{}),
+        else => std.debug.print("  Unexpected: {}\n", .{@intFromEnum(bf_msg1)}),
     }
+
+    stream.close();
 }
