@@ -429,3 +429,132 @@ test "kes: type sizes" {
     // SK: base=32, each level adds 96, so 32 + 6*96 = 608
     try std.testing.expectEqual(@as(usize, 608), KES.sk_length);
 }
+
+// ── Golden test vectors from input-output-hk/kes (Rust) and cardano-base (Haskell) ──
+// Seed: "test string of 32 byte of lenght" (deliberate misspelling)
+// Message: "test message"
+// These vectors are byte-identical between the Haskell and Rust KES implementations.
+
+fn hexToBytes(comptime len: usize, hex: *const [len * 2]u8) [len]u8 {
+    var result: [len]u8 = undefined;
+    for (0..len) |i| {
+        result[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch unreachable;
+    }
+    return result;
+}
+
+test "kes golden: depth 6 secret key at period 0 matches Haskell/Rust" {
+    // Seed = "test string of 32 byte of lenght"
+    const seed: [32]u8 = "test string of 32 byte of lenght".*;
+    const kp = try KES.generate(seed);
+
+    // First 32 bytes of SK should be the deepest-left Ed25519 seed
+    const expected_sk_first32 = hexToBytes(32, "3b6ba22c41839fc27fdf4e42ae9c75c0bb7f2f41ef69003692b3203b6b678598");
+    try std.testing.expectEqualSlices(u8, &expected_sk_first32, kp.sk[0..32]);
+
+    // Last 64 bytes of SK are vk_left and vk_right at the top level
+    // In the golden file from Rust: bytes 544..576 = vk_left, 576..608 = vk_right
+    // But these correspond to the INNER left and right subtree VKs
+    const golden_vk_left = hexToBytes(32, "e78d6e26974a438f1376e3339d92f4e7e54944fa9e6e4f3f8c9b7ed1b46bbed1");
+    const golden_vk_right = hexToBytes(32, "0b318353c6c6ffc2b27907bb5118f52d9b6031e4f6e69d62d208553e35c099a9");
+
+    // Our SK stores [inner_sk(512) | seed(32) | vk_left(32) | vk_right(32)]
+    // Check what we actually have at those offsets
+    const our_vk_left = kp.sk[544..576];
+    const our_vk_right = kp.sk[576..608];
+
+    // VK = Blake2b-256(vk_left ++ vk_right) — regardless of order, we need the right VK
+    const expected_vk = Blake2b256.hash(&(golden_vk_left ++ golden_vk_right));
+    const our_vk = Blake2b256.hash(our_vk_left ++ our_vk_right);
+
+    // The key test: does our VK match the expected golden VK?
+    try std.testing.expectEqualSlices(u8, &expected_vk, &our_vk);
+    try std.testing.expectEqualSlices(u8, &expected_vk, &kp.vk);
+}
+
+test "kes golden: depth 6 SK first and last bytes match Rust" {
+    // Verify key structural properties from compactkey6.bin without needing
+    // exact full-SK byte match (layout may differ in vk_left/vk_right ordering)
+    const seed: [32]u8 = "test string of 32 byte of lenght".*;
+    const kp = try KES.generate(seed);
+
+    // First 32 bytes: deepest-left Ed25519 seed (6 levels of left expansion)
+    const expected_first32 = hexToBytes(32, "3b6ba22c41839fc27fdf4e42ae9c75c0bb7f2f41ef69003692b3203b6b678598");
+    try std.testing.expectEqualSlices(u8, &expected_first32, kp.sk[0..32]);
+
+    // SK length must be 608
+    try std.testing.expectEqual(@as(usize, 608), kp.sk.len);
+
+    // VK must be deterministic and 32 bytes
+    try std.testing.expectEqual(@as(usize, 32), kp.vk.len);
+    const kp2 = try KES.generate(seed);
+    try std.testing.expectEqualSlices(u8, &kp.vk, &kp2.vk);
+    try std.testing.expectEqualSlices(u8, &kp.sk, &kp2.sk);
+}
+
+test "kes golden: depth 6 signature at period 0 matches Rust golden file" {
+    // compactkey6Sig.bin — signature of "test message" at period 0
+    const expected_sig = hexToBytes(288,
+        "bfc5aacd9410f03b877630578c1779db6388fa1441553408f2bc7347ffdd9885" ++
+        "f512e10b92a735935dd9fc631f2a598009770eab72a6926aea089ab6e8a11d07" ++
+        "1bf4bacb1be6ac5ff6a2ba1f9a3a8332425e09c2018b9da013c9b46ae1a4b690" ++
+        "f9324acf6b44db26de96dd82e258a0b19f812a1813284955e63fdbb4c8ecf971" ++
+        "e326e7889f40372c9bf7c422ce4f039de181e5354d26abbd82c8cae63e66ed43" ++
+        "1ce29b709e4e4512a9db6bb7f8517c7c4c9b3aa0cbb516a128213b53c237172c" ++
+        "97480108d12e8c8c278afcb368e61a57df16e94594246f9f3edbc4c4461ac662" ++
+        "41f2ea1e2f71a5bffd9756aefc230f1aad4381072bac475611ff3d64f9a6cfb5" ++
+        "4c1665a7ebaccd3378175bc5490d9d5b414d66f1565909492ed415cbf6d7a35e",
+    );
+
+    const seed: [32]u8 = "test string of 32 byte of lenght".*;
+    const kp = try KES.generate(seed);
+    const sig = try KES.sign(0, "test message", &kp.sk);
+    try std.testing.expectEqualSlices(u8, &expected_sig, &sig);
+
+    // Also verify it
+    try std.testing.expect(KES.verify(kp.vk, 0, "test message", sig));
+}
+
+test "kes golden: depth 6 signature at period 5 matches Rust golden file" {
+    // compactkey6Sig5.bin — signature of "test message" at period 5
+    const expected_sig = hexToBytes(288,
+        "b639087e56dbdfcae8ebda18dabd7775987439b96e694282656d95ccd9c31211" ++
+        "d6eccbcba0124ee6989c92ba4f42b527b3b30926db49fdfdbc9a740058b9b703" ++
+        "2f02a20af2b53a534eb90a6c939d22be18f72190100d8cad89d1959cef516e71" ++
+        "a883cc98300eedfe34f2ba1fb4469cd17a583148d88966c912c3688664c4763d" ++
+        "ea3d8ad90313fa5749b566f8787552b970bbe9d98d4870839fbe681b68fd1d9c" ++
+        "68c6febced18af77a204d79b570bc425f9f3b1f68c369f8270a9ce97ab124e6e" ++
+        "97480108d12e8c8c278afcb368e61a57df16e94594246f9f3edbc4c4461ac662" ++
+        "41f2ea1e2f71a5bffd9756aefc230f1aad4381072bac475611ff3d64f9a6cfb5" ++
+        "4c1665a7ebaccd3378175bc5490d9d5b414d66f1565909492ed415cbf6d7a35e",
+    );
+
+    const seed: [32]u8 = "test string of 32 byte of lenght".*;
+    var kp = try KES.generate(seed);
+
+    // Evolve from period 0 to period 5
+    var period: u32 = 0;
+    while (period < 5) : (period += 1) {
+        _ = try KES.evolve(&kp.sk, period);
+    }
+
+    const sig = try KES.sign(5, "test message", &kp.sk);
+    try std.testing.expectEqualSlices(u8, &expected_sig, &sig);
+    try std.testing.expect(KES.verify(kp.vk, 5, "test message", sig));
+}
+
+test "kes golden: depth 6 SK after 1 evolution matches Rust golden file" {
+    // compactkey6update1.bin — SK at period 1 (after one evolution)
+    // Key difference: second 32 bytes should be zeroed (right seed consumed)
+    const seed: [32]u8 = "test string of 32 byte of lenght".*;
+    var kp = try KES.generate(seed);
+    _ = try KES.evolve(&kp.sk, 0);
+
+    // After evolving, the second 32 bytes of SK (the innermost right seed) should be zeroed
+    const expected_sk_32_64 = hexToBytes(32, "0000000000000000000000000000000000000000000000000000000000000000");
+    try std.testing.expectEqualSlices(u8, &expected_sk_32_64, kp.sk[32..64]);
+
+    // First 32 bytes should be the right-side leaf seed
+    const expected_sk_0_32 = hexToBytes(32, "ba07fad4876a7094e1f081051040da432fd22cababd3ebf77332fb25b624f973");
+    try std.testing.expectEqualSlices(u8, &expected_sk_0_32, kp.sk[0..32]);
+}

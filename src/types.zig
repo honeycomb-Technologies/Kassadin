@@ -495,3 +495,112 @@ test "key hash: from verification key" {
     const kh = hashKey(&vk);
     try std.testing.expectEqual(@as(usize, 28), kh.len);
 }
+
+// ── Golden address test vectors from CIP-0019 / cardano-ledger golden tests ──
+// Payment key hash: 9493315cd92eb5d8c4304e67b7e16ae36d61d34502694657811a2c8e
+// Stake key hash:   337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251
+// Script hash:      c37b1b5dc0669f1d3c61a6fddb2e8fde96be87b881c60bce8e8d542f
+
+fn hexDecode(comptime len: usize, hex: *const [len * 2]u8) [len]u8 {
+    var result: [len]u8 = undefined;
+    for (0..len) |i| {
+        result[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch unreachable;
+    }
+    return result;
+}
+
+test "address golden: base key/key mainnet (CIP-19)" {
+    // addr1qx2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3n0d3vllmyqwsx5wktcd8cc3sq835lu7drv2xwl2wywfgse35a3x
+    const raw = hexDecode(57, "019493315cd92eb5d8c4304e67b7e16ae36d61d34502694657811a2c8e337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251");
+    const addr = try Address.fromBytes(&raw);
+    switch (addr) {
+        .shelley => |sa| {
+            try std.testing.expectEqual(Network.mainnet, sa.network);
+            try std.testing.expectEqual(AddressType.base_key_key, sa.addr_type);
+            try std.testing.expectEqual(CredentialType.key_hash, sa.payment.cred_type);
+            const expected_payment = hexDecode(28, "9493315cd92eb5d8c4304e67b7e16ae36d61d34502694657811a2c8e");
+            try std.testing.expectEqualSlices(u8, &expected_payment, &sa.payment.hash);
+            switch (sa.stake) {
+                .base => |stake_cred| {
+                    const expected_stake = hexDecode(28, "337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251");
+                    try std.testing.expectEqualSlices(u8, &expected_stake, &stake_cred.hash);
+                },
+                else => unreachable,
+            }
+        },
+        .bootstrap => unreachable,
+    }
+}
+
+test "address golden: enterprise key mainnet (CIP-19)" {
+    // addr1vx2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzers66hrl8
+    const raw = hexDecode(29, "619493315cd92eb5d8c4304e67b7e16ae36d61d34502694657811a2c8e");
+    const addr = try Address.fromBytes(&raw);
+    switch (addr) {
+        .shelley => |sa| {
+            try std.testing.expectEqual(Network.mainnet, sa.network);
+            try std.testing.expectEqual(AddressType.enterprise_key, sa.addr_type);
+            try std.testing.expectEqual(CredentialType.key_hash, sa.payment.cred_type);
+            const expected_payment = hexDecode(28, "9493315cd92eb5d8c4304e67b7e16ae36d61d34502694657811a2c8e");
+            try std.testing.expectEqualSlices(u8, &expected_payment, &sa.payment.hash);
+        },
+        .bootstrap => unreachable,
+    }
+}
+
+test "address golden: reward key mainnet (CIP-19)" {
+    // stake1uyehkck0lajq8gr28t9uxnuvgcqrc6070x3k9r8048z8y5gh6ffgw
+    const raw = hexDecode(29, "e1337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251");
+    const addr = try Address.fromBytes(&raw);
+    switch (addr) {
+        .shelley => |sa| {
+            try std.testing.expectEqual(Network.mainnet, sa.network);
+            try std.testing.expectEqual(AddressType.reward_key, sa.addr_type);
+            const expected_stake = hexDecode(28, "337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251");
+            try std.testing.expectEqualSlices(u8, &expected_stake, &sa.payment.hash);
+        },
+        .bootstrap => unreachable,
+    }
+}
+
+test "address golden: script enterprise mainnet (CIP-19)" {
+    // addr1w8phkx6acpnf78fuvxn0mkew3l0fd058hzquvz7w36x4gtcyjy7wx
+    const raw = hexDecode(29, "71c37b1b5dc0669f1d3c61a6fddb2e8fde96be87b881c60bce8e8d542f");
+    const addr = try Address.fromBytes(&raw);
+    switch (addr) {
+        .shelley => |sa| {
+            try std.testing.expectEqual(Network.mainnet, sa.network);
+            try std.testing.expectEqual(AddressType.enterprise_script, sa.addr_type);
+            try std.testing.expectEqual(CredentialType.script_hash, sa.payment.cred_type);
+            const expected_script = hexDecode(28, "c37b1b5dc0669f1d3c61a6fddb2e8fde96be87b881c60bce8e8d542f");
+            try std.testing.expectEqualSlices(u8, &expected_script, &sa.payment.hash);
+        },
+        .bootstrap => unreachable,
+    }
+}
+
+test "address golden: script+key base mainnet (CIP-19)" {
+    // addr1z8phkx6acpnf78fuvxn0mkew3l0fd058hzquvz7w36x4gten0d3vllmyqwsx5wktcd8cc3sq835lu7drv2xwl2wywfgs9yc0hh
+    const raw = hexDecode(57, "11c37b1b5dc0669f1d3c61a6fddb2e8fde96be87b881c60bce8e8d542f337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251");
+    const addr = try Address.fromBytes(&raw);
+    switch (addr) {
+        .shelley => |sa| {
+            try std.testing.expectEqual(Network.mainnet, sa.network);
+            try std.testing.expectEqual(AddressType.base_script_key, sa.addr_type);
+            try std.testing.expectEqual(CredentialType.script_hash, sa.payment.cred_type);
+        },
+        .bootstrap => unreachable,
+    }
+}
+
+test "reward account golden: round-trip CIP-19" {
+    const raw = hexDecode(29, "e1337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251");
+    const ra = try RewardAccount.fromBytes(raw);
+    try std.testing.expectEqual(Network.mainnet, ra.network);
+    try std.testing.expectEqual(CredentialType.key_hash, ra.credential.cred_type);
+    const expected_hash = hexDecode(28, "337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251");
+    try std.testing.expectEqualSlices(u8, &expected_hash, &ra.credential.hash);
+    // Round-trip
+    const encoded = ra.toBytes();
+    try std.testing.expectEqualSlices(u8, &raw, &encoded);
+}
