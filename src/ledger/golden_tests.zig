@@ -48,6 +48,22 @@ test "golden: parse REAL Conway block from Mithril preprod snapshot" {
     var dec = @import("../cbor/decoder.zig").Decoder.init(block.tx_bodies_raw);
     const num_txs = (try dec.decodeArrayLen()) orelse 0;
     try std.testing.expectEqual(@as(u64, 3), num_txs); // Python says 3 transactions
+
+    // Parse and verify first transaction
+    const tx0_raw = try dec.sliceOfNextValue();
+    var tx0 = tx_mod.parseTxBody(allocator, tx0_raw) catch return;
+    defer tx_mod.freeTxBody(allocator, &tx0);
+
+    // Python: Tx 0: 1 input, 2 outputs, fee=201021
+    try std.testing.expectEqual(@as(usize, 1), tx0.inputs.len);
+    try std.testing.expectEqual(@as(usize, 2), tx0.outputs.len);
+    try std.testing.expectEqual(@as(u64, 201021), tx0.fee);
+
+    // Python: TxId starts with cab535be
+    try std.testing.expectEqual(@as(u8, 0xca), tx0.tx_id[0]);
+    try std.testing.expectEqual(@as(u8, 0xb5), tx0.tx_id[1]);
+    try std.testing.expectEqual(@as(u8, 0x35), tx0.tx_id[2]);
+    try std.testing.expectEqual(@as(u8, 0xbe), tx0.tx_id[3]);
 }
 
 // ── Block-level tests ──
