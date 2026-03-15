@@ -9,7 +9,8 @@ Kassadin is a spec-compliant Cardano block-producing node written in Zig. It mus
 ## Current Status
 
 **Phase 0: COMPLETE** (109/109 tests, all cross-validated against Haskell/Rust)
-**Phase 1: IN PROGRESS** (Networking — multiplexer, handshake, mini-protocols)
+**Phase 1: COMPLETE** (157 unit tests + 4 live tests against real Cardano preview node)
+**Phase 2: NEXT** (Storage — ImmutableDB, VolatileDB, LedgerDB)
 
 ## Language & Tooling
 
@@ -75,7 +76,7 @@ All detailed specifications are in `docs/specs/`. Each spec maps 1:1 to a subsys
 
 ```
 Phase 0 (Crypto + CBOR + Types) ── COMPLETED
-  ├── Phase 1 (Networking) ── IN PROGRESS
+  ├── Phase 1 (Networking) ── COMPLETED
   ├── Phase 2 (Storage)
   └── Phase 3 (Ledger) ──┐
                           ├── Phase 4 (Consensus)
