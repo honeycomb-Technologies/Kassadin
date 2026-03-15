@@ -173,10 +173,25 @@ A spec-compliant Cardano block-producing node that:
 
 ---
 
-## Phase 3: Ledger — Multi-Era Validation -- IN PROGRESS
+## Phase 3: Ledger — Multi-Era Validation -- LAYER 1 COMPLETE
 
-**Status:** 265 tests across 13 ledger modules. Zig 0.15.2 + plutuz integrated.
-Every module validated against real golden block data (Python cbor2 cross-checked).
+**Status:** 265 tests across 14 ledger modules. Zig 0.15.2 + plutuz integrated.
+Parsing and Plutus execution fully validated against real data. Full ledger state
+management (UTxO tracking, rewards, block application) deferred to Phase 7/8
+where chain integration provides real state.
+
+**Layer 1 (COMPLETE — parsing, validation rules, Plutus execution):**
+All validated against real golden block data and 999/999 Plutus conformance.
+
+**Layer 2 (DEFERRED — requires chain state from Phase 7/8):**
+These items CANNOT be properly tested without real chain state. They must be
+revisited during Phase 7 (Mithril bootstrap) and Phase 8 (hardening):
+- Apply real blocks end-to-end and verify UTxO state matches Haskell
+- Reward calculation against real epoch boundary data
+- Script_data_hash computation (needs genesis cost model parameters)
+- Stake distribution verification against real snapshot data
+- Sequential multi-block state tracking
+DO NOT mark Phase 3 fully complete until these are validated in Phase 7/8.
 
 ### 3.1 Byron Era
 - [ ] Byron block deserialization (deferred — Mithril bootstrap skips Byron)

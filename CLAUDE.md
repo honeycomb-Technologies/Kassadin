@@ -9,11 +9,24 @@ Kassadin is a spec-compliant Cardano block-producing node written in Zig. It mus
 ## Current Status
 
 **Phase 0: COMPLETE** — Crypto, CBOR, Core Types (109 tests, cross-validated)
-**Phase 1: COMPLETE** — Networking (157 tests + live preview node validation)
-**Phase 2: COMPLETE** — Storage (175 tests, zero memory leaks)
-**Phase 3: IN PROGRESS** — Ledger (232 tests, 10 modules, Plutus blocked on Zig version)
-**Phase 4: Started** — Consensus (Praos state, nonce evolution, chain selection)
-**Phase 5: Started** — Mempool + node orchestrator foundations
+**Phase 1: COMPLETE** — Networking (48 tests + live preview node validation)
+**Phase 2: COMPLETE** — Storage (18 tests, zero memory leaks)
+**Phase 3: LAYER 1 COMPLETE** — Parsing + Plutus (265 tests, 999/999 plutuz conformance)
+  Layer 2 (UTxO state, rewards, block application) deferred to Phase 7/8 — needs chain state
+**Phase 4: NEXT** — Consensus (Praos leader election, header validation, chain selection)
+
+## CRITICAL: Phase 3 Layer 2 Deferred Items
+
+The following Phase 3 items MUST be completed during Phase 7/8:
+- Apply real blocks end-to-end and verify UTxO state matches Haskell node
+- Reward calculation validated against real epoch boundary data
+- Script_data_hash computed and verified (needs genesis cost model)
+- Stake distribution verified against real snapshot data
+- Sequential multi-block state tracking
+
+These require loading genesis configuration, bootstrapping from Mithril,
+and syncing real blocks — infrastructure that doesn't exist until Phase 7.
+They are NOT done. Do NOT skip them.
 
 ## Language & Tooling
 
