@@ -59,6 +59,8 @@ pub fn decodeHeader(bytes: *const [header_length]u8) SDUHeader {
 /// Bearer abstraction for reading/writing SDUs over a stream (TCP or Unix socket).
 pub const Bearer = struct {
     stream: std.net.Stream,
+    leftover: std.ArrayList(u8) = .empty,
+    leftover_allocator: ?std.mem.Allocator = null,
 
     /// Read one complete SDU (header + payload). Caller must provide buffer.
     /// Returns the decoded header and a slice of the payload within buf.
@@ -120,19 +122,41 @@ pub const Bearer = struct {
     /// Read a complete protocol message that may span multiple SDUs.
     ///
     /// Following the Haskell mux design (Network/Mux.hs, Network/Mux/Ingress.hs):
-    /// 1. Read SDUs from the bearer
-    /// 2. Accumulate payload bytes for the target protocol
-    /// 3. After each SDU, try to parse a complete CBOR value
-    /// 4. If complete, return the message bytes
+    /// 1. Check leftover buffer from previous call (handles pipelined messages)
+    /// 2. Read SDUs from the bearer and accumulate
+    /// 3. Try to parse a complete CBOR value
+    /// 4. If complete, save remaining bytes as leftover, return the message
     /// 5. If incomplete, read more SDUs
-    ///
-    /// SDUs for other protocols are silently discarded (proper per-protocol
-    /// queuing comes when we run concurrent protocol handlers).
     pub fn readProtocolMessage(self: *Bearer, protocol_num: u15, allocator: std.mem.Allocator) ![]u8 {
         const Decoder = @import("../cbor/decoder.zig").Decoder;
 
+        // Initialize leftover buffer if needed
+        if (self.leftover_allocator == null) {
+            self.leftover_allocator = allocator;
+            self.leftover = .empty;
+        }
+
         var accumulated: std.ArrayList(u8) = .empty;
         defer accumulated.deinit(allocator);
+
+        // Start with any leftover data from the previous call
+        if (self.leftover.items.len > 0) {
+            try accumulated.appendSlice(allocator, self.leftover.items);
+            self.leftover.clearRetainingCapacity();
+
+            // Check if leftover already contains a complete message
+            var dec = Decoder.init(accumulated.items);
+            if (dec.sliceOfNextValue()) |complete_msg| {
+                const result = try allocator.alloc(u8, complete_msg.len);
+                @memcpy(result, complete_msg);
+                // Save remaining bytes as leftover
+                const remaining = accumulated.items[dec.pos..];
+                if (remaining.len > 0) {
+                    try self.leftover.appendSlice(allocator, remaining);
+                }
+                return result;
+            } else |_| {}
+        }
 
         var sdu_buf: [max_sdu_payload]u8 = undefined;
 
@@ -151,6 +175,13 @@ pub const Bearer = struct {
                 // Found a complete CBOR message
                 const result = try allocator.alloc(u8, complete_msg.len);
                 @memcpy(result, complete_msg);
+
+                // Save remaining bytes as leftover for the next call
+                const remaining = accumulated.items[dec.pos..];
+                if (remaining.len > 0) {
+                    try self.leftover.appendSlice(allocator, remaining);
+                }
+
                 return result;
             } else |_| {
                 // Incomplete CBOR — need more SDUs
