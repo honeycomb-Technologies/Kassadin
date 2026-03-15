@@ -42,17 +42,19 @@ pub const BlockHeader = struct {
 pub const Block = struct {
     era: Era,
     header: BlockHeader,
+    // Raw CBOR of the full header [header_body, kes_sig] — for block hash computation
+    // Cardano block hash = Blake2b-256 of these bytes (hashAnnotated pattern)
+    header_raw: []const u8,
     // Raw CBOR slices for the block components
     tx_bodies_raw: []const u8,
     tx_witnesses_raw: []const u8,
     auxiliary_data_raw: []const u8,
     invalid_txs_raw: ?[]const u8, // Alonzo+ only
 
-    /// Compute the block hash (Blake2b-256 of the header CBOR).
+    /// Compute the block hash (Blake2b-256 of the full header CBOR).
+    /// This matches the Haskell headerHash = extractHash . hashAnnotated
     pub fn hash(self: *const Block) HeaderHash {
-        // The block hash is Blake2b-256 of the serialized header
-        // For now, hash the header_body_raw
-        return Blake2b256.hash(self.header.header_body_raw);
+        return Blake2b256.hash(self.header_raw);
     }
 };
 
@@ -203,7 +205,9 @@ pub fn parseBlock(data: []const u8) !Block {
 
     // KES signature
     const kes_sig_raw = try dec.sliceOfNextValue();
-    _ = header_start;
+
+    // Full header raw: from header_start to current position
+    const header_raw = data[header_start..dec.pos];
 
     // Elements 1-3 (or 1-4): tx_bodies, tx_witnesses, aux_data, [invalid_txs]
     const tx_bodies_raw = try dec.sliceOfNextValue();
@@ -230,6 +234,7 @@ pub fn parseBlock(data: []const u8) !Block {
             .header_body_raw = header_body_raw,
             .kes_signature_raw = kes_sig_raw,
         },
+        .header_raw = header_raw,
         .tx_bodies_raw = tx_bodies_raw,
         .tx_witnesses_raw = tx_witnesses_raw,
         .auxiliary_data_raw = auxiliary_data_raw,

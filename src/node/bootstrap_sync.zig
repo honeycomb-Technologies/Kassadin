@@ -55,8 +55,9 @@ pub fn bootstrapSync(
     result.snapshot_tip_block = tip_block.header.block_no;
 
     // Compute the block hash for FindIntersect
-    // The block hash in Cardano is Blake2b-256 of the header body CBOR
-    const block_hash = Blake2b256.hash(tip_block.header.header_body_raw);
+    // Cardano block hash = Blake2b-256 of the FULL header CBOR [header_body, kes_sig]
+    // This matches Haskell's headerHash = extractHash . hashAnnotated
+    const block_hash = tip_block.hash();
 
     std.debug.print("Snapshot tip: block={}, slot={}\n", .{
         result.snapshot_tip_block,
