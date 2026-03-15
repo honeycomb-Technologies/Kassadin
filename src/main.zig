@@ -35,6 +35,7 @@ pub const ledger = struct {
     pub const block = @import("ledger/block.zig");
     pub const transaction = @import("ledger/transaction.zig");
     pub const rules = @import("ledger/rules.zig");
+    pub const multiasset = @import("ledger/multiasset.zig");
 };
 
 pub const consensus = struct {
