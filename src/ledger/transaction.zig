@@ -237,6 +237,64 @@ test "transaction: parse Alonzo golden tx body" {
 
     // TxId should be 32 bytes (Blake2b-256 of body CBOR)
     try std.testing.expectEqual(@as(usize, 32), tx.tx_id.len);
+
+    // CRITICAL: Verify TxId matches Python-computed value from original bytes
+    // Python: hashlib.blake2b(raw_tx_body_bytes, digest_size=32).hexdigest()
+    //       = "ad8033bc3f0da247fb074361ad195cafd5b8bda105319325450f19d06723200a"
+    const expected_txid = [_]u8{
+        0xad, 0x80, 0x33, 0xbc, 0x3f, 0x0d, 0xa2, 0x47,
+        0xfb, 0x07, 0x43, 0x61, 0xad, 0x19, 0x5c, 0xaf,
+        0xd5, 0xb8, 0xbd, 0xa1, 0x05, 0x31, 0x93, 0x25,
+        0x45, 0x0f, 0x19, 0xd0, 0x67, 0x23, 0x20, 0x0a,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_txid, &tx.tx_id);
+}
+
+test "transaction: golden Alonzo tx fields match Python analysis" {
+    const allocator = std.testing.allocator;
+
+    const block_data = std.fs.cwd().readFileAlloc(
+        allocator,
+        "tests/vectors/alonzo_block.cbor",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(block_data);
+
+    const block_mod = @import("block.zig");
+    const block = try block_mod.parseBlock(block_data);
+
+    var dec = Decoder.init(block.tx_bodies_raw);
+    const num_txs = (try dec.decodeArrayLen()) orelse return;
+    try std.testing.expectEqual(@as(u64, 1), num_txs); // Golden block has exactly 1 tx
+
+    const first_tx_raw = try dec.sliceOfNextValue();
+    var tx = try parseTxBody(allocator, first_tx_raw);
+    defer freeTxBody(allocator, &tx);
+
+    // From Python analysis of the golden block:
+    // Inputs: 1 input — [ee155ace9c40292074cb6aff8c9ccdd273c81648ff1149ef36bcea6ebb8a3e25, 0]
+    try std.testing.expectEqual(@as(usize, 1), tx.inputs.len);
+    const expected_input_txid = [_]u8{
+        0xee, 0x15, 0x5a, 0xce, 0x9c, 0x40, 0x29, 0x20,
+        0x74, 0xcb, 0x6a, 0xff, 0x8c, 0x9c, 0xcd, 0xd2,
+        0x73, 0xc8, 0x16, 0x48, 0xff, 0x11, 0x49, 0xef,
+        0x36, 0xbc, 0xea, 0x6e, 0xbb, 0x8a, 0x3e, 0x25,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_input_txid, &tx.inputs[0].tx_id);
+    try std.testing.expectEqual(@as(u16, 0), tx.inputs[0].tx_ix);
+
+    // Outputs: 1 output with multi-asset value
+    try std.testing.expectEqual(@as(usize, 1), tx.outputs.len);
+    // The output value includes ADA (100 lovelace) + native token
+    // Python shows: value=[100, {policy => {name => 1000}}]
+    // Our parser extracts just the coin part for now
+    try std.testing.expectEqual(@as(Coin, 100), tx.outputs[0].value);
+
+    // Fee: 999
+    try std.testing.expectEqual(@as(Coin, 999), tx.fee);
 }
 
 test "transaction: total output value" {
