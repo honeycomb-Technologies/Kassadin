@@ -24,6 +24,11 @@ pub const network = struct {
     pub const peer = @import("network/peer.zig");
 };
 
+pub const storage = struct {
+    pub const immutable = @import("storage/immutable.zig");
+    pub const volatile_db = @import("storage/volatile.zig");
+};
+
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     try stdout.print("Kassadin — Cardano Node in Zig\n", .{});
