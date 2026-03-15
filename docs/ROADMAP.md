@@ -173,75 +173,66 @@ A spec-compliant Cardano block-producing node that:
 
 ---
 
-## Phase 3: Ledger — Multi-Era Validation
+## Phase 3: Ledger — Multi-Era Validation -- IN PROGRESS
 
-**Goal:** Validate every transaction and block from Byron through Conway.
+**Status:** 223 tests. Core subsystems built, Plutus stubbed (Zig version mismatch).
 
 ### 3.1 Byron Era
-- [ ] Byron block deserialization (legacy CBOR format)
-- [ ] Byron address validation
-- [ ] Byron UTxO transitions
-- [ ] Byron → Shelley hard fork boundary handling
+- [ ] Byron block deserialization (deferred — Mithril bootstrap skips Byron)
+- [ ] Byron address validation (deferred)
+- [ ] Byron UTxO transitions (deferred)
 
 ### 3.2 Shelley Era
-- [ ] Transaction body parsing (fields 0-7)
-- [ ] UTxO transition rule (UTXOW): inputs consumed, outputs created, fees, deposits
-- [ ] Preservation of value invariant
-- [ ] Certificate processing: registration, delegation, pool reg/retire, MIR
+- [x] Transaction body parsing (inputs, outputs, fee, TTL, validity_start)
+- [x] UTxO transition rule: preservation of value, fee check, min output
+- [x] Certificate processing: all 7 Shelley types (registration, delegation, pool reg/retire, genesis, MIR)
+- [x] Native multi-sig script validation (sig, all, any, n_of_k)
+- [x] Minimum fee calculation: fixed + (size × per-byte)
 - [ ] Stake snapshot pipeline (mark → set → go)
 - [ ] Reward calculation at epoch boundaries
 - [ ] Protocol parameter updates
-- [ ] Native multi-sig script validation
-- [ ] Minimum fee calculation: fixed + (size × per-byte)
 
 ### 3.3 Allegra/Mary Extensions
-- [ ] Validity intervals (invalidBefore, invalidHereafter)
-- [ ] Timelock scripts
-- [ ] Multi-asset Value type: Coin + Map PolicyID (Map AssetName Quantity)
-- [ ] Minting/burning via native scripts
-- [ ] Min-ADA-per-UTxO rule
+- [x] Validity intervals (invalidBefore, invalidHereafter via timelock scripts)
+- [x] Timelock scripts (invalid_before, invalid_hereafter)
+- [x] Multi-asset Value type: Coin + Map PolicyID (Map AssetName Quantity)
+- [ ] Minting/burning via native scripts (parsing done, validation deferred)
+- [ ] Min-ADA-per-UTxO rule (Babbage formula deferred)
 
 ### 3.4 Alonzo Extensions
-- [ ] Plutus V1 script execution (via plutuz)
-- [ ] Two-phase validation: Phase-1 (structural) then Phase-2 (scripts)
-- [ ] Collateral inputs (consumed on script failure)
+- [x] ExUnits tracking (mem + steps, add, fits)
+- [x] Redeemer types (spend, mint, cert, reward, voting, proposing)
+- [x] Script hash computation (Blake2b-224 with language prefix)
+- [ ] Plutus V1 script execution — BLOCKED: plutuz requires Zig 0.15.2+
+- [ ] Two-phase validation (Phase-1 structural done, Phase-2 scripts blocked)
+- [ ] Collateral inputs
 - [ ] Datum/Redeemer/ScriptContext construction
 - [ ] Script data hash computation (canonical CBOR)
-- [ ] ExUnits tracking and validation
-- [ ] Cost model application from protocol parameters
+- [ ] Cost model loading from protocol parameters
 
 ### 3.5 Babbage Extensions
-- [ ] Plutus V2 script execution
-- [ ] Reference inputs (CIP-31)
-- [ ] Inline datums (CIP-32)
-- [ ] Reference scripts (CIP-33)
-- [ ] Collateral return output
-- [ ] Total collateral field
+- [ ] Plutus V2 script execution (blocked on plutuz)
+- [ ] Reference inputs/scripts/datums (CIP-31/32/33)
+- [ ] Collateral return, total collateral
 
 ### 3.6 Conway Extensions
-- [ ] Plutus V3 script execution
-- [ ] Governance actions (7 types): parameter change, hard fork, treasury withdrawal, no confidence, update committee, new constitution, info
-- [ ] Voting procedures (DReps, Constitutional Committee, SPOs)
-- [ ] DRep registration/delegation certificates (tags 9-18)
-- [ ] Voting thresholds (pool: 5 params, DRep: 10 params)
-- [ ] Guardrails scripts
-- [ ] Treasury withdrawals
-- [ ] Governance action enactment state machine
+- [x] Certificate parsing: all Conway types (tags 7-18)
+- [x] DRep type (key_hash, script_hash, always_abstain, always_no_confidence)
+- [ ] Plutus V3 script execution (blocked on plutuz)
+- [ ] Governance actions, voting, enactment (parsing deferred)
 
 ### 3.7 Hard Fork Combinator
-- [ ] Multi-era block dispatch (tag 0=Byron, 1=Shelley, ..., 6=Conway)
-- [ ] Era transition detection from protocol parameters
+- [x] Multi-era block dispatch: tag 24 unwrapping, era ID mapping
+- [x] All 6 post-Byron eras parse correctly from ouroboros-consensus golden files
+- [ ] Era transition detection
 - [ ] Cross-era ledger state migration
-- [ ] Cross-era forecast bounds
 
 ### 3.8 Plutus Integration
-- [ ] plutuz dependency integration (build.zig.zon)
-- [ ] ScriptContext construction from transaction data
-- [ ] Cost model parameter loading from protocol parameters (V1, V2, V3)
-- [ ] Script hash computation (language prefix + flat-encoded script)
-- [ ] Phase-1 validation (well-formedness, version compatibility)
-- [ ] Redeemer → Script matching
-- [ ] Reference script resolution from UTxO
+- [x] Script hash computation (native + Plutus V1/V2/V3)
+- [x] ExUnits and Redeemer types defined
+- [x] evaluateScript interface defined (matches plutuz API)
+- [ ] BLOCKED: plutuz requires Zig 0.15.2+, we are on 0.13.0
+- [ ] Options: build plutuz as C lib, upgrade Zig, or port CEK machine
 
 **Spec:** `docs/specs/05-ledger.md`
 
