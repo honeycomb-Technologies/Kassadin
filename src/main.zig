@@ -62,6 +62,7 @@ pub const mempool = @import("mempool/mempool.zig");
 pub const node = struct {
     pub const node_mod = @import("node/node.zig");
     pub const keys = @import("node/keys.zig");
+    pub const genesis = @import("node/genesis.zig");
 };
 
 pub fn main() !void {
