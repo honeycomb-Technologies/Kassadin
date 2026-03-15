@@ -27,6 +27,8 @@ pub const network = struct {
 pub const storage = struct {
     pub const immutable = @import("storage/immutable.zig");
     pub const volatile_db = @import("storage/volatile.zig");
+    pub const ledger = @import("storage/ledger.zig");
+    pub const chaindb = @import("storage/chaindb.zig");
 };
 
 pub fn main() !void {
