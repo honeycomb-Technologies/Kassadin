@@ -443,53 +443,71 @@ fn hexToBytes(comptime len: usize, hex: *const [len * 2]u8) [len]u8 {
     return result;
 }
 
-test "kes golden: depth 6 secret key at period 0 matches Haskell/Rust" {
-    // Seed = "test string of 32 byte of lenght"
+test "kes golden: depth 6 SK layout matches Rust compactkey6.bin" {
+    // Seed = "test string of 32 byte of lenght" (deliberate misspelling, matches Rust/Haskell test)
     const seed: [32]u8 = "test string of 32 byte of lenght".*;
     const kp = try KES.generate(seed);
 
-    // First 32 bytes of SK should be the deepest-left Ed25519 seed
-    const expected_sk_first32 = hexToBytes(32, "3b6ba22c41839fc27fdf4e42ae9c75c0bb7f2f41ef69003692b3203b6b678598");
-    try std.testing.expectEqualSlices(u8, &expected_sk_first32, kp.sk[0..32]);
+    // Verify the full SK layout from compactkey6.bin (608 bytes):
+    // Layout: [depth5_inner_sk(512) | right_seed(32) | vk_left(32) | vk_right(32)]
 
-    // Last 64 bytes of SK are vk_left and vk_right at the top level
-    // In the golden file from Rust: bytes 544..576 = vk_left, 576..608 = vk_right
-    // But these correspond to the INNER left and right subtree VKs
-    const golden_vk_left = hexToBytes(32, "e78d6e26974a438f1376e3339d92f4e7e54944fa9e6e4f3f8c9b7ed1b46bbed1");
-    const golden_vk_right = hexToBytes(32, "0b318353c6c6ffc2b27907bb5118f52d9b6031e4f6e69d62d208553e35c099a9");
+    // First 32 bytes: deepest-left Ed25519 seed (6 levels of left seed expansion)
+    try std.testing.expectEqualSlices(u8,
+        &hexToBytes(32, "3b6ba22c41839fc27fdf4e42ae9c75c0bb7f2f41ef69003692b3203b6b678598"),
+        kp.sk[0..32]);
 
-    // Our SK stores [inner_sk(512) | seed(32) | vk_left(32) | vk_right(32)]
-    // Check what we actually have at those offsets
-    const our_vk_left = kp.sk[544..576];
-    const our_vk_right = kp.sk[576..608];
+    // Depth-1 level: vk_left = Ed25519 VK of the deepest-left leaf
+    try std.testing.expectEqualSlices(u8,
+        &hexToBytes(32, "1bf4bacb1be6ac5ff6a2ba1f9a3a8332425e09c2018b9da013c9b46ae1a4b690"),
+        kp.sk[64..96]);
 
-    // VK = Blake2b-256(vk_left ++ vk_right) — regardless of order, we need the right VK
-    const expected_vk = Blake2b256.hash(&(golden_vk_left ++ golden_vk_right));
-    const our_vk = Blake2b256.hash(our_vk_left ++ our_vk_right);
+    // Bytes 512-543: top-level right seed
+    try std.testing.expectEqualSlices(u8,
+        &hexToBytes(32, "e78d6e26974a438f1376e3339d92f4e7e54944fa9e6e4f3f8c9b7ed1b46bbed1"),
+        kp.sk[512..544]);
 
-    // The key test: does our VK match the expected golden VK?
-    try std.testing.expectEqualSlices(u8, &expected_vk, &our_vk);
+    // Bytes 544-575: top-level vk_left (= VK of entire depth-5 left subtree)
+    try std.testing.expectEqualSlices(u8,
+        &hexToBytes(32, "0b318353c6c6ffc2b27907bb5118f52d9b6031e4f6e69d62d208553e35c099a9"),
+        kp.sk[544..576]);
+
+    // Bytes 576-607: top-level vk_right (= VK of entire depth-5 right subtree)
+    try std.testing.expectEqualSlices(u8,
+        &hexToBytes(32, "4c1665a7ebaccd3378175bc5490d9d5b414d66f1565909492ed415cbf6d7a35e"),
+        kp.sk[576..608]);
+
+    // VK = Blake2b-256(vk_left || vk_right) — this is what gets published
+    const expected_vk = Blake2b256.hash(kp.sk[544..576] ++ kp.sk[576..608]);
     try std.testing.expectEqualSlices(u8, &expected_vk, &kp.vk);
 }
 
-test "kes golden: depth 6 SK first and last bytes match Rust" {
-    // Verify key structural properties from compactkey6.bin without needing
-    // exact full-SK byte match (layout may differ in vk_left/vk_right ordering)
+test "kes golden: depth 6 full SK byte-exact match with Rust compactkey6.bin" {
+    // Complete 608-byte SK from compactkey6.bin — byte-exact comparison
+    const expected_sk = hexToBytes(608,
+        "3b6ba22c41839fc27fdf4e42ae9c75c0bb7f2f41ef69003692b3203b6b678598" ++
+        "ba07fad4876a7094e1f081051040da432fd22cababd3ebf77332fb25b624f973" ++
+        "1bf4bacb1be6ac5ff6a2ba1f9a3a8332425e09c2018b9da013c9b46ae1a4b690" ++
+        "f9324acf6b44db26de96dd82e258a0b19f812a1813284955e63fdbb4c8ecf971" ++
+        "8af95e8b0da95d172e749ead8dc4828fc5607723f3e7611762d46f8723555920" ++
+        "a0448a6a090bbf65c1052e3995b5ee749626ab5a2484f7d767e75e2da828af97" ++
+        "e326e7889f40372c9bf7c422ce4f039de181e5354d26abbd82c8cae63e66ed43" ++
+        "473c46e066829bb6c19c956d83c4ef1a1d83949b39d16e28523030eb1b1adfcf" ++
+        "68c6febced18af77a204d79b570bc425f9f3b1f68c369f8270a9ce97ab124e6e" ++
+        "1ce29b709e4e4512a9db6bb7f8517c7c4c9b3aa0cbb516a128213b53c237172c" ++
+        "0abc61518b7113d686520c4c3216a273f6f2a1b0bb653cc96478e74db520a058" ++
+        "ef212dd8e22cfa42d3a6048250603c7f743d15886fb60ff22407a37b1a66311c" ++
+        "97480108d12e8c8c278afcb368e61a57df16e94594246f9f3edbc4c4461ac662" ++
+        "095ed01b1c3bdcf5b17055e8939283aad504f63ec0b6c29b4e7c5864df47815a" ++
+        "dfce87cddaeda4f313f5b91fe4e8dc13fb889d42bf04ca64cbeca3e5e71ab683" ++
+        "41f2ea1e2f71a5bffd9756aefc230f1aad4381072bac475611ff3d64f9a6cfb5" ++
+        "e78d6e26974a438f1376e3339d92f4e7e54944fa9e6e4f3f8c9b7ed1b46bbed1" ++
+        "0b318353c6c6ffc2b27907bb5118f52d9b6031e4f6e69d62d208553e35c099a9" ++
+        "4c1665a7ebaccd3378175bc5490d9d5b414d66f1565909492ed415cbf6d7a35e",
+    );
+
     const seed: [32]u8 = "test string of 32 byte of lenght".*;
     const kp = try KES.generate(seed);
-
-    // First 32 bytes: deepest-left Ed25519 seed (6 levels of left expansion)
-    const expected_first32 = hexToBytes(32, "3b6ba22c41839fc27fdf4e42ae9c75c0bb7f2f41ef69003692b3203b6b678598");
-    try std.testing.expectEqualSlices(u8, &expected_first32, kp.sk[0..32]);
-
-    // SK length must be 608
-    try std.testing.expectEqual(@as(usize, 608), kp.sk.len);
-
-    // VK must be deterministic and 32 bytes
-    try std.testing.expectEqual(@as(usize, 32), kp.vk.len);
-    const kp2 = try KES.generate(seed);
-    try std.testing.expectEqualSlices(u8, &kp.vk, &kp2.vk);
-    try std.testing.expectEqualSlices(u8, &kp.sk, &kp2.sk);
+    try std.testing.expectEqualSlices(u8, &expected_sk, &kp.sk);
 }
 
 test "kes golden: depth 6 signature at period 0 matches Rust golden file" {
