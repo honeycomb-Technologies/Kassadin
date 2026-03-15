@@ -39,26 +39,26 @@ pub const Bech32 = struct {
     }
 
     fn hrpExpand(allocator: Allocator, hrp: []const u8) Error![]u8 {
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
         for (hrp) |c| {
-            try result.append(@intCast(c >> 5));
+            try result.append(allocator, @intCast(c >> 5));
         }
-        try result.append(0);
+        try result.append(allocator, 0);
         for (hrp) |c| {
-            try result.append(@intCast(c & 31));
+            try result.append(allocator, @intCast(c & 31));
         }
-        return result.toOwnedSlice() catch return Error.OutOfMemory;
+        return result.toOwnedSlice(allocator) catch return Error.OutOfMemory;
     }
 
     fn verifyChecksum(allocator: Allocator, hrp: []const u8, data: []const u8) Error!bool {
         const expanded = try hrpExpand(allocator, hrp);
         defer allocator.free(expanded);
 
-        var values = std.ArrayList(u8).init(allocator);
-        defer values.deinit();
-        values.appendSlice(expanded) catch return Error.OutOfMemory;
-        values.appendSlice(data) catch return Error.OutOfMemory;
+        var values: std.ArrayList(u8) = .empty;
+        defer values.deinit(allocator);
+        values.appendSlice(allocator, expanded) catch return Error.OutOfMemory;
+        values.appendSlice(allocator, data) catch return Error.OutOfMemory;
 
         return polymod(values.items) == 1;
     }
@@ -67,11 +67,11 @@ pub const Bech32 = struct {
         const expanded = try hrpExpand(allocator, hrp);
         defer allocator.free(expanded);
 
-        var values = std.ArrayList(u8).init(allocator);
-        defer values.deinit();
-        values.appendSlice(expanded) catch return Error.OutOfMemory;
-        values.appendSlice(data) catch return Error.OutOfMemory;
-        values.appendSlice(&[_]u8{ 0, 0, 0, 0, 0, 0 }) catch return Error.OutOfMemory;
+        var values: std.ArrayList(u8) = .empty;
+        defer values.deinit(allocator);
+        values.appendSlice(allocator, expanded) catch return Error.OutOfMemory;
+        values.appendSlice(allocator, data) catch return Error.OutOfMemory;
+        values.appendSlice(allocator, &[_]u8{ 0, 0, 0, 0, 0, 0 }) catch return Error.OutOfMemory;
 
         const poly = polymod(values.items) ^ 1;
         var result: [6]u8 = undefined;
@@ -83,8 +83,8 @@ pub const Bech32 = struct {
 
     /// Convert between bit widths. from_bits/to_bits are 1-8.
     pub fn convertBits(allocator: Allocator, data: []const u8, comptime from_bits: u4, comptime to_bits: u4, pad: bool) Error![]u8 {
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
 
         var acc: u32 = 0;
         var bits: u32 = 0;
@@ -94,20 +94,20 @@ pub const Bech32 = struct {
             bits += from_bits;
             while (bits >= to_bits) {
                 bits -= to_bits;
-                result.append(@intCast((acc >> @intCast(bits)) & ((1 << to_bits) - 1))) catch return Error.OutOfMemory;
+                result.append(allocator, @intCast((acc >> @intCast(bits)) & ((1 << to_bits) - 1))) catch return Error.OutOfMemory;
             }
         }
 
         if (pad) {
             if (bits > 0) {
-                result.append(@intCast((acc << @intCast(to_bits - bits)) & ((1 << to_bits) - 1))) catch return Error.OutOfMemory;
+                result.append(allocator, @intCast((acc << @intCast(to_bits - bits)) & ((1 << to_bits) - 1))) catch return Error.OutOfMemory;
             }
         } else {
             if (bits >= from_bits) return Error.InvalidPadding;
             if ((acc << @intCast(to_bits - bits)) & ((1 << to_bits) - 1) != 0) return Error.InvalidPadding;
         }
 
-        return result.toOwnedSlice() catch return Error.OutOfMemory;
+        return result.toOwnedSlice(allocator) catch return Error.OutOfMemory;
     }
 
     /// Encode data with a human-readable prefix.
@@ -120,31 +120,31 @@ pub const Bech32 = struct {
 
         const checksum = try createChecksum(allocator, hrp, converted);
 
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
 
         // HRP (lowercase)
         for (hrp) |c| {
-            result.append(std.ascii.toLower(c)) catch return Error.OutOfMemory;
+            result.append(allocator, std.ascii.toLower(c)) catch return Error.OutOfMemory;
         }
         // Separator
-        result.append('1') catch return Error.OutOfMemory;
+        result.append(allocator, '1') catch return Error.OutOfMemory;
         // Data
         for (converted) |v| {
-            result.append(charset[v]) catch return Error.OutOfMemory;
+            result.append(allocator, charset[v]) catch return Error.OutOfMemory;
         }
         // Checksum
         for (checksum) |v| {
-            result.append(charset[v]) catch return Error.OutOfMemory;
+            result.append(allocator, charset[v]) catch return Error.OutOfMemory;
         }
 
         const total = result.items.len;
         if (total > 90) {
-            result.deinit();
+            result.deinit(allocator);
             return Error.TooLong;
         }
 
-        return result.toOwnedSlice() catch return Error.OutOfMemory;
+        return result.toOwnedSlice(allocator) catch return Error.OutOfMemory;
     }
 
     /// Decode a bech32 string. Returns HRP and data.
@@ -174,12 +174,12 @@ pub const Bech32 = struct {
         }
 
         // Extract data part (after separator, including checksum)
-        var data_with_checksum = std.ArrayList(u8).init(allocator);
-        defer data_with_checksum.deinit();
+        var data_with_checksum: std.ArrayList(u8) = .empty;
+        defer data_with_checksum.deinit(allocator);
         for (input[sep + 1 ..]) |c| {
             const lower = std.ascii.toLower(c);
             const val = charsetRevLookup(lower) orelse return Error.InvalidCharacter;
-            data_with_checksum.append(val) catch return Error.OutOfMemory;
+            data_with_checksum.append(allocator, val) catch return Error.OutOfMemory;
         }
 
         // Verify checksum

@@ -73,12 +73,12 @@ pub fn decodeValue(allocator: Allocator, decoder: *Decoder) (Allocator.Error || 
                 return .{ .array = items };
             } else {
                 // Indefinite-length
-                var list = std.ArrayList(CborValue).init(allocator);
+                var list: std.ArrayList(CborValue) = .empty;
                 while (!decoder.isBreak()) {
-                    try list.append(try decodeValue(allocator, decoder));
+                    try list.append(allocator, try decodeValue(allocator, decoder));
                 }
                 try decoder.decodeBreak();
-                return .{ .array = try list.toOwnedSlice() };
+                return .{ .array = try list.toOwnedSlice(allocator) };
             }
         },
         5 => {
@@ -91,14 +91,14 @@ pub fn decodeValue(allocator: Allocator, decoder: *Decoder) (Allocator.Error || 
                 }
                 return .{ .map = entries };
             } else {
-                var list = std.ArrayList(MapEntry).init(allocator);
+                var list: std.ArrayList(MapEntry) = .empty;
                 while (!decoder.isBreak()) {
                     const key = try decodeValue(allocator, decoder);
                     const value = try decodeValue(allocator, decoder);
-                    try list.append(.{ .key = key, .value = value });
+                    try list.append(allocator, .{ .key = key, .value = value });
                 }
                 try decoder.decodeBreak();
-                return .{ .map = try list.toOwnedSlice() };
+                return .{ .map = try list.toOwnedSlice(allocator) };
             }
         },
         6 => {

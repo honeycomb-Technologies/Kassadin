@@ -52,10 +52,11 @@ pub const mempool = @import("mempool/mempool.zig");
 pub const node = @import("node/node.zig");
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("Kassadin — Cardano Node in Zig\n", .{});
-    try stdout.print("Version: 0.0.0 (Phase 0: Foundation)\n", .{});
-    try stdout.print("Status: Crypto + CBOR complete\n", .{});
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("Kassadin — Cardano Node in Zig\n", .{});
+    try w.interface.print("Version: 0.0.0 (Phase 0: Foundation)\n", .{});
+    try w.interface.print("Status: Crypto + CBOR complete\n", .{});
 }
 
 test {

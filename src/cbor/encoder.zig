@@ -2,14 +2,15 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const Encoder = struct {
-    data: std.ArrayList(u8),
+    data: std.ArrayList(u8) = .empty,
+    allocator: Allocator,
 
     pub fn init(allocator: Allocator) Encoder {
-        return .{ .data = std.ArrayList(u8).init(allocator) };
+        return .{ .data = .empty, .allocator = allocator };
     }
 
     pub fn deinit(self: *Encoder) void {
-        self.data.deinit();
+        self.data.deinit(self.allocator);
     }
 
     // ── Major type 0: Unsigned integer ──
@@ -38,14 +39,14 @@ pub const Encoder = struct {
 
     pub fn encodeBytes(self: *Encoder, bytes: []const u8) !void {
         try self.writeTypedArgument(2, bytes.len);
-        try self.data.appendSlice(bytes);
+        try self.data.appendSlice(self.allocator, bytes);
     }
 
     // ── Major type 3: Text string ──
 
     pub fn encodeText(self: *Encoder, text: []const u8) !void {
         try self.writeTypedArgument(3, text.len);
-        try self.data.appendSlice(text);
+        try self.data.appendSlice(self.allocator, text);
     }
 
     // ── Major type 4: Array ──
@@ -55,7 +56,7 @@ pub const Encoder = struct {
     }
 
     pub fn encodeArrayIndef(self: *Encoder) !void {
-        try self.data.append(0x9f);
+        try self.data.append(self.allocator, 0x9f);
     }
 
     // ── Major type 5: Map ──
@@ -65,7 +66,7 @@ pub const Encoder = struct {
     }
 
     pub fn encodeMapIndef(self: *Encoder) !void {
-        try self.data.append(0xbf);
+        try self.data.append(self.allocator, 0xbf);
     }
 
     // ── Major type 6: Tag ──
@@ -77,34 +78,34 @@ pub const Encoder = struct {
     // ── Major type 7: Simple values and floats ──
 
     pub fn encodeBool(self: *Encoder, value: bool) !void {
-        try self.data.append(if (value) 0xf5 else 0xf4);
+        try self.data.append(self.allocator, if (value) 0xf5 else 0xf4);
     }
 
     pub fn encodeNull(self: *Encoder) !void {
-        try self.data.append(0xf6);
+        try self.data.append(self.allocator, 0xf6);
     }
 
     pub fn encodeUndefined(self: *Encoder) !void {
-        try self.data.append(0xf7);
+        try self.data.append(self.allocator, 0xf7);
     }
 
     pub fn encodeBreak(self: *Encoder) !void {
-        try self.data.append(0xff);
+        try self.data.append(self.allocator, 0xff);
     }
 
     pub fn encodeSimple(self: *Encoder, value: u8) !void {
         if (value <= 23) {
-            try self.data.append(0xe0 | value);
+            try self.data.append(self.allocator, 0xe0 | value);
         } else {
-            try self.data.append(0xf8);
-            try self.data.append(value);
+            try self.data.append(self.allocator, 0xf8);
+            try self.data.append(self.allocator, value);
         }
     }
 
     // ── Raw byte injection ──
 
     pub fn writeRaw(self: *Encoder, raw: []const u8) !void {
-        try self.data.appendSlice(raw);
+        try self.data.appendSlice(self.allocator, raw);
     }
 
     // ── Output ──
@@ -114,7 +115,7 @@ pub const Encoder = struct {
     }
 
     pub fn toOwnedSlice(self: *Encoder) ![]u8 {
-        return self.data.toOwnedSlice();
+        return self.data.toOwnedSlice(self.allocator);
     }
 
     // ── Internal: Write major type + argument ──
@@ -122,19 +123,19 @@ pub const Encoder = struct {
     fn writeTypedArgument(self: *Encoder, major: u3, value: u64) !void {
         const high: u8 = @as(u8, major) << 5;
         if (value <= 23) {
-            try self.data.append(high | @as(u8, @intCast(value)));
+            try self.data.append(self.allocator, high | @as(u8, @intCast(value)));
         } else if (value <= 0xff) {
-            try self.data.append(high | 24);
-            try self.data.append(@intCast(value));
+            try self.data.append(self.allocator, high | 24);
+            try self.data.append(self.allocator, @intCast(value));
         } else if (value <= 0xffff) {
-            try self.data.append(high | 25);
-            try self.data.appendSlice(&std.mem.toBytes(std.mem.nativeTo(u16, @intCast(value), .big)));
+            try self.data.append(self.allocator, high | 25);
+            try self.data.appendSlice(self.allocator, &std.mem.toBytes(std.mem.nativeTo(u16, @intCast(value), .big)));
         } else if (value <= 0xffff_ffff) {
-            try self.data.append(high | 26);
-            try self.data.appendSlice(&std.mem.toBytes(std.mem.nativeTo(u32, @intCast(value), .big)));
+            try self.data.append(self.allocator, high | 26);
+            try self.data.appendSlice(self.allocator, &std.mem.toBytes(std.mem.nativeTo(u32, @intCast(value), .big)));
         } else {
-            try self.data.append(high | 27);
-            try self.data.appendSlice(&std.mem.toBytes(std.mem.nativeTo(u64, value, .big)));
+            try self.data.append(self.allocator, high | 27);
+            try self.data.appendSlice(self.allocator, &std.mem.toBytes(std.mem.nativeTo(u64, value, .big)));
         }
     }
 };

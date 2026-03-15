@@ -97,8 +97,8 @@ pub const ChainDB = struct {
         var promoted: u32 = 0;
         const vol = &self.@"volatile";
 
-        var to_promote = std.ArrayList(HeaderHash).init(self.allocator);
-        defer to_promote.deinit();
+        var to_promote: std.ArrayList(HeaderHash) = .empty;
+        defer to_promote.deinit(self.allocator);
 
         var it = vol.blocks.iterator();
         while (it.next()) |entry| {
@@ -106,7 +106,7 @@ pub const ChainDB = struct {
             if (self.tip_block_no > self.security_param and
                 info.block_no <= self.tip_block_no - self.security_param)
             {
-                try to_promote.append(info.hash);
+                try to_promote.append(self.allocator, info.hash);
             }
         }
 

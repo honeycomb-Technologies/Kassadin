@@ -45,10 +45,10 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
 
     const map_len = try dec.decodeMapLen() orelse return error.InvalidCbor;
 
-    var inputs = std.ArrayList(TxIn).init(allocator);
-    defer inputs.deinit();
-    var outputs = std.ArrayList(TxOut).init(allocator);
-    defer outputs.deinit();
+    var inputs: std.ArrayList(TxIn) = .empty;
+    defer inputs.deinit(allocator);
+    var outputs: std.ArrayList(TxOut) = .empty;
+    defer outputs.deinit(allocator);
     var fee: Coin = 0;
     var ttl: ?u64 = null;
     var validity_start: ?u64 = null;
@@ -79,7 +79,7 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
                     var txid: TxId = undefined;
                     @memcpy(&txid, txid_bytes);
                     const ix = @as(u16, @intCast(try dec.decodeUint()));
-                    try inputs.append(.{ .tx_id = txid, .tx_ix = ix });
+                    try inputs.append(allocator, .{ .tx_id = txid, .tx_ix = ix });
                 }
             },
             1 => {
@@ -89,7 +89,7 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
                 while (j < num_outputs) : (j += 1) {
                     const out_raw = try dec.sliceOfNextValue();
                     const out = try parseOutput(out_raw);
-                    try outputs.append(.{
+                    try outputs.append(allocator, .{
                         .address_raw = out.address_raw,
                         .value = out.value,
                         .datum_hash = out.datum_hash,
@@ -118,8 +118,8 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
 
     return .{
         .tx_id = tx_id,
-        .inputs = try inputs.toOwnedSlice(),
-        .outputs = try outputs.toOwnedSlice(),
+        .inputs = try inputs.toOwnedSlice(allocator),
+        .outputs = try outputs.toOwnedSlice(allocator),
         .fee = fee,
         .ttl = ttl,
         .validity_start = validity_start,

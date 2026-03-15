@@ -106,13 +106,13 @@ pub const VolatileDB = struct {
 
     /// Garbage collect blocks with slot < given slot.
     pub fn garbageCollect(self: *VolatileDB, min_slot: SlotNo) !void {
-        var to_remove = std.ArrayList(HeaderHash).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList(HeaderHash) = .empty;
+        defer to_remove.deinit(self.allocator);
 
         var it = self.blocks.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.slot < min_slot) {
-                try to_remove.append(entry.key_ptr.*);
+                try to_remove.append(self.allocator, entry.key_ptr.*);
             }
         }
 

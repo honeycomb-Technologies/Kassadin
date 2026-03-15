@@ -60,18 +60,18 @@ pub fn applyBlock(
         const consumed = try allocator.alloc(TxIn, tx.inputs.len);
         @memcpy(consumed, tx.inputs);
 
-        var produced_list = std.ArrayList(UtxoEntry).init(allocator);
-        defer produced_list.deinit();
+        var produced_list: std.ArrayList(UtxoEntry) = .empty;
+        defer produced_list.deinit(allocator);
 
         for (tx.outputs, 0..) |out, ix| {
-            try produced_list.append(.{
+            try produced_list.append(allocator, .{
                 .tx_in = .{ .tx_id = tx.tx_id, .tx_ix = @intCast(ix) },
                 .value = out.value,
                 .raw_cbor = out.raw_cbor,
             });
         }
 
-        const produced = try produced_list.toOwnedSlice();
+        const produced = try produced_list.toOwnedSlice(allocator);
 
         // Apply the diff
         try ledger.applyDiff(.{

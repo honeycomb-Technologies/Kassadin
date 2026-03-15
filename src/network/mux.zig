@@ -120,8 +120,8 @@ pub const Bearer = struct {
     /// Read a complete protocol message that may span multiple SDUs.
     /// Reassembles fragments until a complete CBOR value is available.
     pub fn readProtocolMessage(self: *Bearer, protocol_num: u15, allocator: std.mem.Allocator) ![]u8 {
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
 
         var buf: [max_sdu_payload]u8 = undefined;
 
@@ -135,7 +135,7 @@ pub const Bearer = struct {
                 continue;
             }
 
-            try result.appendSlice(sdu.payload);
+            try result.appendSlice(allocator, sdu.payload);
 
             // Check if we have a complete CBOR value
             // A simple heuristic: try to decode the CBOR and see if it consumes all bytes
@@ -144,7 +144,7 @@ pub const Bearer = struct {
             break;
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(allocator);
     }
 
     // -- Internal helpers --

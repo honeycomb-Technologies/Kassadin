@@ -96,13 +96,13 @@ pub const Mempool = struct {
     /// Get transactions sorted by fee density (fee/size) for block forging.
     /// Returns up to max_bytes worth of transactions.
     pub fn selectForForging(self: *const Mempool, allocator: Allocator, max_bytes: u32) ![]const MempoolTx {
-        var result = std.ArrayList(MempoolTx).init(allocator);
-        defer result.deinit();
+        var result: std.ArrayList(MempoolTx) = .empty;
+        defer result.deinit(allocator);
 
         // Collect all txs
         var it = self.txs.valueIterator();
         while (it.next()) |tx| {
-            try result.append(tx.*);
+            try result.append(allocator, tx.*);
         }
 
         // Sort by fee density (descending — highest fee/byte first)
@@ -115,15 +115,15 @@ pub const Mempool = struct {
         }.lessThan);
 
         // Select txs up to max_bytes
-        var selected = std.ArrayList(MempoolTx).init(allocator);
+        var selected: std.ArrayList(MempoolTx) = .empty;
         var total_bytes: u32 = 0;
         for (result.items) |tx| {
             if (total_bytes + tx.size_bytes > max_bytes) continue;
-            try selected.append(tx);
+            try selected.append(allocator, tx);
             total_bytes += tx.size_bytes;
         }
 
-        return selected.toOwnedSlice();
+        return selected.toOwnedSlice(allocator);
     }
 };
 

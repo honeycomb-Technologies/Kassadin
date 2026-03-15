@@ -51,7 +51,7 @@ pub const LedgerDB = struct {
         return .{
             .allocator = allocator,
             .utxo_set = std.AutoHashMap(TxIn, UtxoEntry).init(allocator),
-            .diffs = std.ArrayList(LedgerDiff).init(allocator),
+            .diffs = .empty,
             .tip_slot = null,
             .snapshot_path = snapshot_path,
         };
@@ -70,7 +70,7 @@ pub const LedgerDB = struct {
             self.allocator.free(diff.consumed);
             self.allocator.free(diff.produced);
         }
-        self.diffs.deinit();
+        self.diffs.deinit(self.allocator);
     }
 
     /// Apply a ledger diff (from a validated block).
@@ -94,7 +94,7 @@ pub const LedgerDB = struct {
         }
 
         // Store diff for rollback (we take ownership of consumed/produced slices)
-        try self.diffs.append(diff);
+        try self.diffs.append(self.allocator, diff);
 
         // Trim diffs to k=2160
         const max_diffs = 2160;
@@ -111,7 +111,7 @@ pub const LedgerDB = struct {
     pub fn rollback(self: *LedgerDB, n: usize) !void {
         var i: usize = 0;
         while (i < n and self.diffs.items.len > 0) : (i += 1) {
-            const diff = self.diffs.pop();
+            const diff = self.diffs.pop().?;
 
             // Undo: remove produced UTxOs
             for (diff.produced) |entry| {

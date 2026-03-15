@@ -1,11 +1,18 @@
 .{
-    .name = "kassadin",
+    .name = .kassadin,
     .version = "0.0.0",
-    .dependencies = .{},
+    .fingerprint = 0x24d7ae8e83f4e0a4,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .plutuz = .{
+            .path = "reference-plutuz",
+        },
+    },
     .paths = .{
-        "",
         "build.zig",
         "build.zig.zon",
         "src",
+        "vendor",
+        "tests",
     },
 }

@@ -19,7 +19,7 @@ pub const Ed25519 = struct {
 
     /// Generate a keypair from a 32-byte seed. Deterministic.
     pub fn keyFromSeed(seed: Seed) Error!struct { sk: SignKey, vk: VerKey } {
-        const kp = Std.KeyPair.create(seed) catch return error.KeyGenFailed;
+        const kp = Std.KeyPair.generateDeterministic(seed) catch return error.KeyGenFailed;
         var sk: SignKey = undefined;
         @memcpy(sk[0..32], &seed);
         @memcpy(sk[32..64], &kp.public_key.bytes);
@@ -29,7 +29,7 @@ pub const Ed25519 = struct {
     /// Sign a message. Deterministic (RFC 8032).
     pub fn sign(msg: []const u8, sk: SignKey) Error!Signature {
         const seed: Seed = sk[0..32].*;
-        const kp = Std.KeyPair.create(seed) catch return error.SignFailed;
+        const kp = Std.KeyPair.generateDeterministic(seed) catch return error.SignFailed;
         const sig = kp.sign(msg, null) catch return error.SignFailed;
         return sig.toBytes();
     }
