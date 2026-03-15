@@ -66,6 +66,7 @@ pub const node = struct {
     pub const sync = @import("node/sync.zig");
     pub const runner = @import("node/runner.zig");
     pub const mithril = @import("node/mithril.zig");
+    pub const snapshot_restore = @import("node/snapshot_restore.zig");
 };
 
 pub fn main() !void {
