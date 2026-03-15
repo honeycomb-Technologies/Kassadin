@@ -67,8 +67,10 @@ A spec-compliant Cardano block-producing node that:
 - [x] SDU framing (12,288 byte max payload)
 - [x] Bearer abstraction (TCP socket via std.net)
 - [x] SDU fragmentation for payloads > max size
+- [x] Multi-SDU message reassembly with per-protocol ingress buffers
+  (following Haskell Network/Mux/Ingress.hs design — CBOR framing for message boundaries)
+- [x] Unix socket bearer for N2C (connectUnix, UnixServer)
 - [ ] Round-robin egress scheduling (deferred — single-threaded for now)
-- [ ] Unix socket bearer (deferred to Phase 6 for N2C)
 
 ### 1.2 Handshake Protocol
 - [x] MsgProposeVersions / MsgAcceptVersion / MsgRefuse codec
