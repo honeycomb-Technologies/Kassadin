@@ -37,6 +37,10 @@ pub const ledger = struct {
     pub const rules = @import("ledger/rules.zig");
 };
 
+pub const consensus = struct {
+    pub const praos = @import("consensus/praos.zig");
+};
+
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     try stdout.print("Kassadin — Cardano Node in Zig\n", .{});
