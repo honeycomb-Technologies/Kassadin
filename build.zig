@@ -69,7 +69,10 @@ pub fn build(b: *std.Build) void {
         .{ "test-blocks", "tests/test_real_blocks.zig", "Run real block parsing" },
         .{ "test-fetch", "tests/test_fetch_blocks.zig", "Fetch and parse real blocks" },
         .{ "test-dolos", "tests/test_dolos.zig", "Test N2C with local Dolos node" },
+        .{ "test-dolos-query", "tests/test_dolos_query.zig", "Test Dolos gRPC query path with local Dolos node" },
         .{ "test-blockfetch", "tests/test_block_fetch.zig", "Fetch a real block from preview" },
+        .{ "test-origin-sync", "tests/test_origin_sync.zig", "Validate fresh-db origin sync with local genesis seeding" },
+        .{ "test-origin-transition", "tests/test_origin_transition.zig", "Validate origin sync across the Byron-to-Shelley transition" },
     }) |entry| {
         const t = b.addExecutable(.{
             .name = entry[0],

@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
+const block_mod = @import("../ledger/block.zig");
 
 pub const SlotNo = types.SlotNo;
 pub const HeaderHash = types.HeaderHash;
@@ -20,6 +21,7 @@ pub const BlockInfo = struct {
     slot: SlotNo,
     hash: HeaderHash,
     block_no: BlockNo,
+    chunk_no: u32,
     offset: u64, // byte offset in chunk file
     size: u32, // block size in bytes
     header_offset: u16, // offset of header within block
@@ -70,7 +72,7 @@ pub const ImmutableDB = struct {
     }
 
     /// Append a block to the current chunk.
-    pub fn appendBlock(self: *ImmutableDB, block_data: []const u8, slot: SlotNo, block_no: BlockNo) !void {
+    pub fn appendBlock(self: *ImmutableDB, hash: HeaderHash, block_data: []const u8, slot: SlotNo, block_no: BlockNo) !void {
         // Open or create chunk file
         if (self.chunk_file == null) {
             self.chunk_file = try self.openOrCreateChunk(self.current_chunk);
@@ -78,6 +80,7 @@ pub const ImmutableDB = struct {
 
         const file = self.chunk_file.?;
         const offset = try file.getEndPos();
+        try file.seekTo(offset);
 
         // Write block with length prefix (4 bytes, big-endian)
         var len_buf: [4]u8 = undefined;
@@ -85,14 +88,12 @@ pub const ImmutableDB = struct {
         try file.writeAll(&len_buf);
         try file.writeAll(block_data);
 
-        // Compute block hash
-        const hash = Blake2b256.hash(block_data);
-
         // Update secondary index
         try self.secondary_index.put(hash, .{
             .slot = slot,
             .hash = hash,
             .block_no = block_no,
+            .chunk_no = self.current_chunk,
             .offset = offset,
             .size = @intCast(block_data.len),
             .header_offset = 0, // TODO: parse header offset from block
@@ -112,7 +113,7 @@ pub const ImmutableDB = struct {
     /// Get a block by its hash.
     pub fn getBlock(self: *ImmutableDB, hash: HeaderHash) !?[]const u8 {
         const info = self.secondary_index.get(hash) orelse return null;
-        return try self.readBlockAt(self.current_chunk, info.offset, info.size);
+        return try self.readBlockAt(info.chunk_no, info.offset, info.size);
     }
 
     /// Get the current tip.
@@ -139,8 +140,10 @@ pub const ImmutableDB = struct {
     }
 
     fn readBlockAt(self: *ImmutableDB, chunk_no: u32, offset: u64, size: u32) ![]const u8 {
-        _ = chunk_no;
-        const file = self.chunk_file orelse return error.FileNotFound;
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{ self.base_path, chunk_no });
+        var file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer file.close();
 
         try file.seekTo(offset);
 
@@ -164,17 +167,83 @@ pub const ImmutableDB = struct {
     }
 
     fn recoverState(self: *ImmutableDB) !void {
-        // Scan for the highest-numbered chunk file
-        var chunk_no: u32 = 0;
-        while (chunk_no < 100000) : (chunk_no += 1) {
-            var path_buf: [256]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{ self.base_path, chunk_no }) catch break;
-            const stat = std.fs.cwd().statFile(path) catch break;
-            _ = stat;
-            self.current_chunk = chunk_no;
+        var dir = std.fs.cwd().openDir(self.base_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var discovered: std.ArrayList(u32) = .empty;
+        defer discovered.deinit(self.allocator);
+
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (!std.mem.endsWith(u8, entry.name, ".chunk")) continue;
+            const chunk_str = entry.name[0 .. entry.name.len - ".chunk".len];
+            const chunk_no = std.fmt.parseInt(u32, chunk_str, 10) catch continue;
+            try discovered.append(self.allocator, chunk_no);
         }
-        // If chunks exist, we'd rebuild the index here.
-        // For Phase 2, we start fresh.
+
+        if (discovered.items.len == 0) {
+            self.current_chunk = 0;
+            self.tip = null;
+            return;
+        }
+
+        std.mem.sort(u32, discovered.items, {}, comptime std.sort.asc(u32));
+        self.current_chunk = discovered.items[discovered.items.len - 1];
+
+        for (discovered.items) |chunk_no| {
+            try self.recoverChunk(chunk_no);
+        }
+    }
+
+    fn recoverChunk(self: *ImmutableDB, chunk_no: u32) !void {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{ self.base_path, chunk_no });
+        var file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer file.close();
+
+        const end_pos = try file.getEndPos();
+        var offset: u64 = 0;
+
+        while (offset < end_pos) {
+            try file.seekTo(offset);
+
+            var len_buf: [4]u8 = undefined;
+            const len_read = try file.readAll(&len_buf);
+            if (len_read == 0) break;
+            if (len_read != len_buf.len) break;
+
+            const block_len = std.mem.readInt(u32, &len_buf, .big);
+            const remaining = end_pos - offset - len_buf.len;
+            if (block_len == 0 or block_len > remaining) break;
+
+            const block_data = try self.allocator.alloc(u8, block_len);
+            defer self.allocator.free(block_data);
+
+            const data_read = try file.readAll(block_data);
+            if (data_read != block_len) break;
+
+            const block = block_mod.parseBlock(block_data) catch break;
+            const hash = block.hash();
+            try self.secondary_index.put(hash, .{
+                .slot = block.header.slot,
+                .hash = hash,
+                .block_no = block.header.block_no,
+                .chunk_no = chunk_no,
+                .offset = offset,
+                .size = block_len,
+                .header_offset = 0,
+                .header_size = 0,
+                .is_ebb = false,
+            });
+            self.tip = .{
+                .slot = block.header.slot,
+                .hash = hash,
+                .block_no = block.header.block_no,
+                .chunk_no = chunk_no,
+            };
+
+            offset += len_buf.len + block_len;
+        }
     }
 
     pub const Error = error{
@@ -205,7 +274,8 @@ test "immutabledb: append and retrieve block" {
 
     // Append a fake block
     const block_data = "fake block data for testing";
-    try db.appendBlock(block_data, 42, 1);
+    const hash = Blake2b256.hash(block_data);
+    try db.appendBlock(hash, block_data, 42, 1);
 
     // Verify tip
     const tip = db.getTip().?;
@@ -213,7 +283,6 @@ test "immutabledb: append and retrieve block" {
     try std.testing.expectEqual(@as(BlockNo, 1), tip.block_no);
 
     // Retrieve by hash
-    const hash = Blake2b256.hash(block_data);
     const retrieved = try db.getBlock(hash);
     try std.testing.expect(retrieved != null);
     defer allocator.free(retrieved.?);
@@ -234,32 +303,61 @@ test "immutabledb: multiple blocks" {
         var data: [32]u8 = undefined;
         std.mem.writeInt(u32, data[0..4], i, .big);
         @memset(data[4..], 0xab);
-        try db.appendBlock(&data, @intCast(i * 10), @intCast(i));
+        try db.appendBlock(Blake2b256.hash(&data), &data, @intCast(i * 10), @intCast(i));
     }
 
     try std.testing.expectEqual(@as(usize, 10), db.blockCount());
     try std.testing.expectEqual(@as(SlotNo, 90), db.getTip().?.slot);
 }
 
-test "immutabledb: crash recovery — reopening preserves nothing (fresh start)" {
+test "immutabledb: crash recovery rebuilds tip and index" {
     const allocator = std.testing.allocator;
     std.fs.cwd().deleteTree("/tmp/kassadin-test-imm4") catch {};
     defer std.fs.cwd().deleteTree("/tmp/kassadin-test-imm4") catch {};
+
+    const block1_data = std.fs.cwd().readFileAlloc(
+        allocator,
+        "tests/vectors/golden_block_babbage.cbor",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(block1_data);
+
+    const block2_data = std.fs.cwd().readFileAlloc(
+        allocator,
+        "tests/vectors/golden_block_conway.cbor",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(block2_data);
+
+    const block1 = try block_mod.parseBlock(block1_data);
+    const block2 = try block_mod.parseBlock(block2_data);
 
     // Write blocks
     {
         var db = try ImmutableDB.open(allocator, "/tmp/kassadin-test-imm4");
         defer db.close();
-        try db.appendBlock("block1", 10, 1);
-        try db.appendBlock("block2", 20, 2);
+        try db.appendBlock(block1.hash(), block1_data, block1.header.slot, block1.header.block_no);
+        try db.appendBlock(block2.hash(), block2_data, block2.header.slot, block2.header.block_no);
     }
 
-    // Reopen — for now the in-memory index is lost (full recovery comes later)
+    // Reopen — the in-memory index is reconstructed from chunk files.
     {
         var db = try ImmutableDB.open(allocator, "/tmp/kassadin-test-imm4");
         defer db.close();
-        // The chunk file exists but we don't rebuild the index yet
-        try std.testing.expect(db.getTip() == null);
-        // This is a known limitation for Phase 2 — full recovery will rebuild from chunk files
+
+        const tip = db.getTip().?;
+        try std.testing.expectEqual(block2.header.slot, tip.slot);
+        try std.testing.expectEqual(block2.header.block_no, tip.block_no);
+
+        const block = try db.getBlock(block2.hash());
+        try std.testing.expect(block != null);
+        defer allocator.free(block.?);
+        try std.testing.expectEqualSlices(u8, block2_data, block.?);
     }
 }

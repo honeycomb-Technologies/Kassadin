@@ -1,14 +1,21 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
+const block_mod = @import("../ledger/block.zig");
+const ledger_apply = @import("../ledger/apply.zig");
+const protocol_update = @import("../ledger/protocol_update.zig");
+const rules = @import("../ledger/rules.zig");
 const ImmutableDB = @import("immutable.zig").ImmutableDB;
 const VolatileDB = @import("volatile.zig").VolatileDB;
 const LedgerDB = @import("ledger.zig").LedgerDB;
+const UtxoEntry = @import("ledger.zig").UtxoEntry;
 
 pub const SlotNo = types.SlotNo;
 pub const BlockNo = types.BlockNo;
 pub const HeaderHash = types.HeaderHash;
+pub const Point = types.Point;
 
 /// Result of adding a block to the ChainDB.
 pub const AddBlockResult = enum {
@@ -22,15 +29,34 @@ pub const AddBlockResult = enum {
 /// Manages the full block storage lifecycle: volatile → immutable promotion,
 /// chain selection, and ledger state tracking.
 pub const ChainDB = struct {
+    const TipInfo = struct {
+        point: Point,
+        block_no: BlockNo,
+    };
+
+    const CurrentChainEntry = struct {
+        point: Point,
+        block_no: BlockNo,
+        txs_applied: u32,
+        governance_snapshot: ?protocol_update.GovernanceSnapshot,
+    };
+
     allocator: Allocator,
     immutable: ImmutableDB,
     @"volatile": VolatileDB,
     ledger: LedgerDB,
+    current_chain: std.ArrayList(CurrentChainEntry),
 
     /// Current chain tip (from volatile or immutable).
     tip_slot: SlotNo,
     tip_hash: HeaderHash,
     tip_block_no: BlockNo,
+    base_tip: ?TipInfo,
+    ledger_validation_enabled: bool,
+    ledger_ready: bool,
+    protocol_params: rules.ProtocolParams,
+    shelley_governance_config: ?protocol_update.GovernanceConfig,
+    governance_state: protocol_update.GovernanceState,
 
     /// Security parameter k — blocks deeper than this are finalized.
     security_param: u64,
@@ -42,53 +68,255 @@ pub const ChainDB = struct {
         var ledger_path_buf: [256]u8 = undefined;
         const ledger_path = try std.fmt.bufPrint(&ledger_path_buf, "{s}/ledger", .{db_path});
 
-        return .{
+        var db = ChainDB{
             .allocator = allocator,
             .immutable = try ImmutableDB.open(allocator, imm_path),
             .@"volatile" = VolatileDB.init(allocator),
             .ledger = try LedgerDB.init(allocator, ledger_path),
+            .current_chain = .empty,
             .tip_slot = 0,
             .tip_hash = [_]u8{0} ** 32,
             .tip_block_no = 0,
+            .base_tip = null,
+            .ledger_validation_enabled = false,
+            .ledger_ready = false,
+            .protocol_params = rules.ProtocolParams.compatibility_defaults,
+            .shelley_governance_config = null,
+            .governance_state = .{},
             .security_param = security_param,
         };
+
+        if (db.immutable.getTip()) |tip| {
+            db.tip_slot = tip.slot;
+            db.tip_hash = tip.hash;
+            db.tip_block_no = tip.block_no;
+            db.base_tip = .{
+                .point = .{ .slot = tip.slot, .hash = tip.hash },
+                .block_no = tip.block_no,
+            };
+        }
+
+        return db;
     }
 
     pub fn close(self: *ChainDB) void {
+        for (self.current_chain.items) |*entry| {
+            if (entry.governance_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+        }
         self.immutable.close();
         self.@"volatile".deinit();
         self.ledger.deinit();
+        self.current_chain.deinit(self.allocator);
+        self.governance_state.deinit(self.allocator);
+        if (self.shelley_governance_config) |*config| {
+            config.deinit(self.allocator);
+        }
+    }
+
+    /// Enable ledger validation for an empty current chain.
+    /// If `base_tip` is present, callers must have already hydrated the base ledger state.
+    pub fn enableLedgerValidation(self: *ChainDB) !void {
+        if (self.current_chain.items.len > 0) {
+            return error.ChainNotEmpty;
+        }
+        if (self.base_tip == null and (self.tip_slot != 0 or self.tip_block_no != 0)) {
+            return error.ChainNotEmpty;
+        }
+
+        self.ledger_validation_enabled = true;
+        self.ledger_ready = true;
+        self.ledger.setTipSlot(if (self.base_tip) |tip| tip.point.slot else null);
+    }
+
+    pub fn primeBaseUtxos(self: *ChainDB, entries: []const UtxoEntry) !u32 {
+        return self.ledger.primeUtxos(entries);
+    }
+
+    pub fn isLedgerValidationEnabled(self: *const ChainDB) bool {
+        return self.ledger_validation_enabled;
+    }
+
+    pub fn setProtocolParams(self: *ChainDB, pp: rules.ProtocolParams) void {
+        self.protocol_params = pp;
+    }
+
+    pub fn getProtocolParams(self: *const ChainDB) rules.ProtocolParams {
+        return self.protocol_params;
+    }
+
+    pub fn configureShelleyGovernanceTracking(
+        self: *ChainDB,
+        config: protocol_update.GovernanceConfig,
+    ) !void {
+        if (self.shelley_governance_config) |*existing| {
+            existing.deinit(self.allocator);
+        }
+        self.governance_state.deinit(self.allocator);
+        self.governance_state = .{};
+        self.governance_state.setCurrentEpoch(types.slotToEpoch(self.tip_slot, config.epoch_length));
+        self.shelley_governance_config = config;
+    }
+
+    /// Seed the ChainDB tip from an external snapshot tip.
+    /// This allows volatile blocks fetched after a Mithril snapshot to extend
+    /// the known chain without pretending we already restored the ledger state.
+    pub fn attachSnapshotTip(self: *ChainDB, point: Point, block_no: BlockNo) !void {
+        if (self.current_chain.items.len > 0) return error.ChainNotEmpty;
+        if (self.tip_block_no > 0 or self.base_tip != null) return error.ChainNotEmpty;
+
+        self.base_tip = .{ .point = point, .block_no = block_no };
+        self.tip_slot = point.slot;
+        self.tip_hash = point.hash;
+        self.tip_block_no = block_no;
+        self.ledger_validation_enabled = false;
+        self.ledger_ready = false;
+        if (self.shelley_governance_config) |*config| {
+            protocol_update.setCurrentEpochFromSlot(config, &self.governance_state, point.slot);
+        }
     }
 
     /// Add a block to the chain database.
     /// First validates it's not a duplicate, then stores in volatile DB.
-    pub fn addBlock(self: *ChainDB, block_data: []const u8, slot: SlotNo, block_no: BlockNo, prev_hash: ?HeaderHash) !AddBlockResult {
-        const hash = Blake2b256.hash(block_data);
-
+    pub fn addBlock(self: *ChainDB, hash: HeaderHash, block_data: []const u8, slot: SlotNo, block_no: BlockNo, prev_hash: ?HeaderHash) !AddBlockResult {
         // Check if already known
         if (self.@"volatile".getBlock(hash) != null) return .already_known;
         if (self.immutable.getBlock(hash) catch null != null) return .already_known;
 
-        // Add to volatile DB
-        try self.@"volatile".putBlock(block_data, slot, block_no, prev_hash);
-
-        // Update tip if this extends the current chain
-        if (prev_hash) |ph| {
-            if (std.mem.eql(u8, &ph, &self.tip_hash) and block_no > self.tip_block_no) {
-                self.tip_slot = slot;
-                self.tip_hash = hash;
-                self.tip_block_no = block_no;
-                return .added_to_current_chain;
-            }
-        } else if (self.tip_block_no == 0) {
-            // Genesis block
-            self.tip_slot = slot;
-            self.tip_hash = hash;
-            self.tip_block_no = block_no;
-            return .added_to_current_chain;
+        var extends_current_chain = false;
+        if (self.tip_block_no == 0 and self.base_tip == null and self.current_chain.items.len == 0) {
+            extends_current_chain = true;
+        } else if (prev_hash) |ph| {
+            extends_current_chain = std.mem.eql(u8, &ph, &self.tip_hash) and block_no > self.tip_block_no;
         }
 
-        return .added_to_fork;
+        if (!extends_current_chain) {
+            try self.@"volatile".putBlock(hash, block_data, slot, block_no, prev_hash);
+            return .added_to_fork;
+        }
+
+        const needs_block_parse = self.ledger_validation_enabled or self.shelley_governance_config != null;
+        var parsed_block: ?block_mod.Block = null;
+        if (needs_block_parse) {
+            parsed_block = block_mod.parseBlock(block_data) catch |err| {
+                if (!builtin.is_test) {
+                    std.debug.print("ChainDB validation failed to parse block {}: {}\n", .{ block_no, err });
+                }
+                return .invalid;
+            };
+        }
+
+        var governance_snapshot: ?protocol_update.GovernanceSnapshot = null;
+        errdefer {
+            if (governance_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+        }
+        if (self.shelley_governance_config != null) {
+            governance_snapshot = try self.governance_state.cloneSnapshot(self.allocator, self.protocol_params);
+        }
+
+        if (self.shelley_governance_config) |*config| {
+            try protocol_update.advanceToSlot(
+                self.allocator,
+                config,
+                &self.governance_state,
+                &self.protocol_params,
+                slot,
+            );
+        }
+
+        var txs_applied: u32 = 0;
+        var apply_result: ?ledger_apply.ApplyResult = null;
+        defer {
+            if (apply_result) |*result| result.deinit(self.allocator);
+        }
+        if (self.ledger_validation_enabled) {
+            if (!self.ledger_ready) {
+                if (!builtin.is_test) {
+                    std.debug.print("ChainDB validation rejected block {} at slot {}: ledger not ready\n", .{ block_no, slot });
+                }
+                if (governance_snapshot) |*snapshot| {
+                    try self.governance_state.restoreSnapshot(self.allocator, snapshot);
+                    self.protocol_params = snapshot.active_params;
+                }
+                return .invalid;
+            }
+
+            apply_result = ledger_apply.applyBlock(
+                self.allocator,
+                &self.ledger,
+                &(parsed_block orelse unreachable),
+                self.protocol_params,
+            ) catch |err| {
+                if (!builtin.is_test) {
+                    std.debug.print("ChainDB validation apply failed for block {}: {}\n", .{ block_no, err });
+                }
+                if (governance_snapshot) |*snapshot| {
+                    try self.governance_state.restoreSnapshot(self.allocator, snapshot);
+                    self.protocol_params = snapshot.active_params;
+                }
+                return .invalid;
+            };
+
+            if (apply_result.?.txs_failed > 0) {
+                if (!builtin.is_test) {
+                    std.debug.print("ChainDB validation rejected block {}: {} txs failed, {} txs applied\n", .{
+                        block_no,
+                        apply_result.?.txs_failed,
+                        apply_result.?.txs_applied,
+                    });
+                }
+                if (apply_result.?.txs_applied > 0) {
+                    try self.ledger.rollback(apply_result.?.txs_applied);
+                }
+                if (governance_snapshot) |*snapshot| {
+                    try self.governance_state.restoreSnapshot(self.allocator, snapshot);
+                    self.protocol_params = snapshot.active_params;
+                }
+                return .invalid;
+            }
+
+            txs_applied = apply_result.?.txs_applied;
+        }
+
+        if (self.shelley_governance_config) |*config| {
+            if (apply_result) |*result| {
+                for (result.protocol_updates) |*update| {
+                    protocol_update.stageTxUpdate(
+                        self.allocator,
+                        config,
+                        &self.governance_state,
+                        self.protocol_params,
+                        slot,
+                        update,
+                    ) catch |err| {
+                        if (!builtin.is_test) {
+                            std.debug.print("ChainDB governance rejected block {}: {}\n", .{ block_no, err });
+                        }
+                        if (txs_applied > 0) {
+                            try self.ledger.rollback(txs_applied);
+                        }
+                        if (governance_snapshot) |*snapshot| {
+                            try self.governance_state.restoreSnapshot(self.allocator, snapshot);
+                            self.protocol_params = snapshot.active_params;
+                        }
+                        return .invalid;
+                    };
+                }
+            }
+        }
+
+        try self.@"volatile".putBlock(hash, block_data, slot, block_no, prev_hash);
+        self.tip_slot = slot;
+        self.tip_hash = hash;
+        self.tip_block_no = block_no;
+        try self.current_chain.append(self.allocator, .{
+            .point = .{ .slot = slot, .hash = hash },
+            .block_no = block_no,
+            .txs_applied = txs_applied,
+            .governance_snapshot = governance_snapshot,
+        });
+        governance_snapshot = null;
+
+        return .added_to_current_chain;
     }
 
     /// Promote finalized blocks from volatile to immutable.
@@ -112,7 +340,7 @@ pub const ChainDB = struct {
 
         for (to_promote.items) |hash| {
             if (vol.getBlock(hash)) |info| {
-                try self.immutable.appendBlock(info.data, info.slot, info.block_no);
+                try self.immutable.appendBlock(info.hash, info.data, info.slot, info.block_no);
                 promoted += 1;
             }
         }
@@ -133,6 +361,59 @@ pub const ChainDB = struct {
             .hash = self.tip_hash,
             .block_no = self.tip_block_no,
         };
+    }
+
+    pub fn rollbackToPoint(self: *ChainDB, point: ?Point) !u32 {
+        var rolled_back: u32 = 0;
+
+        while (self.current_chain.items.len > 0) {
+            const last = self.current_chain.items[self.current_chain.items.len - 1];
+            if (point) |target| {
+                if (Point.eql(last.point, target)) break;
+            }
+
+            const removed = self.current_chain.pop().?;
+            if (self.ledger_validation_enabled and removed.txs_applied > 0) {
+                try self.ledger.rollback(removed.txs_applied);
+            }
+            var mutable_removed = removed;
+            if (mutable_removed.governance_snapshot) |*snapshot| {
+                try self.governance_state.restoreSnapshot(self.allocator, snapshot);
+                self.protocol_params = snapshot.active_params;
+                snapshot.deinit(self.allocator);
+            }
+            rolled_back += 1;
+        }
+
+        if (self.current_chain.items.len > 0) {
+            const last = self.current_chain.items[self.current_chain.items.len - 1];
+            self.tip_slot = last.point.slot;
+            self.tip_hash = last.point.hash;
+            self.tip_block_no = last.block_no;
+            self.ledger_ready = self.ledger_validation_enabled;
+            return rolled_back;
+        }
+
+        if (point) |target| {
+            if (self.base_tip) |base| {
+                if (Point.eql(base.point, target)) {
+                    self.tip_slot = base.point.slot;
+                    self.tip_hash = base.point.hash;
+                    self.tip_block_no = base.block_no;
+                    self.ledger_ready = self.ledger_validation_enabled;
+                    return rolled_back;
+                }
+            }
+        }
+
+        self.tip_slot = 0;
+        self.tip_hash = [_]u8{0} ** 32;
+        self.tip_block_no = 0;
+        if (point == null) {
+            self.base_tip = null;
+        }
+        self.ledger_ready = self.ledger_validation_enabled and point == null and self.base_tip == null;
+        return rolled_back;
     }
 
     /// Total blocks across volatile + immutable.
@@ -162,16 +443,178 @@ test "chaindb: add blocks extends tip" {
     defer db.close();
 
     // Add genesis-like block
-    const result1 = try db.addBlock("block0", 0, 0, null);
+    const hash0 = Blake2b256.hash("block0");
+    const result1 = try db.addBlock(hash0, "block0", 0, 0, null);
     try std.testing.expect(result1 == .added_to_current_chain);
 
     // Add next block (extends chain)
-    const prev_hash = Blake2b256.hash("block0");
-    const result2 = try db.addBlock("block1", 10, 1, prev_hash);
+    const hash1 = Blake2b256.hash("block1");
+    const result2 = try db.addBlock(hash1, "block1", 10, 1, hash0);
     try std.testing.expect(result2 == .added_to_current_chain);
 
     try std.testing.expectEqual(@as(BlockNo, 1), db.getTip().block_no);
     try std.testing.expectEqual(@as(SlotNo, 10), db.getTip().slot);
+}
+
+test "chaindb: attach snapshot tip and extend from anchor" {
+    const allocator = std.testing.allocator;
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-anchor") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-anchor") catch {};
+
+    var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-anchor", 2160);
+    defer db.close();
+
+    const anchor_hash = Blake2b256.hash("snapshot-tip");
+    try db.attachSnapshotTip(.{ .slot = 100, .hash = anchor_hash }, 50);
+
+    const child_hash = Blake2b256.hash("child");
+    const result = try db.addBlock(child_hash, "child", 110, 51, anchor_hash);
+    try std.testing.expect(result == .added_to_current_chain);
+    try std.testing.expectEqual(@as(BlockNo, 51), db.getTip().block_no);
+    try std.testing.expectEqual(@as(SlotNo, 110), db.getTip().slot);
+}
+
+test "chaindb: rollback rewinds current chain tip" {
+    const allocator = std.testing.allocator;
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-rollback") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-rollback") catch {};
+
+    var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-rollback", 2160);
+    defer db.close();
+
+    const hash0 = Blake2b256.hash("block0");
+    const hash1 = Blake2b256.hash("block1");
+    const hash2 = Blake2b256.hash("block2");
+    _ = try db.addBlock(hash0, "block0", 0, 0, null);
+    _ = try db.addBlock(hash1, "block1", 10, 1, hash0);
+    _ = try db.addBlock(hash2, "block2", 20, 2, hash1);
+
+    const rolled_back = try db.rollbackToPoint(.{ .slot = 10, .hash = hash1 });
+    try std.testing.expectEqual(@as(u32, 1), rolled_back);
+    try std.testing.expectEqual(@as(BlockNo, 1), db.getTip().block_no);
+    try std.testing.expectEqual(@as(SlotNo, 10), db.getTip().slot);
+}
+
+test "chaindb: ledger validation rejects invalid current-chain blocks" {
+    const allocator = std.testing.allocator;
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-invalid") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-invalid") catch {};
+
+    var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-invalid", 2160);
+    defer db.close();
+
+    try db.enableLedgerValidation();
+
+    const hash = Blake2b256.hash("not a real block");
+    const result = try db.addBlock(hash, "not a real block", 1, 1, null);
+    try std.testing.expect(result == .invalid);
+    try std.testing.expectEqual(@as(usize, 0), db.totalBlocks());
+    try std.testing.expectEqual(@as(BlockNo, 0), db.getTip().block_no);
+}
+
+test "chaindb: ledger validation applies a real block" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-validated") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-validated") catch {};
+
+    const input = types.TxIn{ .tx_id = [_]u8{0x11} ** 32, .tx_ix = 0 };
+
+    var tx_enc = Encoder.init(allocator);
+    defer tx_enc.deinit();
+    try tx_enc.encodeMapLen(3);
+    try tx_enc.encodeUint(0);
+    try tx_enc.encodeArrayLen(1);
+    try tx_enc.encodeArrayLen(2);
+    try tx_enc.encodeBytes(&input.tx_id);
+    try tx_enc.encodeUint(input.tx_ix);
+    try tx_enc.encodeUint(1);
+    try tx_enc.encodeArrayLen(1);
+    try tx_enc.encodeArrayLen(2);
+    try tx_enc.encodeBytes(&([_]u8{0x61} ++ [_]u8{0xaa} ** 28));
+    try tx_enc.encodeUint(1_000_000);
+    try tx_enc.encodeUint(2);
+    try tx_enc.encodeUint(200_000);
+    const tx_raw = try tx_enc.toOwnedSlice();
+    defer allocator.free(tx_raw);
+
+    var tx_array_enc = Encoder.init(allocator);
+    defer tx_array_enc.deinit();
+    try tx_array_enc.encodeArrayLen(1);
+    try tx_array_enc.writeRaw(tx_raw);
+    const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
+    defer allocator.free(tx_bodies_raw);
+
+    var header_body_enc = Encoder.init(allocator);
+    defer header_body_enc.deinit();
+    try header_body_enc.encodeArrayLen(10);
+    try header_body_enc.encodeUint(1); // block_no
+    try header_body_enc.encodeUint(42); // slot
+    try header_body_enc.encodeNull(); // prev_hash
+    try header_body_enc.encodeBytes(&([_]u8{0x22} ** 32));
+    try header_body_enc.encodeBytes(&([_]u8{0x33} ** 32));
+    try header_body_enc.encodeArrayLen(0); // vrf result
+    try header_body_enc.encodeUint(tx_bodies_raw.len);
+    try header_body_enc.encodeBytes(&([_]u8{0x44} ** 32)); // body hash placeholder
+    try header_body_enc.encodeArrayLen(0); // opcert placeholder
+    try header_body_enc.encodeArrayLen(2);
+    try header_body_enc.encodeUint(1);
+    try header_body_enc.encodeUint(0);
+    const header_body_raw = try header_body_enc.toOwnedSlice();
+    defer allocator.free(header_body_raw);
+
+    var header_enc = Encoder.init(allocator);
+    defer header_enc.deinit();
+    try header_enc.encodeArrayLen(2);
+    try header_enc.writeRaw(header_body_raw);
+    try header_enc.encodeBytes(&[_]u8{}); // kes signature placeholder
+    const header_raw = try header_enc.toOwnedSlice();
+    defer allocator.free(header_raw);
+
+    var block_enc = Encoder.init(allocator);
+    defer block_enc.deinit();
+    try block_enc.encodeArrayLen(4);
+    try block_enc.writeRaw(header_raw);
+    try block_enc.writeRaw(tx_bodies_raw);
+    try block_enc.encodeArrayLen(0); // witnesses
+    try block_enc.encodeMapLen(0); // auxiliary data
+    const block_data = try block_enc.toOwnedSlice();
+    defer allocator.free(block_data);
+
+    const block = try block_mod.parseBlock(block_data);
+
+    var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-validated", 2160);
+    defer db.close();
+
+    const seed_produced = try allocator.alloc(UtxoEntry, 1);
+    seed_produced[0] = .{
+        .tx_in = input,
+        .value = 1_200_000,
+        .raw_cbor = try allocator.dupe(u8, "seed"),
+    };
+    try db.ledger.applyDiff(.{
+        .slot = 0,
+        .block_hash = [_]u8{0} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = seed_produced,
+    });
+
+    try db.enableLedgerValidation();
+
+    const result = try db.addBlock(
+        block.hash(),
+        block_data,
+        block.header.slot,
+        block.header.block_no,
+        block.header.prev_hash,
+    );
+
+    try std.testing.expect(result == .added_to_current_chain);
+    try std.testing.expectEqual(@as(BlockNo, 1), db.getTip().block_no);
+    try std.testing.expectEqual(@as(SlotNo, 42), db.getTip().slot);
+    try std.testing.expectEqual(@as(usize, 1), db.current_chain.items.len);
+    try std.testing.expectEqual(@as(u32, 1), db.current_chain.items[0].txs_applied);
 }
 
 test "chaindb: duplicate block returns already_known" {
@@ -182,8 +625,9 @@ test "chaindb: duplicate block returns already_known" {
     var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb3", 2160);
     defer db.close();
 
-    _ = try db.addBlock("block0", 0, 0, null);
-    const result = try db.addBlock("block0", 0, 0, null);
+    const hash0 = Blake2b256.hash("block0");
+    _ = try db.addBlock(hash0, "block0", 0, 0, null);
+    const result = try db.addBlock(hash0, "block0", 0, 0, null);
     try std.testing.expect(result == .already_known);
 }
 
@@ -195,12 +639,12 @@ test "chaindb: fork block returns added_to_fork" {
     var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb4", 2160);
     defer db.close();
 
-    _ = try db.addBlock("block0", 0, 0, null);
-    const prev = Blake2b256.hash("block0");
-    _ = try db.addBlock("block1a", 10, 1, prev);
+    const hash0 = Blake2b256.hash("block0");
+    _ = try db.addBlock(hash0, "block0", 0, 0, null);
+    _ = try db.addBlock(Blake2b256.hash("block1a"), "block1a", 10, 1, hash0);
 
     // Fork: different block at same height, same parent
-    const result = try db.addBlock("block1b", 11, 1, prev);
+    const result = try db.addBlock(Blake2b256.hash("block1b"), "block1b", 11, 1, hash0);
     try std.testing.expect(result == .added_to_fork);
 
     try std.testing.expectEqual(@as(usize, 3), db.totalBlocks());

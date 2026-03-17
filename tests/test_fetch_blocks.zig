@@ -47,10 +47,10 @@ pub fn main() !void {
         switch (msg) {
             .roll_forward => |rf| {
                 if (!rf.tip.is_genesis and points_found < 5) {
-                    points[points_found] = .{ .slot = rf.tip.slot, .hash = rf.tip.hash };
+                    points[points_found] = try block_mod.pointFromHeader(rf.header_raw);
                     points_found += 1;
                     try stdout.interface.print("  Point {}: slot={}, block={}\n", .{
-                        points_found, rf.tip.slot, rf.tip.block_no,
+                        points_found, points[points_found - 1].slot, rf.tip.block_no,
                     });
                 }
             },

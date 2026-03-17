@@ -28,7 +28,8 @@ db/
 
 ### Chunk File Format
 - Concatenated CBOR-encoded blocks
-- Each block preceded by a 2-byte length prefix (CRC optional)
+- Current Kassadin-written chunks use a 4-byte big-endian length prefix per block
+- Mithril/Haskell snapshots remain raw concatenated CBOR and are currently read via `ChunkReader`
 - Epoch Boundary Blocks (EBBs) stored at offset 0 in their epoch's chunk
 
 ### Primary Index
@@ -66,6 +67,10 @@ pub const ImmutableDB = struct {
 2. Verify CRC of last block in last chunk
 3. If CRC fails, truncate to last valid block
 4. Rebuild primary/secondary indices if corrupted
+
+Current implementation note:
+- Kassadin-written ImmutableDB chunks rebuild the in-memory tip/hash index on reopen
+- Snapshot/Haskell ImmutableDB chunks are read via `ChunkReader`; for bootstrap, `ChainDB` can now load restored Mithril ancillary ledger state locally and replay the immutable tail to the snapshot tip before forward validation
 
 ### Memory Strategy
 - mmap chunk files for reading (OS manages page cache)
@@ -273,18 +278,23 @@ pub const AddBlockResult = enum {
 ```
 1. Check: block not older than immutable tip slot
 2. Check: block not already in VolatileDB
-3. Check: block not marked invalid
-4. Store block in VolatileDB
-5. Construct candidate chains from VolatileDB successors
-6. For each candidate better than current chain:
+3. If explicit validated mode is enabled, parse/apply the block before storing it
+4. Reject invalid current-chain blocks without storing them
+5. Store block in VolatileDB
+6. Construct candidate chains from VolatileDB successors
+7. For each candidate better than current chain:
    a. Roll back ledger to intersection
    b. Apply new blocks sequentially
    c. Validate each step
-7. If valid candidate found:
+8. If valid candidate found:
    a. Switch current chain to candidate
    b. Update ledger state
-8. Periodically: move blocks from VolatileDB to ImmutableDB (immutable tip advances)
+9. Periodically: move blocks from VolatileDB to ImmutableDB (immutable tip advances)
 ```
+
+Current implementation note:
+- Explicit validated mode remains opt-in, but runtime `sync` now enables it automatically when a restored Mithril snapshot + local ledger state are available
+- Local validation now uses configured Shelley genesis protocol params when available, the empty-chain runtime path can seed Byron genesis UTxOs locally before enabling validation, and `ChainDB` now keeps Shelley-era protocol-parameter update state rollback-safe while adopting supported PPUP changes at epoch boundaries; modern-era min-ADA/cost-model handling and fuller ledger-state semantics are still pending
 
 ### Immutable Tip Advancement
 ```

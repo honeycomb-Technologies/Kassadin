@@ -70,6 +70,7 @@ pub const Node = struct {
 
         // Add to chain DB
         const result = try self.chain_db.addBlock(
+            block.hash(),
             block_data,
             block.header.slot,
             block.header.block_no,

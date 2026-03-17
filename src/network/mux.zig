@@ -62,6 +62,15 @@ pub const Bearer = struct {
     leftover: std.ArrayList(u8) = .empty,
     leftover_allocator: ?std.mem.Allocator = null,
 
+    pub fn deinit(self: *Bearer) void {
+        if (self.leftover_allocator) |allocator| {
+            self.leftover.deinit(allocator);
+            self.leftover = .empty;
+            self.leftover_allocator = null;
+        }
+        self.stream.close();
+    }
+
     /// Read one complete SDU (header + payload). Caller must provide buffer.
     /// Returns the decoded header and a slice of the payload within buf.
     pub fn readSDU(self: *Bearer, buf: []u8) !struct { header: SDUHeader, payload: []const u8 } {

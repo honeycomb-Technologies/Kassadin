@@ -58,9 +58,7 @@ pub const VolatileDB = struct {
     }
 
     /// Add a block to the volatile DB.
-    pub fn putBlock(self: *VolatileDB, data: []const u8, slot: SlotNo, block_no: BlockNo, prev_hash: ?HeaderHash) !void {
-        const hash = Blake2b256.hash(data);
-
+    pub fn putBlock(self: *VolatileDB, hash: HeaderHash, data: []const u8, slot: SlotNo, block_no: BlockNo, prev_hash: ?HeaderHash) !void {
         // Already known?
         if (self.blocks.contains(hash)) return;
 
@@ -146,12 +144,12 @@ test "volatiledb: put and get block" {
     defer db.deinit();
 
     const data = "test block data";
-    try db.putBlock(data, 100, 1, null);
+    const hash = Blake2b256.hash(data);
+    try db.putBlock(hash, data, 100, 1, null);
 
     try std.testing.expectEqual(@as(usize, 1), db.count());
     try std.testing.expectEqual(@as(SlotNo, 100), db.max_slot);
 
-    const hash = Blake2b256.hash(data);
     const info = db.getBlock(hash).?;
     try std.testing.expectEqual(@as(SlotNo, 100), info.slot);
     try std.testing.expectEqualSlices(u8, data, info.data);
@@ -164,11 +162,11 @@ test "volatiledb: successor tracking" {
 
     const parent = "parent block";
     const parent_hash = Blake2b256.hash(parent);
-    try db.putBlock(parent, 100, 1, null);
+    try db.putBlock(parent_hash, parent, 100, 1, null);
 
     // Add two children
-    try db.putBlock("child1", 110, 2, parent_hash);
-    try db.putBlock("child2", 115, 3, parent_hash);
+    try db.putBlock(Blake2b256.hash("child1"), "child1", 110, 2, parent_hash);
+    try db.putBlock(Blake2b256.hash("child2"), "child2", 115, 3, parent_hash);
 
     const successors = db.getSuccessors(parent_hash).?;
     try std.testing.expectEqual(@as(usize, 2), successors.count());
@@ -179,8 +177,9 @@ test "volatiledb: duplicate block ignored" {
     var db = VolatileDB.init(allocator);
     defer db.deinit();
 
-    try db.putBlock("same block", 100, 1, null);
-    try db.putBlock("same block", 100, 1, null); // duplicate
+    const hash = Blake2b256.hash("same block");
+    try db.putBlock(hash, "same block", 100, 1, null);
+    try db.putBlock(hash, "same block", 100, 1, null); // duplicate
 
     try std.testing.expectEqual(@as(usize, 1), db.count());
 }
@@ -190,8 +189,8 @@ test "volatiledb: garbage collection" {
     var db = VolatileDB.init(allocator);
     defer db.deinit();
 
-    try db.putBlock("old block", 50, 1, null);
-    try db.putBlock("new block", 200, 2, null);
+    try db.putBlock(Blake2b256.hash("old block"), "old block", 50, 1, null);
+    try db.putBlock(Blake2b256.hash("new block"), "new block", 200, 2, null);
 
     try std.testing.expectEqual(@as(usize, 2), db.count());
 
@@ -209,22 +208,22 @@ test "volatiledb: fork tracking (3 competing chains)" {
     // Common ancestor
     const ancestor = "ancestor";
     const ancestor_hash = Blake2b256.hash(ancestor);
-    try db.putBlock(ancestor, 100, 1, null);
+    try db.putBlock(ancestor_hash, ancestor, 100, 1, null);
 
     // Fork 1: 2 blocks
-    try db.putBlock("fork1-block1", 110, 2, ancestor_hash);
+    try db.putBlock(Blake2b256.hash("fork1-block1"), "fork1-block1", 110, 2, ancestor_hash);
     const f1b1_hash = Blake2b256.hash("fork1-block1");
-    try db.putBlock("fork1-block2", 120, 3, f1b1_hash);
+    try db.putBlock(Blake2b256.hash("fork1-block2"), "fork1-block2", 120, 3, f1b1_hash);
 
     // Fork 2: 1 block
-    try db.putBlock("fork2-block1", 111, 2, ancestor_hash);
+    try db.putBlock(Blake2b256.hash("fork2-block1"), "fork2-block1", 111, 2, ancestor_hash);
 
     // Fork 3: 3 blocks
-    try db.putBlock("fork3-block1", 109, 2, ancestor_hash);
+    try db.putBlock(Blake2b256.hash("fork3-block1"), "fork3-block1", 109, 2, ancestor_hash);
     const f3b1_hash = Blake2b256.hash("fork3-block1");
-    try db.putBlock("fork3-block2", 119, 3, f3b1_hash);
+    try db.putBlock(Blake2b256.hash("fork3-block2"), "fork3-block2", 119, 3, f3b1_hash);
     const f3b2_hash = Blake2b256.hash("fork3-block2");
-    try db.putBlock("fork3-block3", 130, 4, f3b2_hash);
+    try db.putBlock(Blake2b256.hash("fork3-block3"), "fork3-block3", 130, 4, f3b2_hash);
 
     // Total: 7 blocks
     try std.testing.expectEqual(@as(usize, 7), db.count());

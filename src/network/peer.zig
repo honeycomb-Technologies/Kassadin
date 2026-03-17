@@ -43,7 +43,7 @@ pub const Peer = struct {
 
     pub fn close(self: *Peer) void {
         if (self.last_cs_response) |resp| self.allocator.free(resp);
-        self.stream.close();
+        self.bearer.deinit();
     }
 
     // ── Chain-Sync operations ──
@@ -159,7 +159,13 @@ pub const Peer = struct {
                     @intFromEnum(protocol.MiniProtocolNum.block_fetch),
                     self.allocator,
                 );
-                // Don't defer free — caller owns this
+                defer self.allocator.free(block_msg);
+
+                const block_response = try blockfetch.decodeMsg(block_msg);
+                const block_raw = switch (block_response) {
+                    .block => |raw| try self.allocator.dupe(u8, raw),
+                    else => return error.UnexpectedMessage,
+                };
 
                 // Read BatchDone
                 const done_msg = try self.bearer.readProtocolMessage(
@@ -168,7 +174,7 @@ pub const Peer = struct {
                 );
                 defer self.allocator.free(done_msg);
 
-                return block_msg;
+                return block_raw;
             },
             .no_blocks => return null,
             else => return error.UnexpectedMessage,

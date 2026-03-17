@@ -155,6 +155,51 @@ pub fn parseCertificate(dec: *Decoder) !Certificate {
             const drep = try parseDRep(dec);
             return .{ .vote_delegation = .{ .cred = cred, .drep = drep } };
         },
+        10 => {
+            const cred = try parseCredential(dec);
+            const pool_bytes = try dec.decodeBytes();
+            if (pool_bytes.len != 28) return error.InvalidCbor;
+            const drep = try parseDRep(dec);
+            return .{ .stake_vote_delegation = .{
+                .cred = cred,
+                .pool = pool_bytes[0..28].*,
+                .drep = drep,
+            } };
+        },
+        11 => {
+            const cred = try parseCredential(dec);
+            const pool_bytes = try dec.decodeBytes();
+            if (pool_bytes.len != 28) return error.InvalidCbor;
+            const deposit = try dec.decodeUint();
+            return .{ .stake_reg_delegation = .{
+                .cred = cred,
+                .pool = pool_bytes[0..28].*,
+                .deposit = deposit,
+            } };
+        },
+        12 => {
+            const cred = try parseCredential(dec);
+            const drep = try parseDRep(dec);
+            const deposit = try dec.decodeUint();
+            return .{ .vote_reg_delegation = .{
+                .cred = cred,
+                .drep = drep,
+                .deposit = deposit,
+            } };
+        },
+        13 => {
+            const cred = try parseCredential(dec);
+            const pool_bytes = try dec.decodeBytes();
+            if (pool_bytes.len != 28) return error.InvalidCbor;
+            const drep = try parseDRep(dec);
+            const deposit = try dec.decodeUint();
+            return .{ .stake_vote_reg_delegation = .{
+                .cred = cred,
+                .pool = pool_bytes[0..28].*,
+                .drep = drep,
+                .deposit = deposit,
+            } };
+        },
         14 => {
             const cold = try parseCredential(dec);
             const hot = try parseCredential(dec);

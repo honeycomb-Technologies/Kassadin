@@ -13,6 +13,10 @@ A spec-compliant Cardano block-producing node that:
 - Can produce valid blocks accepted by other nodes on preview/preprod
 - Can operate in private testnet with 2 Haskell nodes
 
+Local development note: on this workstation, operational side-by-side validation
+uses Dolos on preprod. The Haskell codebases remain reference sources for
+semantics, serialization, and troubleshooting.
+
 ---
 
 ## Phase 0: Foundation — Crypto, CBOR, Core Types -- COMPLETED
@@ -118,7 +122,7 @@ A spec-compliant Cardano block-producing node that:
 - [x] Keep-Alive: cookie=42 round-trip matches
 - [x] Tx-Submission: indefinite-length encoding verified (0x9f...0xff)
 - [x] Peer-Sharing: IPv4/IPv6 encode/decode round-trip
-- [ ] Block-Fetch live test: deferred (needs multi-SDU reassembly for real blocks)
+- [x] Block-Fetch live test: fetched and parsed a non-genesis preview block
 - [ ] Wrong-magic test: deferred (need separate connection)
 
 **Validation:** preview-node.play.dev.cardano.org:3001 (Cardano Preview, magic=2)
@@ -127,13 +131,14 @@ A spec-compliant Cardano block-producing node that:
 
 ## Phase 2: Storage — ImmutableDB, VolatileDB, LedgerDB -- COMPLETED
 
-**Status:** 175 tests (18 storage tests), zero memory leaks. Structural validation.
+**Status:** 176 tests (19 storage tests), zero memory leaks. Structural validation plus local ImmutableDB reopen/recovery for Kassadin-written chunks.
 
 ### 2.1 ImmutableDB
 - [x] Append-only chunk-based block storage with 4-byte length prefix
 - [x] Secondary index: hash → block info (slot, offset, size)
 - [x] Block retrieval by hash
 - [x] Tip tracking
+- [x] Rebuild local tip/index from Kassadin-written chunk files on reopen
 - [ ] Primary index: slot → offset (deferred)
 - [ ] EBB handling, mmap, CRC32 (deferred to production hardening)
 
@@ -149,7 +154,7 @@ A spec-compliant Cardano block-producing node that:
 - [x] k=2160 diff ring buffer
 - [x] Proper memory ownership (zero leaks under GPA)
 - [x] Apply: consume inputs, produce outputs
-- [x] Rollback: undo produced UTxOs
+- [x] Rollback: undo produced UTxOs and restore consumed UTxOs
 - [ ] LMDB backing (deferred to mainnet scale)
 - [ ] Snapshot write/load (deferred)
 
@@ -159,19 +164,23 @@ A spec-compliant Cardano block-producing node that:
 - [x] Fork detection (added_to_current_chain vs added_to_fork)
 - [x] Duplicate detection
 - [x] Finalization promotion (volatile → immutable at k depth)
+- [x] Rollback current chain to a specific point
+- [x] Snapshot/immutable tip anchor carried into current-chain tracking
+- [x] Explicit validated mode rejects invalid current-chain blocks before storage
 
 **Spec:** `docs/specs/04-storage.md`
 
 ### Testing Gate 2 -- PASSED (structural)
 - [x] ImmutableDB: append/retrieve blocks, tip tracking
+- [x] ImmutableDB: reopen rebuilds tip/index for Kassadin-written chunks
 - [x] VolatileDB: 3-way fork with correct successor tracking
 - [x] VolatileDB: GC removes old blocks
 - [x] LedgerDB: apply diff adds/removes UTxOs correctly
-- [x] LedgerDB: rollback removes produced UTxOs
+- [x] LedgerDB: rollback restores consumed UTxOs and removes produced UTxOs
 - [x] ChainDB: block addition extends tip, forks detected, duplicates handled
 - [x] Zero memory leaks verified via Zig GPA
 
-**Note:** Full storage validation requires Phase 3 (applying real blocks with real ledger rules). Current tests verify data structure correctness, not Haskell compatibility.
+**Note:** Full storage validation still requires Phase 3 Layer 2. Current tests verify data structure correctness, local chunk reopen behavior, rollback semantics, and explicit validated-mode rejection. Mithril/Haskell ImmutableDB chunks are still read through `ChunkReader`; for bootstrap, restored ledger state is now loaded locally from Mithril ancillary tables and replayed to the immutable snapshot tip before forward validation.
 
 ---
 
@@ -196,9 +205,10 @@ revisited during Phase 7 (Mithril bootstrap) and Phase 8 (hardening):
 DO NOT mark Phase 3 fully complete until these are validated in Phase 7/8.
 
 ### 3.1 Byron Era
-- [ ] Byron block deserialization (deferred — Mithril bootstrap skips Byron)
-- [ ] Byron address validation (deferred)
-- [ ] Byron UTxO transitions (deferred)
+- [x] Byron block deserialization (regular + EBB golden blocks and N2N headers parse correctly)
+- [x] Byron transaction parsing (golden GenTx and regular-block tx payloads parse correctly)
+- [ ] Byron address validation (general bootstrap-address decode/validation is still deferred outside the genesis seeding path)
+- [x] Byron UTxO transitions from genesis (non-AVVM base58 decoding, AVVM redeem-address construction, genesis pseudo-input derivation, and empty-chain UTxO seeding are wired locally)
 
 ### 3.2 Shelley Era
 - [x] Transaction body parsing (inputs, outputs, fee, TTL, validity_start)
@@ -371,7 +381,8 @@ DO NOT mark Phase 3 fully complete until these are validated in Phase 7/8.
 ## Phase 6: Node-to-Client Protocols -- CODECS DONE
 
 **Status:** All protocol codecs built. Live N2C handshake with Dolos verified.
-Full N2C server requires Phase 7 chain state integration.
+The current `test-dolos` target is a handshake smoke test. Full N2C serving and
+chain-sync/query parity still require Phase 7 chain state integration.
 
 ### 6.1 Local Chain-Sync
 - [x] Message codec (same as N2N but protocol num 5)
@@ -401,42 +412,92 @@ Full N2C server requires Phase 7 chain state integration.
 
 ## Phase 7: Mithril Bootstrap & Full Integration -- IN PROGRESS
 
-**Status:** 310 tests. Mithril download in progress. Sync client working.
+**Status:** 351 tests. Preview sync fetches real blocks from genesis or a saved
+checkpoint, stores them through `ChainDB`, and resumes from `db/preview/sync.resume`.
+Mithril metadata query works, snapshot restore validates extracted layout under
+`db/<network>/`, and both `bootstrap-sync` and normal runtime `sync` can now
+read the restored immutable tip, anchor `ChainDB` there, load the latest
+restored ledger snapshot from Mithril ancillary state, replay the immutable tail
+locally, and then validate/follow real forward blocks. `bootstrap-sync
+--validate-dolos` remains available as an optional comparison/fallback path, but
+the verified bootstrap/runtime path no longer depends on Dolos. Both follower
+commands now run until stopped by default and handle `SIGINT`/`SIGTERM` without
+crashing. Genesis-seeded runtime validation and Shelley-era protocol-parameter
+update tracking are now in place; modern min-ADA/cost-model handling, Conway-era
+governance parameter changes, and final shutdown snapshot/checkpoint persistence
+are still pending. The current local validation path now loads Shelley genesis
+parameters from configured/local genesis JSON and applies those real
+fee/size/deposit limits during immutable replay and forward sync. The CLI can
+also parse official cardano-node config JSON, resolve genesis file paths
+relative to the config bundle, select a relay from official topology JSON,
+parse Byron genesis protocol constants plus initial balance distributions from
+official/local genesis files, load Byron fee/size params when starting from
+origin, and parse/apply Byron regular-block transactions plus Byron regular/EBB
+headers from ouroboros-consensus golden data.
 
 ### 7.1 Mithril Snapshot Bootstrap
 - [x] Query Mithril aggregator API for latest snapshot (preprod: epoch 276, 3.1GB)
 - [x] Download snapshot archive (curl, background download)
-- [x] Snapshot restore module (scan chunk files, extract tar.zst)
+- [x] Snapshot restore module (scan chunk files, extract tar.zst, resolve snapshot root layout)
+- [x] CLI path contract fixed: preprod snapshots restore under `db/preprod/`
+- [x] Download step validates extracted immutable chunk layout before reporting success
+- [x] Download ancillary Mithril archive when local ledger state is absent
+- [x] ChainDB anchor/rollback path wired for snapshot-follow sync
+- [x] Real preprod snapshot restored locally (`db/preprod/`, 5461 immutable chunks including ancillary chunk)
 - [ ] Verify certificate chain (STM multi-signatures) — deferred, trust aggregator for now
-- [ ] Restore ledger state from snapshot
+- [x] Restore ledger state from snapshot ancillary tables
+- [x] Replay immutable tail from restored ledger snapshot to immutable tip
 - [x] FindIntersect at snapshot tip — ACCEPTED by preprod relay
-- [x] Sync forward: 100 headers from preprod, era tags parsed
+- [x] Sync forward from snapshot tip: fetch and parse real preprod blocks (requires restored snapshot)
+- [x] Optional Dolos validation path hydrates historical inputs via gRPC `ReadTx`
 
 ### 7.2 Chain Sync
 - [x] SyncClient: connect, handshake, follow chain, handle rollbacks
 - [x] Node runner: genesis config + ChainDB + sync loop
-- [x] CLI: `kassadin sync` syncs 20 headers from preview (WORKING)
+- [x] Real block points derived from chain-sync headers for block-fetch
+- [x] CLI: `kassadin sync` fetches 20 preview blocks from genesis (WORKING)
+- [x] Resume checkpoint: subsequent preview sync runs continue from the last saved point
 - [x] CLI: `kassadin bootstrap` queries Mithril (WORKING)
-- [x] Sync from snapshot tip: 100+ headers synced from preprod relay
-- [ ] Process received blocks through full ledger pipeline (Phase 3/4 Layer 2)
+- [x] Official cardano-node config JSON parser resolves genesis file paths relative to config bundles
+- [x] Byron genesis parser loads protocol constants and initial AVVM/non-AVVM balance maps from official/local genesis JSON
+- [x] Byron regular + EBB block/header parser supports ouroboros-consensus golden N2N payloads
+- [x] Byron regular-block transaction parser/apply path works on ouroboros-consensus golden data with Byron fee parameters
+- [x] Live block-fetch proof upgraded: fetches a non-genesis preview block and validates the fetched block number
+- [x] Explicit validated-mode block path tested with rollback-safe ledger diffs
+- [x] Sync from snapshot tip: `bootstrap-sync` resolves `db/preprod/`, loads the local ledger snapshot, replays the immutable tail, and fetches/parses forward blocks when a snapshot is present
+- [x] `bootstrap-sync` validated 100 forward preprod blocks locally from a restored snapshot
+- [x] `bootstrap-sync --validate-dolos` remains available for comparison/fallback
+- [x] Load runtime ledger state from restored snapshot during normal `sync`
+- [x] Load Shelley genesis protocol params into bootstrap/runtime validation paths
+- [x] CLI topology parser loads relay peers from legacy `Producers` and modern `bootstrapPeers` / `accessPoints` files
+- [x] `sync` and `bootstrap-sync` can run until stopped, with bounded `--max-headers` / `--max-blocks` still available for tests
+- [x] Load runtime ledger state from genesis during normal `sync` for Byron initial UTxO state
+- [x] Empty-chain runtime path seeds Byron genesis UTxOs and enables local validation before `FindIntersectGenesis`
+- [x] Fresh-db preprod origin sync proved against the live network (`test-origin-sync`: 8 genesis UTxOs primed, 5 headers synced, 5 blocks added, 0 invalid)
+- [ ] Process received blocks through full ledger pipeline during normal sync (Phase 3/4 Layer 2)
+- [x] Switch local validation from Byron protocol params to Shelley genesis params on the first post-Byron block
+- [x] Prove origin-start validation end-to-end across the Byron-to-Shelley transition on a live chain (`test-origin-transition`: 46 Byron blocks + first Shelley block validated locally from a fresh DB)
+- [x] Parse Shelley tx-body field `6` updates, stage identical-vote quorum by epoch, adopt supported protocol-parameter changes at epoch boundaries, and keep that state rollback-safe in `ChainDB`
 
 ### 7.3 Full Integration
 - [x] Shelley genesis config parsing (real mainnet genesis verified)
 - [x] CLI with sync and bootstrap commands
 - [ ] P2P topology configuration
 - [ ] Logging system
-- [ ] Graceful shutdown
+- [ ] Graceful shutdown (clean signal exit now works; final shutdown snapshot/checkpoint persistence still pending)
 
 **Spec:** `docs/specs/09-bootstrap.md`
 
 ### Testing Gate 7
 - [ ] Mithril: download, verify, restore mainnet snapshot in <30 minutes
-- [ ] Mithril: node syncs from snapshot tip to current tip
+- [x] Mithril: node syncs from restored snapshot tip with local ledger validation enabled
+- [x] Genesis: fresh-db preprod origin sync starts with local Byron genesis seeding and validates initial blocks
+- [x] Genesis: fresh-db preprod origin sync validates across the Byron-to-Shelley transition
 - [ ] Genesis: sync preview from genesis to tip
-- [ ] Config: parse official mainnet/preview/preprod config files
-- [ ] Integration: run alongside 2 Haskell nodes in private devnet for 24 hours
-- [ ] Integration: tip within 2160 slots of Haskell nodes for entire test
-- [ ] Memory: average RSS ≤ Haskell node over 24 hours
+- [ ] Config: validate parsing against official mainnet/preview/preprod config bundles end-to-end
+- [ ] Integration: run alongside Dolos in private devnet/preprod for 24 hours
+- [ ] Integration: tip within 2160 slots of Dolos for entire test
+- [ ] Memory: capture RSS against local operational baseline
 
 ---
 

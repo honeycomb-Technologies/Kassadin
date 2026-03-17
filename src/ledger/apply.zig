@@ -1,8 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const block_mod = @import("block.zig");
 const tx_mod = @import("transaction.zig");
+const protocol_update = @import("protocol_update.zig");
 const rules = @import("rules.zig");
 const LedgerDB = @import("../storage/ledger.zig").LedgerDB;
 const UtxoEntry = @import("../storage/ledger.zig").UtxoEntry;
@@ -15,12 +17,243 @@ pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
 pub const HeaderHash = types.HeaderHash;
 
+fn freeOwnedEntries(allocator: Allocator, entries: []const UtxoEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.raw_cbor);
+    }
+    allocator.free(entries);
+}
+
 /// Result of applying a block to the ledger.
 pub const ApplyResult = struct {
     txs_applied: u32,
     txs_failed: u32,
     total_fees: Coin,
+    protocol_updates: []protocol_update.TxProtocolUpdate,
+
+    pub fn deinit(self: *ApplyResult, allocator: Allocator) void {
+        protocol_update.freeTxUpdates(allocator, self.protocol_updates);
+    }
 };
+
+fn buildDiff(
+    allocator: Allocator,
+    ledger: *const LedgerDB,
+    block: *const block_mod.Block,
+    tx: *const tx_mod.TxBody,
+    pp: rules.ProtocolParams,
+) !LedgerDiff {
+    var consumed_list: std.ArrayList(UtxoEntry) = .empty;
+    defer consumed_list.deinit(allocator);
+
+    for (tx.inputs) |input| {
+        const entry = ledger.lookupUtxo(input) orelse unreachable;
+
+        try consumed_list.append(allocator, .{
+            .tx_in = input,
+            .value = entry.value,
+            .raw_cbor = try allocator.dupe(u8, entry.raw_cbor),
+        });
+    }
+
+    var produced_list: std.ArrayList(UtxoEntry) = .empty;
+    defer produced_list.deinit(allocator);
+
+    for (tx.outputs, 0..) |out, ix| {
+        try produced_list.append(allocator, .{
+            .tx_in = .{ .tx_id = tx.tx_id, .tx_ix = @intCast(ix) },
+            .value = out.value,
+            .raw_cbor = try allocator.dupe(u8, out.raw_cbor),
+        });
+    }
+
+    const consumed = try consumed_list.toOwnedSlice(allocator);
+    errdefer freeOwnedEntries(allocator, consumed);
+    const produced = try produced_list.toOwnedSlice(allocator);
+    errdefer freeOwnedEntries(allocator, produced);
+
+    var cert_effect = try rules.evaluateCertificateEffect(allocator, tx, ledger, pp);
+    errdefer cert_effect.deinit(allocator);
+
+    return .{
+        .slot = block.header.slot,
+        .block_hash = block.hash(),
+        .consumed = consumed,
+        .produced = produced,
+        .stake_deposit_changes = cert_effect.stake_deposit_changes,
+        .pool_deposit_changes = cert_effect.pool_deposit_changes,
+        .drep_deposit_changes = cert_effect.drep_deposit_changes,
+    };
+}
+
+fn applyShelleyLikeBlock(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    block: *const block_mod.Block,
+    pp: rules.ProtocolParams,
+) !ApplyResult {
+    var result = ApplyResult{
+        .txs_applied = 0,
+        .txs_failed = 0,
+        .total_fees = 0,
+        .protocol_updates = try allocator.alloc(protocol_update.TxProtocolUpdate, 0),
+    };
+    errdefer result.deinit(allocator);
+    var collected_updates: std.ArrayList(protocol_update.TxProtocolUpdate) = .empty;
+    defer {
+        if (result.protocol_updates.len == 0) {
+            protocol_update.freeTxUpdates(allocator, collected_updates.items);
+        } else {
+            collected_updates.deinit(allocator);
+        }
+    }
+
+    var tx_dec = Decoder.init(block.tx_bodies_raw);
+    const num_txs = (try tx_dec.decodeArrayLen()) orelse return result;
+
+    var tx_idx: u64 = 0;
+    while (tx_idx < num_txs) : (tx_idx += 1) {
+        const tx_raw = try tx_dec.sliceOfNextValue();
+
+        var tx = tx_mod.parseTxBody(allocator, tx_raw) catch |err| {
+            if (!builtin.is_test) {
+                std.debug.print("    Tx {}: parse failed: {}\n", .{ tx_idx, err });
+            }
+            result.txs_failed += 1;
+            continue;
+        };
+        defer tx_mod.freeTxBody(allocator, &tx);
+
+        _ = rules.validateTx(
+            &tx,
+            ledger,
+            pp,
+            block.header.slot,
+            switch (block.era) {
+                .shelley, .allegra, .mary => true,
+                else => false,
+            },
+        ) catch |err| {
+            if (!builtin.is_test) {
+                std.debug.print("    Tx {}: validation failed: {}\n", .{ tx_idx, err });
+            }
+            result.txs_failed += 1;
+            continue;
+        };
+
+        try ledger.applyDiff(try buildDiff(allocator, ledger, block, &tx, pp));
+        result.txs_applied += 1;
+        result.total_fees += tx.fee;
+        if (tx.update) |*update| {
+            try collected_updates.append(allocator, try protocol_update.cloneBorrowedTxUpdate(allocator, update));
+        }
+    }
+
+    allocator.free(result.protocol_updates);
+    result.protocol_updates = try collected_updates.toOwnedSlice(allocator);
+    return result;
+}
+
+fn applyByronBlock(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    block: *const block_mod.Block,
+    pp: rules.ProtocolParams,
+) !ApplyResult {
+    var result = ApplyResult{
+        .txs_applied = 0,
+        .txs_failed = 0,
+        .total_fees = 0,
+        .protocol_updates = try allocator.alloc(protocol_update.TxProtocolUpdate, 0),
+    };
+    errdefer result.deinit(allocator);
+
+    var payload_dec = Decoder.init(block.tx_bodies_raw);
+    const tx_payload_len = try payload_dec.decodeArrayLen();
+
+    var tx_idx: u64 = 0;
+    while (true) : (tx_idx += 1) {
+        if (tx_payload_len) |count| {
+            if (tx_idx >= count) break;
+        } else if (payload_dec.isBreak()) {
+            try payload_dec.decodeBreak();
+            break;
+        }
+
+        const tx_entry_raw = payload_dec.sliceOfNextValue() catch |err| {
+            if (!builtin.is_test) {
+                std.debug.print("    Byron tx {}: payload parse failed: {}\n", .{ tx_idx, err });
+            }
+            result.txs_failed += 1;
+            continue;
+        };
+
+        var entry_dec = Decoder.init(tx_entry_raw);
+        const entry_len = (try entry_dec.decodeArrayLen()) orelse {
+            result.txs_failed += 1;
+            continue;
+        };
+        if (entry_len != 2) {
+            result.txs_failed += 1;
+            continue;
+        }
+
+        const tx_raw = entry_dec.sliceOfNextValue() catch |err| {
+            if (!builtin.is_test) {
+                std.debug.print("    Byron tx {}: tx extraction failed: {}\n", .{ tx_idx, err });
+            }
+            result.txs_failed += 1;
+            continue;
+        };
+        _ = entry_dec.sliceOfNextValue() catch {
+            result.txs_failed += 1;
+            continue;
+        };
+
+        var tx = tx_mod.parseByronTxBody(allocator, tx_raw) catch |err| {
+            if (!builtin.is_test) {
+                std.debug.print("    Byron tx {}: parse failed: {}\n", .{ tx_idx, err });
+            }
+            result.txs_failed += 1;
+            continue;
+        };
+        defer tx_mod.freeTxBody(allocator, &tx);
+
+        var consumed_value: Coin = 0;
+        var missing_input = false;
+        for (tx.inputs) |input| {
+            const entry = ledger.lookupUtxo(input) orelse {
+                missing_input = true;
+                break;
+            };
+            consumed_value += entry.value;
+        }
+
+        if (missing_input or consumed_value < tx.totalOutputValue()) {
+            if (!builtin.is_test) {
+                std.debug.print("    Byron tx {}: value preservation failed or missing input\n", .{tx_idx});
+            }
+            result.txs_failed += 1;
+            continue;
+        }
+
+        tx.fee = consumed_value - tx.totalOutputValue();
+
+        _ = rules.validateTx(&tx, ledger, pp, block.header.slot, false) catch |err| {
+            if (!builtin.is_test) {
+                std.debug.print("    Byron tx {}: validation failed: {}\n", .{ tx_idx, err });
+            }
+            result.txs_failed += 1;
+            continue;
+        };
+
+        try ledger.applyDiff(try buildDiff(allocator, ledger, block, &tx, pp));
+        result.txs_applied += 1;
+        result.total_fees += tx.fee;
+    }
+
+    return result;
+}
 
 /// Apply a parsed block's transactions to the ledger.
 /// This is the main entry point for the ledger validation pipeline.
@@ -38,54 +271,10 @@ pub fn applyBlock(
     block: *const block_mod.Block,
     pp: rules.ProtocolParams,
 ) !ApplyResult {
-    _ = pp; // TODO: use for fee validation
-    var result = ApplyResult{ .txs_applied = 0, .txs_failed = 0, .total_fees = 0 };
-
-    // Parse transaction bodies array
-    var tx_dec = Decoder.init(block.tx_bodies_raw);
-    const num_txs = (try tx_dec.decodeArrayLen()) orelse return result;
-
-    var tx_idx: u64 = 0;
-    while (tx_idx < num_txs) : (tx_idx += 1) {
-        const tx_raw = try tx_dec.sliceOfNextValue();
-
-        // Parse transaction body
-        var tx = tx_mod.parseTxBody(allocator, tx_raw) catch {
-            result.txs_failed += 1;
-            continue;
-        };
-        defer tx_mod.freeTxBody(allocator, &tx);
-
-        // Build UTxO diff
-        const consumed = try allocator.alloc(TxIn, tx.inputs.len);
-        @memcpy(consumed, tx.inputs);
-
-        var produced_list: std.ArrayList(UtxoEntry) = .empty;
-        defer produced_list.deinit(allocator);
-
-        for (tx.outputs, 0..) |out, ix| {
-            try produced_list.append(allocator, .{
-                .tx_in = .{ .tx_id = tx.tx_id, .tx_ix = @intCast(ix) },
-                .value = out.value,
-                .raw_cbor = out.raw_cbor,
-            });
-        }
-
-        const produced = try produced_list.toOwnedSlice(allocator);
-
-        // Apply the diff
-        try ledger.applyDiff(.{
-            .slot = block.header.slot,
-            .block_hash = block.header.block_body_hash,
-            .consumed = consumed,
-            .produced = produced,
-        });
-
-        result.txs_applied += 1;
-        result.total_fees += tx.fee;
-    }
-
-    return result;
+    return switch (block.era) {
+        .byron => applyByronBlock(allocator, ledger, block, pp),
+        else => applyShelleyLikeBlock(allocator, ledger, block, pp),
+    };
 }
 
 // ──────────────────────────────────── Tests ────────────────────────────────────
@@ -131,14 +320,14 @@ test "apply: golden Alonzo block transactions update ledger" {
         entry.* = .{
             .tx_in = tx.inputs[i],
             .value = if (i == 0) total_needed else 0,
-            .raw_cbor = "seed",
+            .raw_cbor = try allocator.dupe(u8, "seed"),
         };
     }
 
     try ledger.applyDiff(.{
         .slot = 0,
         .block_hash = [_]u8{0} ** 32,
-        .consumed = try allocator.alloc(TxIn, 0),
+        .consumed = try allocator.alloc(UtxoEntry, 0),
         .produced = seed_produced,
     });
 
@@ -153,11 +342,77 @@ test "apply: golden Alonzo block transactions update ledger" {
         .max_block_body_size = 100000,
     };
 
-    const result = try applyBlock(allocator, &ledger, &block, pp);
+    var result = try applyBlock(allocator, &ledger, &block, pp);
+    defer result.deinit(allocator);
 
     // The golden block has 1 transaction
     try std.testing.expect(result.txs_applied > 0 or result.txs_failed > 0);
 
     // Ledger should have been updated
+    try std.testing.expect(ledger.utxoCount() > 0);
+}
+
+test "apply: golden Byron block transaction updates ledger" {
+    const allocator = std.testing.allocator;
+
+    const block_data = std.fs.cwd().readFileAlloc(
+        allocator,
+        "reference-ouroboros-consensus/ouroboros-consensus-cardano/golden/cardano/CardanoNodeToNodeVersion2/Block_Byron_regular",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(block_data);
+
+    const block = try block_mod.parseBlock(block_data);
+
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-apply-byron");
+    defer ledger.deinit();
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-apply-byron") catch {};
+
+    var payload_dec = Decoder.init(block.tx_bodies_raw);
+    const tx_payload_len = (try payload_dec.decodeArrayLen()) orelse return;
+    if (tx_payload_len < 1) return;
+
+    const tx_entry_raw = try payload_dec.sliceOfNextValue();
+    var entry_dec = Decoder.init(tx_entry_raw);
+    _ = (try entry_dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    const tx_raw = try entry_dec.sliceOfNextValue();
+
+    var tx = try tx_mod.parseByronTxBody(allocator, tx_raw);
+    defer tx_mod.freeTxBody(allocator, &tx);
+
+    var genesis = @import("../node/genesis.zig").parseByronGenesis(allocator, "byron.json") catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer genesis.deinit(allocator);
+
+    const pp = @import("../node/genesis.zig").toLedgerProtocolParamsByron(genesis);
+    const total_needed = tx.totalOutputValue() + rules.calculateMinFee(pp, tx.raw_cbor.len);
+
+    const seed_produced = try allocator.alloc(UtxoEntry, tx.inputs.len);
+    for (seed_produced, 0..) |*entry, i| {
+        entry.* = .{
+            .tx_in = tx.inputs[i],
+            .value = if (i == 0) total_needed else 0,
+            .raw_cbor = try allocator.dupe(u8, "seed_byron_utxo"),
+        };
+    }
+
+    try ledger.applyDiff(.{
+        .slot = 0,
+        .block_hash = [_]u8{0} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = seed_produced,
+    });
+
+    var result = try applyBlock(allocator, &ledger, &block, pp);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.txs_applied);
+    try std.testing.expectEqual(@as(u32, 0), result.txs_failed);
+    try std.testing.expectEqual(total_needed - tx.totalOutputValue(), result.total_fees);
     try std.testing.expect(ledger.utxoCount() > 0);
 }

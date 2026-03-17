@@ -27,6 +27,8 @@ pub const network = struct {
     pub const local_tx_submission = @import("network/local_tx_submission.zig");
     pub const local_tx_monitor = @import("network/local_tx_monitor.zig");
     pub const local_state_query = @import("network/local_state_query.zig");
+    pub const local_state_query_client = @import("network/local_state_query_client.zig");
+    pub const dolos_grpc_client = @import("network/dolos_grpc_client.zig");
 };
 
 pub const storage = struct {
@@ -61,6 +63,7 @@ pub const consensus = struct {
 pub const mempool = @import("mempool/mempool.zig");
 pub const node = struct {
     pub const node_mod = @import("node/node.zig");
+    pub const config = @import("node/config.zig");
     pub const keys = @import("node/keys.zig");
     pub const genesis = @import("node/genesis.zig");
     pub const sync = @import("node/sync.zig");
@@ -68,36 +71,162 @@ pub const node = struct {
     pub const mithril = @import("node/mithril.zig");
     pub const snapshot_restore = @import("node/snapshot_restore.zig");
     pub const chunk_reader = @import("node/chunk_reader.zig");
+    pub const ledger_snapshot = @import("node/ledger_snapshot.zig");
     pub const bootstrap_sync = @import("node/bootstrap_sync.zig");
+    pub const runtime_control = @import("node/runtime_control.zig");
+    pub const topology = @import("node/topology.zig");
 };
 
 pub fn main() !void {
-
     const args = try std.process.argsAlloc(std.heap.page_allocator);
     defer std.process.argsFree(std.heap.page_allocator, args);
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "sync")) {
         // kassadin sync [--network preview|preprod] [--max-headers N]
         std.debug.print("Kassadin — Cardano Node in Zig\n", .{});
-        std.debug.print("Syncing from preview network...\n\n", .{});
+        var config = node.runner.RunConfig.preview_defaults;
+        config.max_headers = 0;
+        var network_name: []const u8 = "preview";
+        var config_file_path: ?[]const u8 = null;
+        var topology_path: ?[]const u8 = null;
+        var db_path_override: ?[]const u8 = null;
 
-        const result = node.runner.run(std.heap.page_allocator, .{
-            .network_magic = network.protocol.NetworkMagic.preview,
-            .peer_host = "preview-node.play.dev.cardano.org",
-            .peer_port = 3001,
-            .db_path = "db",
-            .shelley_genesis_path = null,
-            .max_headers = 20,
-        }) catch |err| {
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--network")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --network\n", .{});
+                    return;
+                }
+
+                if (std.mem.eql(u8, args[i + 1], "preview")) {
+                    config = node.runner.RunConfig.preview_defaults;
+                    network_name = "preview";
+                } else if (std.mem.eql(u8, args[i + 1], "preprod")) {
+                    config = node.runner.RunConfig.preprod_defaults;
+                    network_name = "preprod";
+                } else {
+                    std.debug.print("Unsupported network: {s}\n", .{args[i + 1]});
+                    return;
+                }
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--max-headers")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --max-headers\n", .{});
+                    return;
+                }
+                config.max_headers = std.fmt.parseInt(u64, args[i + 1], 10) catch {
+                    std.debug.print("Invalid --max-headers value: {s}\n", .{args[i + 1]});
+                    return;
+                };
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--shelley-genesis")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --shelley-genesis\n", .{});
+                    return;
+                }
+                config.shelley_genesis_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--byron-genesis")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --byron-genesis\n", .{});
+                    return;
+                }
+                config.byron_genesis_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--config")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --config\n", .{});
+                    return;
+                }
+                config_file_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--topology")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --topology\n", .{});
+                    return;
+                }
+                topology_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--db-path")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --db-path\n", .{});
+                    return;
+                }
+                db_path_override = args[i + 1];
+                i += 1;
+            } else {
+                std.debug.print("Unknown sync argument: {s}\n", .{args[i]});
+                return;
+            }
+        }
+
+        if (config_file_path) |path| {
+            var parsed = node.config.parseCardanoNodeConfig(std.heap.page_allocator, path) catch |err| {
+                std.debug.print("Config parse failed: {}\n", .{err});
+                return;
+            };
+            defer parsed.deinit(std.heap.page_allocator);
+
+            if (parsed.byron_genesis_path) |genesis_path| {
+                config.byron_genesis_path = std.heap.page_allocator.dupe(u8, genesis_path) catch {
+                    std.debug.print("Failed to copy Byron genesis path from config\n", .{});
+                    return;
+                };
+            }
+            if (parsed.shelley_genesis_path) |genesis_path| {
+                config.shelley_genesis_path = std.heap.page_allocator.dupe(u8, genesis_path) catch {
+                    std.debug.print("Failed to copy Shelley genesis path from config\n", .{});
+                    return;
+                };
+            }
+        }
+
+        if (topology_path) |path| {
+            var topology = node.topology.parseTopology(std.heap.page_allocator, path) catch |err| {
+                std.debug.print("Topology parse failed: {}\n", .{err});
+                return;
+            };
+            defer topology.deinit(std.heap.page_allocator);
+
+            const peer = node.topology.firstPeer(topology);
+            config.peer_host = std.heap.page_allocator.dupe(u8, peer.host) catch {
+                std.debug.print("Failed to copy topology peer host\n", .{});
+                return;
+            };
+            config.peer_port = peer.port;
+        }
+
+        if (db_path_override) |path| {
+            config.db_path = path;
+        }
+
+        std.debug.print("Syncing from {s} network...\n\n", .{network_name});
+        node.runtime_control.resetStopRequested();
+        node.runtime_control.installSignalHandlers();
+
+        const result = node.runner.run(std.heap.page_allocator, config) catch |err| {
             std.debug.print("Sync error: {}\n", .{err});
             return;
         };
 
         std.debug.print("Sync complete:\n", .{});
         std.debug.print("  Headers synced: {}\n", .{result.headers_synced});
+        std.debug.print("  Blocks fetched: {}\n", .{result.blocks_fetched});
+        std.debug.print("  Blocks added: {}\n", .{result.blocks_added_to_chain});
+        std.debug.print("  Invalid blocks: {}\n", .{result.invalid_blocks});
         std.debug.print("  Tip slot: {}\n", .{result.tip_slot});
         std.debug.print("  Tip block: {}\n", .{result.tip_block_no});
         std.debug.print("  Rollbacks: {}\n", .{result.rollbacks});
+        std.debug.print("  Resumed from checkpoint: {}\n", .{result.resumed_from_checkpoint});
+        std.debug.print("  Resumed from snapshot: {}\n", .{result.resumed_from_snapshot});
+        std.debug.print("  Snapshot anchor used: {}\n", .{result.snapshot_anchor_used});
+        std.debug.print("  Validation enabled: {}\n", .{result.validation_enabled});
+        std.debug.print("  Snapshot tip: block={}, slot={}\n", .{ result.snapshot_tip_block, result.snapshot_tip_slot });
+        std.debug.print("  Base UTxOs primed: {}\n", .{result.base_utxos_primed});
+        std.debug.print("  Local ledger snapshot slot: {}\n", .{result.local_ledger_snapshot_slot});
+        std.debug.print("  Immutable blocks replayed: {}\n", .{result.immutable_blocks_replayed});
+        std.debug.print("  Stopped by signal: {}\n", .{result.stopped_by_signal});
     } else if (args.len > 1 and std.mem.eql(u8, args[1], "bootstrap")) {
         std.debug.print("Kassadin — Mithril Bootstrap\n", .{});
         std.debug.print("Fetching latest preprod snapshot info...\n\n", .{});
@@ -109,11 +238,15 @@ pub fn main() !void {
             std.debug.print("Failed to fetch snapshot: {}\n", .{err});
             return;
         };
+        defer info.deinit(std.heap.page_allocator);
 
         std.debug.print("Latest snapshot:\n", .{});
         std.debug.print("  Epoch: {}\n", .{info.epoch});
         std.debug.print("  Immutable file: {}\n", .{info.immutable_file_number});
         std.debug.print("  Size: {} MB\n", .{info.size / 1024 / 1024});
+        if (info.ancillary_download_url != null) {
+            std.debug.print("  Ancillary size: {} MB\n", .{info.ancillary_size / 1024 / 1024});
+        }
         std.debug.print("\nTo download and restore, run:\n", .{});
         std.debug.print("  kassadin bootstrap --download\n", .{});
 
@@ -122,24 +255,121 @@ pub fn main() !void {
             node.mithril.downloadAndExtract(
                 std.heap.page_allocator,
                 info,
-                "db",
+                "db/preprod",
             ) catch |err| {
                 std.debug.print("Bootstrap failed: {}\n", .{err});
                 return;
             };
-            std.debug.print("Bootstrap complete! Run 'kassadin sync' to continue from tip.\n", .{});
+            std.debug.print("Bootstrap complete! Run 'kassadin bootstrap-sync' to continue from tip.\n", .{});
         }
     } else if (args.len > 1 and std.mem.eql(u8, args[1], "bootstrap-sync")) {
         // Sync forward from Mithril snapshot tip
         std.debug.print("Kassadin — Bootstrap Sync (preprod)\n\n", .{});
 
+        var validation_endpoint: ?[]const u8 = null;
+        var shelley_genesis_path: ?[]const u8 = "shelley.json";
+        var config_file_path: ?[]const u8 = null;
+        var topology_path: ?[]const u8 = null;
+        var max_blocks: u64 = 0;
+        var peer_host: []const u8 = "preprod-node.play.dev.cardano.org";
+        var peer_port: u16 = 3001;
+        var db_path: []const u8 = "db/preprod";
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--validate-dolos")) {
+                validation_endpoint = "127.0.0.1:50051";
+            } else if (std.mem.eql(u8, args[i], "--dolos-grpc")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing endpoint after --dolos-grpc\n", .{});
+                    return;
+                }
+                validation_endpoint = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--shelley-genesis")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing path after --shelley-genesis\n", .{});
+                    return;
+                }
+                shelley_genesis_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--config")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing path after --config\n", .{});
+                    return;
+                }
+                config_file_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--max-blocks")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --max-blocks\n", .{});
+                    return;
+                }
+                max_blocks = std.fmt.parseInt(u64, args[i + 1], 10) catch {
+                    std.debug.print("Invalid --max-blocks value: {s}\n", .{args[i + 1]});
+                    return;
+                };
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--topology")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --topology\n", .{});
+                    return;
+                }
+                topology_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--db-path")) {
+                if (i + 1 >= args.len) {
+                    std.debug.print("Missing value after --db-path\n", .{});
+                    return;
+                }
+                db_path = args[i + 1];
+                i += 1;
+            } else {
+                std.debug.print("Unknown bootstrap-sync argument: {s}\n", .{args[i]});
+                return;
+            }
+        }
+
+        if (config_file_path) |path| {
+            var parsed = node.config.parseCardanoNodeConfig(std.heap.page_allocator, path) catch |err| {
+                std.debug.print("Config parse failed: {}\n", .{err});
+                return;
+            };
+            defer parsed.deinit(std.heap.page_allocator);
+
+            if (parsed.shelley_genesis_path) |genesis_path| {
+                shelley_genesis_path = std.heap.page_allocator.dupe(u8, genesis_path) catch {
+                    std.debug.print("Failed to copy Shelley genesis path from config\n", .{});
+                    return;
+                };
+            }
+        }
+
+        if (topology_path) |path| {
+            var topology = node.topology.parseTopology(std.heap.page_allocator, path) catch |err| {
+                std.debug.print("Topology parse failed: {}\n", .{err});
+                return;
+            };
+            defer topology.deinit(std.heap.page_allocator);
+
+            const peer = node.topology.firstPeer(topology);
+            peer_host = std.heap.page_allocator.dupe(u8, peer.host) catch {
+                std.debug.print("Failed to copy topology peer host\n", .{});
+                return;
+            };
+            peer_port = peer.port;
+        }
+        node.runtime_control.resetStopRequested();
+        node.runtime_control.installSignalHandlers();
+
         const result = node.bootstrap_sync.bootstrapSync(
             std.heap.page_allocator,
-            "db/preprod/immutable",
-            "preprod-node.play.dev.cardano.org",
-            3001,
+            db_path,
+            peer_host,
+            peer_port,
             network.protocol.NetworkMagic.preprod,
-            100, // max 100 blocks forward
+            max_blocks,
+            shelley_genesis_path,
+            validation_endpoint,
         ) catch |err| {
             std.debug.print("Bootstrap sync failed: {}\n", .{err});
             return;
@@ -148,16 +378,25 @@ pub fn main() !void {
         std.debug.print("\nBootstrap sync complete:\n", .{});
         std.debug.print("  Snapshot tip: block={}, slot={}\n", .{ result.snapshot_tip_block, result.snapshot_tip_slot });
         std.debug.print("  Headers synced forward: {}\n", .{result.headers_synced_forward});
+        std.debug.print("  Blocks parsed: {}\n", .{result.blocks_parsed});
+        std.debug.print("  Blocks added to chain: {}\n", .{result.blocks_added_to_chain});
+        std.debug.print("  Transactions parsed: {}\n", .{result.txs_parsed});
+        std.debug.print("  Validation enabled: {}\n", .{result.validation_enabled});
+        std.debug.print("  Base UTxOs primed: {}\n", .{result.base_utxos_primed});
+        std.debug.print("  Local ledger snapshot slot: {}\n", .{result.local_ledger_snapshot_slot});
+        std.debug.print("  Immutable blocks replayed: {}\n", .{result.immutable_blocks_replayed});
+        std.debug.print("  Invalid blocks: {}\n", .{result.invalid_blocks});
         std.debug.print("  Network tip: block={}, slot={}\n", .{ result.network_tip_block, result.network_tip_slot });
         std.debug.print("  Rollbacks: {}\n", .{result.rollbacks});
+        std.debug.print("  Stopped by signal: {}\n", .{result.stopped_by_signal});
     } else {
         std.debug.print("Kassadin — Cardano Node in Zig\n", .{});
         std.debug.print("Version: 0.1.0\n", .{});
         std.debug.print("\nUsage:\n", .{});
         std.debug.print("  kassadin bootstrap           Show latest Mithril snapshot info\n", .{});
         std.debug.print("  kassadin bootstrap --download Download and restore snapshot\n", .{});
-        std.debug.print("  kassadin bootstrap-sync       Sync forward from Mithril snapshot\n", .{});
-        std.debug.print("  kassadin sync                 Sync headers from preview network\n", .{});
+        std.debug.print("  kassadin bootstrap-sync [--db-path path] [--config config.json] [--topology topology.json] [--shelley-genesis path] [--max-blocks N] [--validate-dolos] [--dolos-grpc host:port]\n", .{});
+        std.debug.print("  kassadin sync [--network preview|preprod] [--db-path path] [--max-headers N] [--config config.json] [--topology topology.json] [--byron-genesis path] [--shelley-genesis path]\n", .{});
         std.debug.print("  kassadin                      Show this help\n", .{});
     }
 }

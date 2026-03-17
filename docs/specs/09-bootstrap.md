@@ -4,6 +4,16 @@
 
 Fast sync via Mithril snapshot download, plus genesis sync fallback, node configuration, and full integration.
 
+Current implementation note:
+- `bootstrap --download` restores under `db/<network>/`, downloads Mithril ancillary data when local ledger state is absent, and validates that immutable chunks exist before reporting success
+- `bootstrap-sync` resolves the snapshot root from `db/<network>/`, reads the snapshot tip, loads the latest local ledger snapshot from `ledger/<slot>/tables/tvar`, replays the immutable tail to the immutable tip, anchors `ChainDB` there, and fetches/parses real forward blocks with local validation enabled
+- `bootstrap-sync --validate-dolos` remains available as an optional comparison/fallback path via Dolos gRPC `ReadTx`
+- Bootstrap/runtime local validation now load Shelley genesis protocol params from configured/local genesis JSON when available, and the CLI can resolve those genesis files from official cardano-node config JSON
+- Byron genesis parsing now loads protocol constants and initial AVVM/non-AVVM balance distributions from official/local genesis JSON, Byron fee/size parameters can seed origin-side validation, and Kassadin now derives Byron genesis UTxOs locally from non-AVVM base58 addresses plus AVVM redeem keys, seeds empty-chain ledger state before `FindIntersectGenesis`, switches to Shelley genesis protocol params on the first post-Byron block, and parses/applies Byron regular/EBB block/header golden data; fresh-db preprod origin runs now validate the first 5 blocks locally from genesis and also validate across the Byron-to-Shelley transition, while general Byron/bootstrap address validation outside the genesis seeding path is still pending
+- The CLI can also load relay peers from official topology JSON (`Producers`, `bootstrapPeers`, `localRoots`, `publicRoots`) and use the first resolved access point for `sync` / `bootstrap-sync`
+- `sync` and `bootstrap-sync` now run until stopped by default, and both exit cleanly on `SIGINT`/`SIGTERM`
+- Shelley-era tx-body protocol-parameter updates are now parsed, staged by epoch, adopted on quorum at epoch boundaries, and kept rollback-safe in `ChainDB`; modern-era governance/Conway parameter changes, modern min-ADA/cost-model handling, and final shutdown snapshot/checkpoint persistence are still pending
+
 ---
 
 ## 1. Mithril Snapshot Bootstrap
@@ -17,29 +27,41 @@ Mithril uses Stake-based Threshold Multi-signatures (STM) to certify snapshots o
 2. List available snapshots (GET /artifact/snapshots)
 3. Select most recent snapshot
 4. Download snapshot archive (.tar.zst, ~100+ GB compressed for mainnet)
-5. Verify certificate chain:
+5. Download ancillary archive when available (ledger state + any extra immutable files)
+6. Verify certificate chain:
    a. Fetch certificate for this snapshot
    b. Verify STM multi-signature against computed message digest
    c. Follow certificate chain back to genesis certificate
-6. Extract archive:
-   a. ImmutableDB files → db/immutable/
-   b. Ledger state snapshot → db/ledger/
-7. Start node, which continues syncing from snapshot tip
+7. Extract archives:
+   a. ImmutableDB files → db/<network>/immutable/
+   b. Ledger state snapshot(s) → db/<network>/ledger/<slot>/{meta,state,tables/tvar}
+8. Load the latest local ledger snapshot at or before the immutable tip
+9. Replay immutable tail blocks from the ledger snapshot slot to the immutable tip
+10. Start node, which continues syncing from snapshot tip
 ```
 
 ### Snapshot Contents
 ```
 snapshot.tar.zst/
+└── immutable/
+    ├── 00000.chunk
+    ├── 00000.primary
+    ├── 00000.secondary
+    ├── ...
+    ├── NNNNN.chunk         # Last complete immutable file
+    ├── NNNNN.primary
+    └── NNNNN.secondary
+
+snapshot.ancillary.tar.zst/
 ├── immutable/
-│   ├── 00000.chunk
-│   ├── 00000.primary
-│   ├── 00000.secondary
-│   ├── ...
-│   ├── NNNNN.chunk         # Last complete epoch
-│   ├── NNNNN.primary
-│   └── NNNNN.secondary
-└── ledger/
-    └── SLOT_NUMBER.snapshot  # Ledger state at snapshot point
+│   └── NNNNN.chunk         # Extra immutable file when present
+├── ledger/
+│   └── SLOT_NUMBER/
+│       ├── meta
+│       ├── state
+│       └── tables/
+│           └── tvar
+└── ancillary_manifest.json
 ```
 
 ### Certificate Verification
@@ -57,8 +79,10 @@ pub fn verifyMithrilCertificate(cert: MithrilCertificate) !void {
 After extraction, verify:
 1. ImmutableDB chunk files are complete (last chunk may be partial)
 2. Primary/secondary indices are consistent
-3. Ledger state snapshot loads successfully
+3. Ledger state snapshot loads successfully from `ledger/<slot>/`
 4. Ledger state hash matches expected value from certificate
+5. The extracted archive resolves to a usable `db/<network>/immutable/` layout
+6. The loaded ledger snapshot can replay the immutable tail to the immutable tip
 
 ---
 
@@ -279,7 +303,7 @@ pub const LogEvent = union(enum) {
 3. **Config parsing:** Load official mainnet/preview/preprod configs
 4. **Topology:** Parse and connect using official topology files
 5. **Crash recovery:** Kill node mid-operation, restart, verify no data loss
-6. **Graceful shutdown:** SIGTERM, verify clean exit and snapshot saved
+6. **Graceful shutdown:** SIGTERM, verify clean exit and final checkpoint/snapshot persistence
 7. **CLI:** All command-line options work as documented
-8. **Integration:** Run alongside 2 Haskell nodes in devnet for 24 hours
-9. **Memory:** Average RSS ≤ Haskell node over 24 hours
+8. **Integration:** Run alongside Dolos on preprod/devnet for 24 hours
+9. **Reference check:** Use the Haskell sources for troubleshooting and semantic diffing where Dolos behavior is ambiguous

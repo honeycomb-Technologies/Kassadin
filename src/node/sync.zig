@@ -74,6 +74,11 @@ pub const SyncClient = struct {
         _ = try self.peer.keepAlivePing(42);
     }
 
+    /// Fetch a full block by point using the block-fetch protocol.
+    pub fn fetchBlock(self: *SyncClient, point: chainsync.Point) !?[]u8 {
+        return self.peer.blockFetchSingle(point);
+    }
+
     /// Sync N headers from the current position.
     /// Returns number of headers actually received.
     pub fn syncHeaders(self: *SyncClient, count: u64) !u64 {

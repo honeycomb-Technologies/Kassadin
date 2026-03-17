@@ -108,7 +108,7 @@ MsgQueryReply = [3, {*version => version_data}]
 ```
 version_data = [network_magic: u32, initiator_only: bool, peer_sharing: u8, query: bool]
 // peer_sharing: 0=NoPeerSharing, 1=PeerSharingV1
-// network_magic: 764824073 (mainnet), 1 (preview), 2 (preprod)
+// network_magic: 764824073 (mainnet), 2 (preview), 1 (preprod)
 ```
 
 ### N2C Versions: 16-21
@@ -466,10 +466,10 @@ target_active_peers: 20
 ## Test Requirements
 
 1. **MUX:** Encode/decode SDU headers with known byte sequences
-2. **Handshake:** Connect to live Haskell node on preview, negotiate v14
-3. **Chain-Sync:** Follow 100+ headers from a Haskell node
+2. **Handshake:** Connect to a live preview relay, negotiate the current N2N version
+3. **Chain-Sync:** Follow 100+ headers from a live preview relay
 4. **Block-Fetch:** Download 100 real blocks, decode them
-5. **Tx-Submission:** Exchange TxIds with Haskell node (empty mempool is fine)
+5. **Tx-Submission:** Exchange TxIds with a live reference node (empty mempool is fine)
 6. **Keep-Alive:** Maintain connection for 5+ minutes with periodic pings
 7. **Peer-Sharing:** Request and decode peer addresses
 8. **State machine:** Verify every transition, reject invalid transitions

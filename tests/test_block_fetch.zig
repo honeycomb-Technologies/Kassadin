@@ -7,7 +7,6 @@ const chainsync = kassadin.network.chainsync;
 const protocol = kassadin.network.protocol;
 const block_mod = kassadin.ledger.block;
 const tx_mod = kassadin.ledger.transaction;
-const Encoder = kassadin.cbor.enc.Encoder;
 const Decoder = kassadin.cbor.Decoder;
 
 pub fn main() !void {
@@ -38,42 +37,70 @@ pub fn main() !void {
     defer allocator.free(find_resp);
     const find_msg = try chainsync.decodeMsg(find_resp);
 
-    var tip_slot: u64 = 0;
-    var tip_hash: [32]u8 = undefined;
+    var fetch_point: ?chainsync.Point = null;
+    var fetch_block_no: ?u64 = null;
     switch (find_msg) {
         .intersect_not_found => |inf| {
-            tip_slot = inf.tip.slot;
-            tip_hash = inf.tip.hash;
-            std.debug.print("  Tip: slot={}\n", .{tip_slot});
+            std.debug.print("  Tip: slot={}\n", .{inf.tip.slot});
         },
         .intersect_found => |isf| {
-            tip_slot = isf.tip.slot;
-            tip_hash = isf.tip.hash;
+            std.debug.print("  Intersect found at slot={}\n", .{isf.point.slot});
         },
         else => return,
     }
 
     // Get one header to find a block point
-    const req_bytes = try chainsync.encodeMsg(allocator, .request_next);
-    defer allocator.free(req_bytes);
-    try bearer.writeSDU(2, .initiator, req_bytes);
-    const req_resp = try bearer.readProtocolMessage(2, allocator);
-    defer allocator.free(req_resp);
-    const req_msg = try chainsync.decodeMsg(req_resp);
+    var attempts: u32 = 0;
+    while (attempts < 20 and fetch_point == null) : (attempts += 1) {
+        const req_bytes = try chainsync.encodeMsg(allocator, .request_next);
+        defer allocator.free(req_bytes);
+        try bearer.writeSDU(2, .initiator, req_bytes);
+        const req_resp = try bearer.readProtocolMessage(2, allocator);
+        defer allocator.free(req_resp);
+        const req_msg = try chainsync.decodeMsg(req_resp);
 
-    switch (req_msg) {
-        .roll_forward => |rf| {
-            tip_slot = rf.tip.slot;
-            tip_hash = rf.tip.hash;
-            std.debug.print("  Got header, tip: slot={}\n", .{tip_slot});
-        },
-        else => {},
+        switch (req_msg) {
+            .roll_forward => |rf| {
+                const header = try block_mod.parseHeader(rf.header_raw);
+                if (header.slot == 0 or header.block_no == 0) {
+                    std.debug.print("  Skipping genesis-like header at slot={} block={}\n", .{
+                        header.slot,
+                        header.block_no,
+                    });
+                    continue;
+                }
+
+                fetch_point = try block_mod.pointFromHeader(rf.header_raw);
+                fetch_block_no = header.block_no;
+                std.debug.print("  Got header at slot={} block={}\n", .{
+                    fetch_point.?.slot,
+                    header.block_no,
+                });
+            },
+            .await_reply => {
+                std.debug.print("  AwaitReply, retrying...\n", .{});
+                std.Thread.sleep(250 * std.time.ns_per_ms);
+            },
+            .roll_backward => {
+                std.debug.print("  RollBackward while searching for fetch point\n", .{});
+            },
+            else => {},
+        }
     }
 
     // Step 3: Block-fetch using the tip point
-    std.debug.print("[3] Block-fetch at slot {}...\n", .{tip_slot});
+    const point = fetch_point orelse {
+        std.debug.print("  No fetch point discovered\n", .{});
+        std.process.exit(1);
+        return;
+    };
+    const expected_block_no = fetch_block_no orelse {
+        std.debug.print("  No non-genesis block number discovered\n", .{});
+        std.process.exit(1);
+        return;
+    };
+    std.debug.print("[3] Block-fetch at slot {}...\n", .{point.slot});
 
-    const point = chainsync.Point{ .slot = tip_slot, .hash = tip_hash };
     const bf_bytes = try blockfetch.encodeMsg(allocator, .{
         .request_range = .{ .from = point, .to = point },
     });
@@ -108,6 +135,18 @@ pub fn main() !void {
                 std.debug.print("  Era: {}\n", .{@intFromEnum(blk.era)});
                 std.debug.print("  Block: {}\n", .{blk.header.block_no});
                 std.debug.print("  Slot: {}\n", .{blk.header.slot});
+
+                if (blk.header.slot == 0 or blk.header.block_no == 0) {
+                    std.debug.print("  ERROR: fetched genesis-like block unexpectedly\n", .{});
+                    std.process.exit(1);
+                }
+                if (blk.header.block_no != expected_block_no) {
+                    std.debug.print("  ERROR: fetched block_no {} but expected {}\n", .{
+                        blk.header.block_no,
+                        expected_block_no,
+                    });
+                    std.process.exit(1);
+                }
 
                 // Parse and verify transactions
                 var tx_dec = Decoder.init(blk.tx_bodies_raw);

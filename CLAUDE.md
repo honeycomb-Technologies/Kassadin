@@ -8,16 +8,19 @@ Kassadin is a spec-compliant Cardano block-producing node written in Zig. It mus
 
 ## Current Status
 
-**52 commits, 50 files, ~12,000 lines, 301 tests, Zig 0.15.2 + plutuz**
+**~14,000 lines, 351 tests, Zig 0.15.2 + plutuz**
 
 **Phase 0: COMPLETE** — Crypto, CBOR, Core Types (109 tests, all byte-exact vs Haskell)
 **Phase 1: COMPLETE** — Networking + multi-SDU mux (48 tests + live preview + Dolos N2C handshake)
-**Phase 2: COMPLETE** — Storage (18 tests, zero memory leaks)
+**Phase 2: COMPLETE** — Storage (19 tests, zero memory leaks)
 **Phase 3: LAYER 1 COMPLETE** — Parsing + Plutus (265 tests, 999/999 plutuz conformance)
 **Phase 4: LAYER 1 COMPLETE** — Consensus algorithms (VRF leader, chain selection, nonce evolution)
 **Phase 5: INDEPENDENT DONE** — Mempool + key file management
 **Phase 6: CODECS DONE** — All 5 N2C protocols + Unix socket + N2C handshake
-**Phase 7: MAJOR MILESTONE** — Full pipeline: Mithril → FindIntersect → block-fetch → parse txs on LIVE preview
+**Phase 7: IN PROGRESS** — Preview sync fetches real blocks, stores them through ChainDB, and resumes from a checkpoint; bootstrap-sync now restores real Mithril main + ancillary snapshots under `db/<network>/`, loads the latest local ledger snapshot into `LedgerDB`, replays the immutable tail to the snapshot tip, and validates forward preprod blocks locally without Dolos; normal runtime `sync` now uses that same restored snapshot/ledger path when available, and both paths load real Shelley genesis protocol params from local config when present. The CLI can now parse official cardano-node config JSON to resolve genesis files, load relay peers from official topology JSON, parse Byron genesis protocol constants and initial balance distributions from official/local genesis JSON, load Byron fee/size params when starting from origin, derive Byron genesis UTxOs locally from non-AVVM base58 addresses plus AVVM redeem keys, seed empty-chain ledger state from Byron genesis before `FindIntersectGenesis`, switch from Byron to Shelley protocol parameters on the first post-Byron block, and parse/apply Byron regular-block transactions plus Byron regular/EBB block headers from ouroboros-consensus golden data. Fresh-db preprod origin runs now validate the first 5 blocks from genesis locally and also validate across the Byron-to-Shelley transition (46 Byron blocks, then the first Shelley block at block 46 / slot 86400) with 0 invalid blocks. Shelley-era protocol-parameter update parsing/staging is now wired through tx bodies, `ChainDB` keeps rollback-safe epoch-scoped PPUP state, and both `sync` and `bootstrap-sync` still validate live preprod blocks cleanly after the change. `sync` and `bootstrap-sync` now run until stopped by default, and both runtime paths exit cleanly on `SIGINT`/`SIGTERM`; general Byron/bootstrap address validation outside the genesis seeding path, full modern-era governance/Conway parameter changes, modern min-ADA/cost-model handling, and final shutdown snapshot/checkpoint persistence are still pending
+
+**Operational validation target:** Dolos on preprod for side-by-side testing.
+The Haskell trees in `reference-*` are used as semantic/reference sources and for troubleshooting.
 
 ## CRITICAL: Deferred Layer 2 Items (Phase 7/8)
 
@@ -70,8 +73,14 @@ DO NOT mark them done until validated against real chain data.
 | Plutus script hash | Blake2b-224 byte-exact |
 | Plutus execution | 999/999 official conformance tests |
 | N2N handshake | Real preview node v15 accepted |
-| N2N chain-sync | 10+ real headers from preview |
+| N2N chain-sync | Real preview sync from genesis with fetched blocks and checkpoint resume |
+| N2N block-fetch | Real preview non-genesis block fetched and parsed |
+| Byron block parsing | ouroboros-consensus golden regular + EBB block/header parsing and point/hash derivation |
+| Byron tx parsing/apply | golden Byron GenTx parsing plus regular-block UTxO application using Byron fee policy |
 | N2C handshake | Real Dolos node (preprod) accepted |
+| Mithril restore | Real preprod main + ancillary snapshot restored under `db/preprod/` |
+| Bootstrap local validation | 100 forward preprod blocks validated locally from restored ledger snapshot |
+| Signal-aware follower runtime | Real preprod `sync` exits cleanly on `SIGINT` while loading/restoring snapshot-backed state |
 | Genesis parsing | Real mainnet-shelley-genesis.json |
 | Addresses | 6 CIP-0019 golden vectors |
 
@@ -86,9 +95,9 @@ DO NOT mark them done until validated against real chain data.
 ## Build Commands
 
 ```bash
-zig build test           # 301 unit tests
+zig build test           # 344 unit + live-gated tests
 zig build test-live      # Live N2N test against preview relay
-zig build test-dolos     # N2C handshake with local Dolos
+zig build test-dolos     # N2C handshake smoke test with local Dolos
 zig build run            # Run the node
 ```
 

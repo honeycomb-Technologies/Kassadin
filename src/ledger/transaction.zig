@@ -2,12 +2,16 @@ const std = @import("std");
 const Decoder = @import("../cbor/decoder.zig").Decoder;
 const types = @import("../types.zig");
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
+const cert_mod = @import("certificates.zig");
+const protocol_update = @import("protocol_update.zig");
 
 pub const TxId = types.TxId;
 pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
 pub const Hash32 = types.Hash32;
 pub const Hash28 = types.Hash28;
+pub const TxProtocolUpdate = protocol_update.TxProtocolUpdate;
+pub const Certificate = cert_mod.Certificate;
 
 /// A parsed transaction output (simplified for Phase 3).
 pub const TxOut = struct {
@@ -22,9 +26,12 @@ pub const TxBody = struct {
     tx_id: TxId, // Blake2b-256 of raw CBOR body
     inputs: []const TxIn,
     outputs: []const TxOut,
+    certificates: []const Certificate,
     fee: Coin,
+    withdrawal_total: Coin,
     ttl: ?u64, // Shelley time-to-live
     validity_start: ?u64, // Allegra+ validity interval start
+    update: ?TxProtocolUpdate, // Shelley-era protocol parameter update
     raw_cbor: []const u8, // original CBOR for hashing
 
     /// Total output value.
@@ -36,6 +43,52 @@ pub const TxBody = struct {
         return total;
     }
 };
+
+fn parseByronTxIn(dec: *Decoder) !TxIn {
+    const arr_len = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    if (arr_len != 2) return error.InvalidCbor;
+
+    const tag = try dec.decodeUint();
+    if (tag != 0) return error.InvalidCbor;
+
+    const cbor_tag = try dec.decodeTag();
+    if (cbor_tag != 24) return error.InvalidCbor;
+
+    const inner_bytes = try dec.decodeBytes();
+    var inner = Decoder.init(inner_bytes);
+    const inner_len = (try inner.decodeArrayLen()) orelse return error.InvalidCbor;
+    if (inner_len != 2) return error.InvalidCbor;
+
+    const txid_bytes = try inner.decodeBytes();
+    if (txid_bytes.len != 32) return error.InvalidCbor;
+
+    var txid: TxId = undefined;
+    @memcpy(&txid, txid_bytes);
+
+    const tx_ix = try inner.decodeUint();
+    if (tx_ix > std.math.maxInt(u16)) return error.Overflow;
+
+    return .{
+        .tx_id = txid,
+        .tx_ix = @intCast(tx_ix),
+    };
+}
+
+fn parseByronTxOut(data: []const u8) !TxOut {
+    var dec = Decoder.init(data);
+    const arr_len = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    if (arr_len != 2) return error.InvalidCbor;
+
+    const address_raw = try dec.sliceOfNextValue();
+    const value = try dec.decodeUint();
+
+    return .{
+        .address_raw = address_raw,
+        .value = value,
+        .datum_hash = null,
+        .raw_cbor = data,
+    };
+}
 
 /// Parse a transaction body from CBOR (map-encoded, Shelley+ format).
 /// Transaction bodies are CBOR maps with integer keys.
@@ -49,9 +102,13 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
     defer inputs.deinit(allocator);
     var outputs: std.ArrayList(TxOut) = .empty;
     defer outputs.deinit(allocator);
+    var certificates: std.ArrayList(Certificate) = .empty;
+    defer certificates.deinit(allocator);
     var fee: Coin = 0;
+    var withdrawal_total: Coin = 0;
     var ttl: ?u64 = null;
     var validity_start: ?u64 = null;
+    var update: ?TxProtocolUpdate = null;
 
     var i: u64 = 0;
     while (i < map_len) : (i += 1) {
@@ -88,7 +145,7 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
                 var j: u64 = 0;
                 while (j < num_outputs) : (j += 1) {
                     const out_raw = try dec.sliceOfNextValue();
-                    const out = try parseOutput(out_raw);
+                    const out = try parseTxOut(out_raw);
                     try outputs.append(allocator, .{
                         .address_raw = out.address_raw,
                         .value = out.value,
@@ -105,9 +162,36 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
                 // TTL (Shelley)
                 ttl = try dec.decodeUint();
             },
+            4 => {
+                const num_certs = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                var j: u64 = 0;
+                while (j < num_certs) : (j += 1) {
+                    var cert_dec = Decoder.init(try dec.sliceOfNextValue());
+                    try certificates.append(allocator, try cert_mod.parseCertificate(&cert_dec));
+                }
+            },
+            5 => {
+                const withdrawals_len = try dec.decodeMapLen();
+                if (withdrawals_len) |count| {
+                    var j: u64 = 0;
+                    while (j < count) : (j += 1) {
+                        try dec.skipValue();
+                        withdrawal_total += try dec.decodeUint();
+                    }
+                } else {
+                    while (!dec.isBreak()) {
+                        try dec.skipValue();
+                        withdrawal_total += try dec.decodeUint();
+                    }
+                    try dec.decodeBreak();
+                }
+            },
             8 => {
                 // Validity interval start (Allegra+)
                 validity_start = try dec.decodeUint();
+            },
+            6 => {
+                update = try protocol_update.parseTxUpdate(allocator, try dec.sliceOfNextValue());
             },
             else => {
                 // Skip unknown fields (certificates, withdrawals, etc.)
@@ -120,15 +204,77 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
         .tx_id = tx_id,
         .inputs = try inputs.toOwnedSlice(allocator),
         .outputs = try outputs.toOwnedSlice(allocator),
+        .certificates = try certificates.toOwnedSlice(allocator),
         .fee = fee,
+        .withdrawal_total = withdrawal_total,
         .ttl = ttl,
         .validity_start = validity_start,
+        .update = update,
+        .raw_cbor = data,
+    };
+}
+
+/// Parse a Byron transaction body from CBOR.
+/// Byron transactions are `[inputs, outputs, attributes]` without an explicit fee.
+pub fn parseByronTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
+    const tx_id = Blake2b256.hash(data);
+    var dec = Decoder.init(data);
+
+    const arr_len = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    if (arr_len != 3) return error.InvalidCbor;
+
+    var inputs: std.ArrayList(TxIn) = .empty;
+    defer inputs.deinit(allocator);
+    var outputs: std.ArrayList(TxOut) = .empty;
+    defer outputs.deinit(allocator);
+
+    const inputs_len = try dec.decodeArrayLen();
+    if (inputs_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            try inputs.append(allocator, try parseByronTxIn(&dec));
+        }
+    } else {
+        while (!dec.isBreak()) {
+            try inputs.append(allocator, try parseByronTxIn(&dec));
+        }
+        try dec.decodeBreak();
+    }
+
+    const outputs_len = try dec.decodeArrayLen();
+    if (outputs_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            const out_raw = try dec.sliceOfNextValue();
+            try outputs.append(allocator, try parseByronTxOut(out_raw));
+        }
+    } else {
+        while (!dec.isBreak()) {
+            const out_raw = try dec.sliceOfNextValue();
+            try outputs.append(allocator, try parseByronTxOut(out_raw));
+        }
+        try dec.decodeBreak();
+    }
+
+    // Transaction attributes are currently ignored, but must still be consumed.
+    try dec.skipValue();
+
+    return .{
+        .tx_id = tx_id,
+        .inputs = try inputs.toOwnedSlice(allocator),
+        .outputs = try outputs.toOwnedSlice(allocator),
+        .certificates = try allocator.alloc(Certificate, 0),
+        .fee = 0,
+        .withdrawal_total = 0,
+        .ttl = null,
+        .validity_start = null,
+        .update = null,
         .raw_cbor = data,
     };
 }
 
 /// Parse a single transaction output.
-fn parseOutput(data: []const u8) !TxOut {
+pub fn parseTxOut(data: []const u8) !TxOut {
     var dec = Decoder.init(data);
     const first = try dec.peekMajorType();
 
@@ -195,8 +341,12 @@ fn parseValue(dec: *Decoder) !Coin {
 
 /// Free a parsed TxBody's owned memory.
 pub fn freeTxBody(allocator: std.mem.Allocator, body: *TxBody) void {
+    if (body.update) |*update| {
+        update.deinit(allocator);
+    }
     allocator.free(body.inputs);
     allocator.free(body.outputs);
+    allocator.free(body.certificates);
 }
 
 // ──────────────────────────────────── Tests ────────────────────────────────────
@@ -338,4 +488,46 @@ test "transaction: total output value" {
     try std.testing.expectEqual(@as(usize, 2), tx.outputs.len);
     try std.testing.expectEqual(@as(Coin, 200_000), tx.fee);
     try std.testing.expectEqual(@as(Coin, 3_000_000), tx.totalOutputValue());
+}
+
+test "transaction: parse Byron golden tx body" {
+    const allocator = std.testing.allocator;
+
+    const gen_tx_data = std.fs.cwd().readFileAlloc(
+        allocator,
+        "reference-ouroboros-consensus/ouroboros-consensus-cardano/golden/byron/ByronNodeToNodeVersion2/GenTx",
+        1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(gen_tx_data);
+
+    var dec = Decoder.init(gen_tx_data);
+    const wrapper_len = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    try std.testing.expectEqual(@as(u64, 2), wrapper_len);
+    try std.testing.expectEqual(@as(u64, 0), try dec.decodeUint());
+
+    const tx_pair_raw = try dec.sliceOfNextValue();
+    var pair_dec = Decoder.init(tx_pair_raw);
+    const pair_len = (try pair_dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    try std.testing.expectEqual(@as(u64, 2), pair_len);
+
+    const tx_raw = try pair_dec.sliceOfNextValue();
+    var tx = try parseByronTxBody(allocator, tx_raw);
+    defer freeTxBody(allocator, &tx);
+
+    try std.testing.expectEqual(@as(usize, 1), tx.inputs.len);
+    try std.testing.expectEqual(@as(usize, 1), tx.outputs.len);
+    try std.testing.expectEqual(@as(Coin, 47), tx.outputs[0].value);
+    try std.testing.expectEqual(@as(Coin, 0), tx.fee);
+
+    // Byron UTxO transaction ids are derived from the exact transaction body bytes.
+    const expected_txid = [_]u8{
+        0x37, 0x62, 0x93, 0xe1, 0x6c, 0xf8, 0x7c, 0x37,
+        0x7d, 0xce, 0x58, 0xea, 0x6e, 0xfd, 0x25, 0x62,
+        0x76, 0xf8, 0x64, 0x54, 0xfc, 0x13, 0xd3, 0x90,
+        0xf6, 0x73, 0xdb, 0x78, 0x9d, 0xcd, 0x71, 0x04,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_txid, &tx.tx_id);
 }
