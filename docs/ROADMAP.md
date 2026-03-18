@@ -519,6 +519,7 @@ headers from ouroboros-consensus golden data.
 - [x] Credit delegator reward accounts as well as pool reward accounts from `go`-snapshot stake during epoch reward distribution (current follower reward model)
 - [x] Import/rotate Haskell-shaped `BlocksMade` (`nesBprev` / `nesBcur`) and use real block production plus Shelley `activeSlotsCoeff` in the follower reward path
 - [x] Parse MIR cert payloads, stage pending instantaneous rewards/pot transfers rollback-safely, hydrate MIR snapshot state locally, and realize-or-drop MIR at epoch boundaries in both immutable replay and live `ChainDB`
+- [x] Filter epoch reward payouts against the current registered account set and route unclaimable rewards to treasury during replay/live epoch processing
 - [ ] Maintain full reward-account and deposit state across epoch reward/stake updates during long-running sync
 
 ### 7.3 Full Integration

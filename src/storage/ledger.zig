@@ -1093,7 +1093,8 @@ pub const LedgerDB = struct {
         const total_stake = params.total_lovelace -| self.reserves_balance;
         const blocks_total = rewards_mod.calculateExpectedBlocks(slots_per_epoch, params.active_slot_coeff);
 
-        var total_distributed: Coin = 0;
+        var total_registered_distributed: Coin = 0;
+        var total_unregistered_distributed: Coin = 0;
         var pool_it = go_dist.pools.iterator();
         while (pool_it.next()) |entry| {
             const pool_stake = entry.value_ptr;
@@ -1123,17 +1124,20 @@ pub const LedgerDB = struct {
             );
 
             if (leader_reward > 0) {
-                try appendPoolReapRewardChange(
-                    allocator,
-                    &reward_changes,
-                    self,
-                    pool_stake.reward_account,
-                    leader_reward,
-                );
-                total_distributed += leader_reward;
+                if (self.isRegisteredRewardCredential(pool_stake.reward_account.credential)) {
+                    try appendPoolReapRewardChange(
+                        allocator,
+                        &reward_changes,
+                        self,
+                        pool_stake.reward_account,
+                        leader_reward,
+                    );
+                    total_registered_distributed += leader_reward;
+                } else {
+                    total_unregistered_distributed += leader_reward;
+                }
             }
 
-            var member_distributed: Coin = 0;
             var deleg_it = go_dist.delegators.iterator();
             while (deleg_it.next()) |deleg_entry| {
                 const delegated = deleg_entry.value_ptr.*;
@@ -1152,19 +1156,22 @@ pub const LedgerDB = struct {
                 );
                 if (reward == 0) continue;
 
-                try appendPoolReapRewardChange(
-                    allocator,
-                    &reward_changes,
-                    self,
-                    .{ .network = self.reward_account_network, .credential = delegated.credential },
-                    reward,
-                );
-                member_distributed += reward;
+                if (self.isRegisteredRewardCredential(delegated.credential)) {
+                    try appendPoolReapRewardChange(
+                        allocator,
+                        &reward_changes,
+                        self,
+                        .{ .network = self.reward_account_network, .credential = delegated.credential },
+                        reward,
+                    );
+                    total_registered_distributed += reward;
+                } else {
+                    total_unregistered_distributed += reward;
+                }
             }
-            total_distributed += member_distributed;
         }
 
-        if (total_distributed == 0) return null;
+        if (total_registered_distributed == 0 and total_unregistered_distributed == 0) return null;
 
         return .{
             .slot = slot,
@@ -1173,11 +1180,11 @@ pub const LedgerDB = struct {
             .produced = try allocator.alloc(UtxoEntry, 0),
             .treasury_balance_change = .{
                 .previous = self.treasury_balance,
-                .next = self.treasury_balance + epoch_rewards.treasury_cut,
+                .next = self.treasury_balance + epoch_rewards.treasury_cut + total_unregistered_distributed,
             },
             .reserves_balance_change = .{
                 .previous = self.reserves_balance,
-                .next = self.reserves_balance -| (total_distributed + epoch_rewards.treasury_cut),
+                .next = self.reserves_balance -| (total_registered_distributed + total_unregistered_distributed + epoch_rewards.treasury_cut),
             },
             .snapshot_fees_change = .{
                 .previous = self.snapshot_fees,
@@ -3095,6 +3102,8 @@ test "ledgerdb: epoch reward diff excludes owners from member rewards" {
 
     try db.importPoolRewardAccount(pool, reward_account);
     try db.importRewardBalance(reward_account, 1_000);
+    try db.importStakeDeposit(reward_account.credential, 2_000_000);
+    try db.importStakeDeposit(delegator_cred, 2_000_000);
     db.setRewardAccountNetwork(.testnet);
     db.importReservesBalance(14_000_000_000_000_000);
     db.importSnapshotFees(50_000_000_000);
@@ -3148,6 +3157,61 @@ test "ledgerdb: epoch reward diff excludes owners from member rewards" {
     try std.testing.expect(db.lookupRewardBalance(owner_account) == null);
     try std.testing.expect(db.lookupRewardBalance(delegator_account) == null);
     try std.testing.expectEqual(@as(Coin, 50_000_000_000), db.getSnapshotFees());
+}
+
+test "ledgerdb: epoch reward diff routes unregistered rewards to treasury" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-epoch-reward-unregistered");
+    defer db.deinit();
+
+    const pool = [_]u8{0x94} ** 28;
+    const reward_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x95} ** 28 },
+    };
+    const delegator_cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0x96} ** 28 };
+    const delegator_account = RewardAccount{
+        .network = .testnet,
+        .credential = delegator_cred,
+    };
+
+    try db.importPoolRewardAccount(pool, reward_account);
+    db.setRewardAccountNetwork(.testnet);
+    db.importTreasuryBalance(10_000);
+    db.importReservesBalance(14_000_000_000_000_000);
+    db.importSnapshotFees(50_000_000_000);
+    try db.importPreviousEpochBlocksMade(pool, 21_600);
+
+    var go = stake_mod.StakeDistribution.init(allocator, 0);
+    try go.setPoolStake(
+        pool,
+        1_000_000_000_000,
+        500_000_000_000,
+        500_000_000_000,
+        340_000_000,
+        .{ .numerator = 0, .denominator = 1 },
+        reward_account,
+    );
+    try go.setDelegatedStake(delegator_cred, pool, 500_000_000_000);
+    go.finalize();
+
+    var snapshots = StakeSnapshots.init(allocator);
+    snapshots.go = go;
+    db.replaceStakeSnapshots(snapshots);
+
+    const diff = (try db.buildEpochRewardDiff(
+        allocator,
+        100,
+        [_]u8{0x97} ** 32,
+        rewards_mod.RewardParams.mainnet_defaults,
+        432_000,
+    )).?;
+    const treasury_before = db.getTreasuryBalance();
+    try db.applyDiff(diff);
+
+    try std.testing.expect(db.getTreasuryBalance() > treasury_before);
+    try std.testing.expect(db.lookupRewardBalance(reward_account) == null);
+    try std.testing.expect(db.lookupRewardBalance(delegator_account) == null);
 }
 
 test "ledgerdb: epoch reward diff requires owner pledge stake" {
