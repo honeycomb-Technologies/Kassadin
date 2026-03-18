@@ -7,6 +7,7 @@ const certificates = @import("../ledger/certificates.zig");
 const ledger_apply = @import("../ledger/apply.zig");
 const rewards_mod = @import("../ledger/rewards.zig");
 const rules = @import("../ledger/rules.zig");
+const header_validation = @import("../consensus/header_validation.zig");
 const stake_mod = @import("../ledger/stake.zig");
 const runtime_control = @import("runtime_control.zig");
 const types = @import("../types.zig");
@@ -244,6 +245,7 @@ pub fn replayImmutableFromSlot(
                             block.hash(),
                             epoch,
                             reward_params,
+                            slots_per_epoch,
                         );
                     }
                 }
@@ -275,6 +277,17 @@ pub fn replayImmutableFromSlot(
                 ledger_diffs_applied += 1;
             }
 
+            const pool = header_validation.poolKeyHash(block.header.issuer_vkey);
+            if (try ledger.buildCurrentEpochBlocksMadeDiff(
+                allocator,
+                block.header.slot,
+                block.hash(),
+                pool,
+            )) |diff| {
+                try ledger.applyDiff(diff);
+                ledger_diffs_applied += 1;
+            }
+
             result.blocks_replayed += 1;
             result.txs_applied += apply_result.txs_applied;
             result.txs_failed += apply_result.txs_failed;
@@ -293,6 +306,7 @@ fn applyReplayEpochBoundaryEffects(
     block_hash: types.HeaderHash,
     epoch: types.EpochNo,
     reward_params: rewards_mod.RewardParams,
+    slots_per_epoch: u64,
 ) !u32 {
     var applied: u32 = 0;
 
@@ -301,12 +315,18 @@ fn applyReplayEpochBoundaryEffects(
         slot,
         block_hash,
         reward_params,
+        slots_per_epoch,
     )) |diff| {
         try ledger.applyDiff(diff);
         applied += 1;
     }
 
     ledger.rotateStakeSnapshots(epoch);
+
+    if (try ledger.buildEpochBlocksMadeShiftDiff(allocator, slot, block_hash)) |diff| {
+        try ledger.applyDiff(diff);
+        applied += 1;
+    }
 
     if (try ledger.buildEpochFeeRolloverDiff(allocator, slot, block_hash)) |diff| {
         try ledger.applyDiff(diff);
@@ -476,12 +496,57 @@ fn parseNewEpochState(
     }
 
     try dec.skipValue(); // nesEL
-    try dec.skipValue(); // nesBprev
-    try dec.skipValue(); // nesBcur
+    try parseBlocksMade(ledger, dec, .previous);
+    try parseBlocksMade(ledger, dec, .current);
     try parseEpochState(allocator, ledger, network, active_era, dec);
     try dec.skipValue(); // nesRu
     try dec.skipValue(); // nesPd
     try dec.skipValue(); // stashedAVVMAddresses
+}
+
+const BlocksMadeTarget = enum {
+    previous,
+    current,
+};
+
+fn parseBlocksMade(
+    ledger: *LedgerDB,
+    dec: *Decoder,
+    target: BlocksMadeTarget,
+) !void {
+    const map_len = try dec.decodeMapLen();
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            try importBlocksMadeEntry(ledger, dec, target);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            try importBlocksMadeEntry(ledger, dec, target);
+        }
+        try dec.decodeBreak();
+    }
+}
+
+fn importBlocksMadeEntry(
+    ledger: *LedgerDB,
+    dec: *Decoder,
+    target: BlocksMadeTarget,
+) !void {
+    const pool_bytes = try dec.decodeBytes();
+    if (pool_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected BlocksMade pool hash len {}\n", .{pool_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var pool: types.KeyHash = undefined;
+    @memcpy(&pool, pool_bytes);
+    const count = try dec.decodeUint();
+
+    switch (target) {
+        .previous => try ledger.importPreviousEpochBlocksMade(pool, count),
+        .current => try ledger.importCurrentEpochBlocksMade(pool, count),
+    }
 }
 
 fn parseEpochState(

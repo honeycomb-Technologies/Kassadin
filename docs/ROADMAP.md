@@ -429,22 +429,23 @@ withdrawals locally; once reward state is loaded, tracked withdrawals now follow
 the Haskell exact-drain rule instead of accepting stale/missing balances on
 faith. Snapshot/runtime validation now hydrates reward balances, stake
 deposits, current/future pool params, current/future pool owner memberships, pool reward accounts, pool retirement schedules, chain-account pots,
-fee pots, and Haskell-shaped mark/set/go stake snapshots from the local
+fee pots, Haskell-shaped `BlocksMade` (`nesBprev` / `nesBcur`), and Haskell-shaped mark/set/go stake snapshots from the local
 ancillary `state` payload before replaying the immutable tail, so live
 withdrawal, deposit, fee, and pool-retirement checks can use real
 snapshot-backed state. The modern Haskell `SnapShots = [mark,set,go,fee]` /
 `StakePoolSnapShot` path is now the primary import path, with compatibility
 handling for observed 9-field pool entries that derives active stake from the
 outer active-stake map instead of zeroing it, and immutable replay now applies
-the same reward/snapshot/fee/pool epoch-boundary effects as live `ChainDB`.
-Epoch reward distribution is also no longer pool-account-only: the current
-simplified reward model now credits both pool reward accounts and delegator
-reward accounts from the `go` snapshot's credential-level stake data, the
-pool leader reward path now uses the snapshot-era pool reward account instead
-of the live pool map, self-delegated owners are excluded from member rewards,
-rewards are gated on snapshot-era pledge coverage, and immutable replay/live
-epoch-boundary processing now use Shelley genesis reward parameters instead of
-hardcoded mainnet defaults.
+the same reward/snapshot/fee/pool/block-count epoch-boundary effects as live `ChainDB`.
+Epoch reward distribution is also no longer pool-account-only or fake-performance-only:
+the current follower path imports/rotates Haskell-shaped `BlocksMade`, derives
+expected blocks from Shelley genesis `activeSlotsCoeff`, applies a Shelley
+`maxPool'`-style pool-pot calculation, credits both pool reward accounts and
+delegator reward accounts from the `go` snapshot's credential-level stake
+data, uses the snapshot-era pool reward account instead of the live pool map,
+excludes self-delegated owners from member rewards, gates rewards on
+snapshot-era pledge coverage, and uses Shelley genesis reward parameters
+instead of hardcoded mainnet defaults.
 Epoch-boundary pool processing is now rollback-safe in both immutable-tail replay and
 forward sync: pool re-registration stages future params and future owner sets
 locally instead of mutating live pool state immediately, those staged values
@@ -515,7 +516,8 @@ headers from ouroboros-consensus golden data.
 - [x] Hydrate treasury/reserves/current-fee/snapshot-fee pots from ancillary snapshot state, accumulate block fees locally, and route unclaimed pool-retirement refunds to treasury
 - [x] Import modern Haskell `SnapShots` / `StakePoolSnapShot` ancillary state as the primary path, retain credential-level active stake in mark/set/go, and handle observed 9-field pool entries compatibly
 - [x] Hydrate current + future pool params from ancillary snapshot state, track them rollback-safely in `LedgerDB`, and activate staged pool re-registration params at epoch processing
-- [x] Credit delegator reward accounts as well as pool reward accounts from `go`-snapshot stake during epoch reward distribution (current simplified reward model)
+- [x] Credit delegator reward accounts as well as pool reward accounts from `go`-snapshot stake during epoch reward distribution (current follower reward model)
+- [x] Import/rotate Haskell-shaped `BlocksMade` (`nesBprev` / `nesBcur`) and use real block production plus Shelley `activeSlotsCoeff` in the follower reward path
 - [ ] Maintain full reward-account and deposit state across epoch reward/stake updates during long-running sync
 
 ### 7.3 Full Integration

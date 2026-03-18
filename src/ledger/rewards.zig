@@ -14,6 +14,7 @@ pub const RewardParams = struct {
     rho: UnitInterval, // monetary expansion rate
     tau: UnitInterval, // treasury growth rate
     a0: UnitInterval, // pool influence factor (pledge)
+    active_slot_coeff: UnitInterval, // active slot coefficient (d)
     n_opt: u16, // target number of pools
     total_lovelace: Coin, // max lovelace supply (45 billion ADA)
 
@@ -21,6 +22,7 @@ pub const RewardParams = struct {
         .rho = .{ .numerator = 3, .denominator = 1000 }, // 0.003
         .tau = .{ .numerator = 2, .denominator = 10 }, // 0.20
         .a0 = .{ .numerator = 3, .denominator = 10 }, // 0.30
+        .active_slot_coeff = .{ .numerator = 1, .denominator = 20 }, // 0.05
         .n_opt = 500,
         .total_lovelace = 45_000_000_000_000_000,
     };
@@ -39,6 +41,77 @@ pub const PoolRewardSplit = struct {
     member_rewards: Coin,
 };
 
+const Rational = struct {
+    numerator: u128,
+    denominator: u128,
+
+    fn init(numerator: u128, denominator: u128) Rational {
+        std.debug.assert(denominator != 0);
+        if (numerator == 0) {
+            return .{ .numerator = 0, .denominator = 1 };
+        }
+        const divisor = gcdU128(numerator, denominator);
+        return .{
+            .numerator = numerator / divisor,
+            .denominator = denominator / divisor,
+        };
+    }
+
+    fn fromUnitInterval(value: UnitInterval) Rational {
+        return init(value.numerator, value.denominator);
+    }
+
+    fn add(a: Rational, b: Rational) Rational {
+        return init(
+            (a.numerator * b.denominator) + (b.numerator * a.denominator),
+            a.denominator * b.denominator,
+        );
+    }
+
+    fn sub(a: Rational, b: Rational) Rational {
+        std.debug.assert(compare(a, b) != .lt);
+        return init(
+            (a.numerator * b.denominator) - (b.numerator * a.denominator),
+            a.denominator * b.denominator,
+        );
+    }
+
+    fn mul(a: Rational, b: Rational) Rational {
+        return init(a.numerator * b.numerator, a.denominator * b.denominator);
+    }
+
+    fn div(a: Rational, b: Rational) Rational {
+        std.debug.assert(b.numerator != 0);
+        return init(a.numerator * b.denominator, a.denominator * b.numerator);
+    }
+
+    fn min(a: Rational, b: Rational) Rational {
+        return switch (compare(a, b)) {
+            .lt, .eq => a,
+            .gt => b,
+        };
+    }
+
+    fn compare(a: Rational, b: Rational) std.math.Order {
+        const left = a.numerator * b.denominator;
+        const right = b.numerator * a.denominator;
+        if (left < right) return .lt;
+        if (left > right) return .gt;
+        return .eq;
+    }
+};
+
+fn gcdU128(a: u128, b: u128) u128 {
+    var x = a;
+    var y = b;
+    while (y != 0) {
+        const rem = x % y;
+        x = y;
+        y = rem;
+    }
+    return x;
+}
+
 fn floorRationalProduct(
     amount: Coin,
     numerator: u128,
@@ -46,6 +119,35 @@ fn floorRationalProduct(
 ) Coin {
     if (amount == 0 or numerator == 0 or denominator == 0) return 0;
     return @as(Coin, @intCast((@as(u128, amount) * numerator) / denominator));
+}
+
+pub fn calculateExpectedBlocks(
+    slots_per_epoch: u64,
+    active_slot_coeff: UnitInterval,
+) u64 {
+    return @intCast((@as(u128, slots_per_epoch) * active_slot_coeff.numerator) / active_slot_coeff.denominator);
+}
+
+fn calculateApparentPerformance(
+    active_slot_coeff: UnitInterval,
+    pool_active_stake: Coin,
+    total_active_stake: Coin,
+    blocks_produced: u64,
+    blocks_total: u64,
+) Rational {
+    if (pool_active_stake == 0 or total_active_stake == 0 or blocks_produced == 0) {
+        return Rational.init(0, 1);
+    }
+
+    const sigma_a = Rational.init(pool_active_stake, total_active_stake);
+    const d = Rational.fromUnitInterval(active_slot_coeff);
+    const threshold = Rational.init(4, 5);
+    if (Rational.compare(d, threshold) != .lt) {
+        return Rational.init(1, 1);
+    }
+
+    const beta = Rational.init(blocks_produced, @max(blocks_total, 1));
+    return Rational.div(beta, sigma_a);
 }
 
 /// Calculate the epoch reward pot.
@@ -78,45 +180,54 @@ pub fn calculateEpochRewards(
 }
 
 /// Calculate reward for a single pool.
-/// Uses a simplified version of the Shelley reward formula.
+/// Uses Shelley `maxPool'` with apparent performance derived from `BlocksMade`.
 pub fn calculatePoolReward(
     pool_stake: Coin,
+    total_stake: Coin,
     total_active_stake: Coin,
     pool_rewards_pot: Coin,
-    pool_cost: Coin,
-    pool_margin: UnitInterval,
+    pool_pledge: Coin,
+    params: RewardParams,
     blocks_produced: u64,
-    expected_blocks: u64,
+    blocks_total: u64,
 ) Coin {
-    if (total_active_stake == 0 or expected_blocks == 0) return 0;
+    if (pool_rewards_pot == 0 or total_stake == 0 or total_active_stake == 0 or params.n_opt == 0 or blocks_produced == 0) {
+        return 0;
+    }
 
-    // Performance: blocks_produced / expected_blocks
-    // Cap at 1.0 to avoid over-rewarding
-    const performance = @min(
-        (@as(u128, blocks_produced) * 1_000_000) / expected_blocks,
-        1_000_000,
+    const sigma = Rational.init(pool_stake, total_stake);
+    const pledge_ratio = Rational.init(pool_pledge, total_stake);
+    const z0 = Rational.init(1, params.n_opt);
+    const sigma_prime = Rational.min(sigma, z0);
+    const pledge_prime = Rational.min(pledge_ratio, z0);
+    const a0 = Rational.fromUnitInterval(params.a0);
+    const one = Rational.init(1, 1);
+
+    const factor1 = Rational.div(one, Rational.add(one, a0));
+    const factor4 = Rational.div(Rational.sub(z0, sigma_prime), z0);
+    const factor3 = Rational.div(
+        Rational.sub(sigma_prime, Rational.mul(pledge_prime, factor4)),
+        z0,
+    );
+    const factor2 = Rational.add(
+        sigma_prime,
+        Rational.mul(Rational.mul(pledge_prime, a0), factor3),
     );
 
-    // Proportional share: pool_stake / total_active_stake
-    const share = (@as(u128, pool_stake) * 1_000_000) / total_active_stake;
+    const max_pool_reward = floorRationalProduct(
+        pool_rewards_pot,
+        Rational.mul(factor1, factor2).numerator,
+        Rational.mul(factor1, factor2).denominator,
+    );
 
-    // Raw pool reward: pool_rewards_pot * share * performance
-    const raw_reward = @as(Coin, @intCast(
-        (@as(u128, pool_rewards_pot) * share * performance) / (1_000_000 * 1_000_000),
-    ));
-
-    if (raw_reward <= pool_cost) return 0;
-    const net_reward = raw_reward - pool_cost;
-
-    // Leader reward: pool_cost + margin * net_reward
-    const margin_cut = @as(Coin, @intCast(
-        (@as(u128, net_reward) * pool_margin.numerator) / pool_margin.denominator,
-    ));
-
-    _ = margin_cut; // leader gets cost + margin_cut
-    // member rewards = net_reward - margin_cut (distributed proportionally)
-
-    return raw_reward;
+    const app_perf = calculateApparentPerformance(
+        params.active_slot_coeff,
+        pool_stake,
+        total_active_stake,
+        blocks_produced,
+        blocks_total,
+    );
+    return floorRationalProduct(max_pool_reward, app_perf.numerator, app_perf.denominator);
 }
 
 pub fn splitPoolReward(
@@ -212,16 +323,66 @@ test "rewards: zero reserve produces only fee rewards" {
 test "rewards: pool reward calculation" {
     const pool_reward = calculatePoolReward(
         10_000_000_000_000, // 10M ADA stake
+        31_000_000_000_000_000, // circulating stake
         200_000_000_000_000, // 200M ADA total
         42_000_000_000_000, // 42M ADA reward pot
-        340_000_000, // 340 ADA cost
-        .{ .numerator = 5, .denominator = 100 }, // 5% margin
-        100, // blocks produced
-        100, // expected blocks (100% performance)
+        5_000_000_000_000, // 5M ADA pledge
+        RewardParams.mainnet_defaults,
+        2, // blocks produced
+        2, // expected blocks
     );
 
-    // Should get approximately 5% of reward pot (10M/200M = 5%)
     try std.testing.expect(pool_reward > 0);
+}
+
+test "rewards: higher pledge increases pool reward" {
+    const lower_pledge = calculatePoolReward(
+        10_000_000_000_000,
+        31_000_000_000_000_000,
+        200_000_000_000_000,
+        42_000_000_000_000,
+        100_000_000_000,
+        RewardParams.mainnet_defaults,
+        2,
+        2,
+    );
+    const higher_pledge = calculatePoolReward(
+        10_000_000_000_000,
+        31_000_000_000_000_000,
+        200_000_000_000_000,
+        42_000_000_000_000,
+        300_000_000_000,
+        RewardParams.mainnet_defaults,
+        2,
+        2,
+    );
+
+    try std.testing.expect(higher_pledge > lower_pledge);
+}
+
+test "rewards: better performance increases pool reward" {
+    const underperforming = calculatePoolReward(
+        10_000_000_000_000,
+        31_000_000_000_000_000,
+        200_000_000_000_000,
+        42_000_000_000_000,
+        300_000_000_000,
+        RewardParams.mainnet_defaults,
+        1,
+        2,
+    );
+    const at_target = calculatePoolReward(
+        10_000_000_000_000,
+        31_000_000_000_000_000,
+        200_000_000_000_000,
+        42_000_000_000_000,
+        300_000_000_000,
+        RewardParams.mainnet_defaults,
+        2,
+        2,
+    );
+
+    try std.testing.expect(at_target > underperforming);
 }
 
 test "rewards: split pool reward into leader and member shares" {
@@ -272,4 +433,5 @@ test "rewards: mainnet default parameters" {
     try std.testing.expectEqual(@as(u16, 500), p.n_opt);
     try std.testing.expectApproxEqAbs(@as(f64, 0.003), p.rho.toFloat(), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f64, 0.2), p.tau.toFloat(), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.05), p.active_slot_coeff.toFloat(), 1e-6);
 }

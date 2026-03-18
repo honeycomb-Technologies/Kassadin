@@ -200,12 +200,14 @@ At each epoch boundary:
 3. pool_rewards = total_rewards - treasury_cut
 
 4. For each pool:
-   a. apparent_performance = blocks_produced / expected_blocks
-   b. if apparent_performance ≥ 1/a0_threshold:
-      optimal_reward = pool_rewards × sigma_prime / (1 + a0)
-   c. pool_reward = optimal_reward × apparent_performance
-   d. leader_reward = pool_reward × (margin + (1-margin) × pledge_ratio)
-   e. member_rewards = pool_reward - leader_reward
+   a. expected_blocks = floor(slots_per_epoch × active_slot_coeff)
+   b. sigma = pool_stake / total_circulating_stake
+   c. sigma_a = pool_stake / total_active_stake
+   d. apparent_performance = if d < 0.8 then (blocks_produced / max(1, expected_blocks)) / sigma_a else 1
+   e. max_pool_reward = maxPool'(a0, n_opt, pool_rewards, sigma, pledge / total_circulating_stake)
+   f. pool_reward = floor(max_pool_reward × apparent_performance)
+   g. leader_reward = pool_reward × (margin + (1-margin) × pledge_ratio)
+   h. member_rewards = pool_reward - leader_reward
       distributed proportionally to delegators
 
 5. rewards_map = {reward_account → reward_amount}

@@ -8,6 +8,7 @@ const ledger_apply = @import("../ledger/apply.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
 const rewards_mod = @import("../ledger/rewards.zig");
 const rules = @import("../ledger/rules.zig");
+const header_validation = @import("../consensus/header_validation.zig");
 const ImmutableDB = @import("immutable.zig").ImmutableDB;
 const VolatileDB = @import("volatile.zig").VolatileDB;
 const LedgerDB = @import("ledger.zig").LedgerDB;
@@ -326,6 +327,15 @@ pub const ChainDB = struct {
                     ledger_diffs_applied += 1;
                 }
             }
+            if (parsed_block) |*block| {
+                if (block.era != .byron) {
+                    const pool = header_validation.poolKeyHash(block.header.issuer_vkey);
+                    if (try self.ledger.buildCurrentEpochBlocksMadeDiff(self.allocator, slot, hash, pool)) |diff| {
+                        try self.ledger.applyDiff(diff);
+                        ledger_diffs_applied += 1;
+                    }
+                }
+            }
         }
 
         try self.@"volatile".putBlock(hash, block_data, slot, block_no, prev_hash);
@@ -465,6 +475,7 @@ pub const ChainDB = struct {
                 slot,
                 block_hash,
                 config.reward_params,
+                config.epoch_length,
             )) |diff| {
                 try self.ledger.applyDiff(diff);
                 applied += 1;
@@ -472,6 +483,11 @@ pub const ChainDB = struct {
 
             // 2. Rotate stake snapshots: go ← set ← mark ← new
             self.ledger.rotateStakeSnapshots(epoch);
+
+            if (try self.ledger.buildEpochBlocksMadeShiftDiff(self.allocator, slot, block_hash)) |diff| {
+                try self.ledger.applyDiff(diff);
+                applied += 1;
+            }
 
             // 3. Roll the fee pot into the next snapshot epoch
             if (try self.ledger.buildEpochFeeRolloverDiff(self.allocator, slot, block_hash)) |diff| {
@@ -682,7 +698,7 @@ test "chaindb: ledger validation applies a real block" {
     try std.testing.expectEqual(@as(BlockNo, 1), db.getTip().block_no);
     try std.testing.expectEqual(@as(SlotNo, 42), db.getTip().slot);
     try std.testing.expectEqual(@as(usize, 1), db.current_chain.items.len);
-    try std.testing.expectEqual(@as(u32, 2), db.current_chain.items[0].ledger_diffs_applied);
+    try std.testing.expectEqual(@as(u32, 3), db.current_chain.items[0].ledger_diffs_applied);
     try std.testing.expectEqual(@as(types.Coin, 200_000), db.ledger.getFeesBalance());
 }
 
@@ -782,7 +798,7 @@ test "chaindb: epoch boundary reaps retiring pool" {
     try std.testing.expect(db.ledger.lookupPoolRetirement(pool) == null);
     try std.testing.expect(db.ledger.lookupStakePoolDelegation(delegated_cred) == null);
     try std.testing.expectEqual(@as(?types.Coin, rules.ProtocolParams.mainnet_defaults.pool_deposit), db.ledger.lookupRewardBalance(reward_account));
-    try std.testing.expectEqual(@as(u32, 1), db.current_chain.items[0].ledger_diffs_applied);
+    try std.testing.expectEqual(@as(u32, 2), db.current_chain.items[0].ledger_diffs_applied);
 }
 
 test "chaindb: epoch boundary sends unclaimed pool refunds to treasury" {

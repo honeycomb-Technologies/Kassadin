@@ -144,6 +144,7 @@ pub fn toRewardParams(genesis: *const ShelleyGenesis) rewards_mod.RewardParams {
         .rho = toUnitInterval(genesis.protocol_params.rho),
         .tau = toUnitInterval(genesis.protocol_params.tau),
         .a0 = toUnitInterval(genesis.protocol_params.a0),
+        .active_slot_coeff = toUnitInterval(genesis.active_slots_coeff),
         .n_opt = genesis.protocol_params.n_opt,
         .total_lovelace = genesis.max_lovelace_supply,
     };

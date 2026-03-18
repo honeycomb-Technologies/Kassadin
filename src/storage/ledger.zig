@@ -48,6 +48,8 @@ pub const LedgerDiff = struct {
     drep_deposit_changes: []const DRepDepositChange = &.{},
     stake_pool_delegation_changes: []const StakePoolDelegationChange = &.{},
     drep_delegation_changes: []const DRepDelegationChange = &.{},
+    previous_epoch_blocks_made_changes: []const BlocksMadeChange = &.{},
+    current_epoch_blocks_made_changes: []const BlocksMadeChange = &.{},
 };
 
 pub const RewardBalanceChange = struct {
@@ -132,6 +134,12 @@ pub const DRepDelegationChange = struct {
     next: ?DRep,
 };
 
+pub const BlocksMadeChange = struct {
+    pool: KeyHash,
+    previous: ?u64,
+    next: ?u64,
+};
+
 /// Manages the ledger state: UTxO set, stake distribution, protocol parameters.
 /// For Phase 2, this is a simplified in-memory UTxO set with diff-based rollback.
 /// Full LMDB-backed storage comes when we need mainnet-scale UTxO sets.
@@ -159,6 +167,8 @@ pub const LedgerDB = struct {
     drep_deposits: std.AutoHashMap(Credential, Coin),
     stake_pool_delegations: std.AutoHashMap(Credential, KeyHash),
     drep_delegations: std.AutoHashMap(Credential, DRep),
+    blocks_made_previous_epoch: std.AutoHashMap(KeyHash, u64),
+    blocks_made_current_epoch: std.AutoHashMap(KeyHash, u64),
 
     /// Ring buffer of recent diffs for rollback support.
     /// Keeps the last k=2160 diffs.
@@ -197,6 +207,8 @@ pub const LedgerDB = struct {
             .drep_deposits = std.AutoHashMap(Credential, Coin).init(allocator),
             .stake_pool_delegations = std.AutoHashMap(Credential, KeyHash).init(allocator),
             .drep_delegations = std.AutoHashMap(Credential, DRep).init(allocator),
+            .blocks_made_previous_epoch = std.AutoHashMap(KeyHash, u64).init(allocator),
+            .blocks_made_current_epoch = std.AutoHashMap(KeyHash, u64).init(allocator),
             .diffs = .empty,
             .tip_slot = null,
             .snapshot_path = snapshot_path,
@@ -223,6 +235,8 @@ pub const LedgerDB = struct {
         self.drep_deposits.deinit();
         self.stake_pool_delegations.deinit();
         self.drep_delegations.deinit();
+        self.blocks_made_previous_epoch.deinit();
+        self.blocks_made_current_epoch.deinit();
 
         // Diffs own their consumed/produced slices
         for (self.diffs.items) |diff| {
@@ -240,6 +254,8 @@ pub const LedgerDB = struct {
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, diff.drep_delegation_changes);
+            freeBlocksMadeChanges(self.allocator, diff.previous_epoch_blocks_made_changes);
+            freeBlocksMadeChanges(self.allocator, diff.current_epoch_blocks_made_changes);
         }
         self.diffs.deinit(self.allocator);
     }
@@ -280,6 +296,8 @@ pub const LedgerDB = struct {
         applyDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
         applyStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
         applyDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
+        applyBlocksMadeChanges(&self.blocks_made_previous_epoch, diff.previous_epoch_blocks_made_changes);
+        applyBlocksMadeChanges(&self.blocks_made_current_epoch, diff.current_epoch_blocks_made_changes);
 
         // Store diff for rollback (we take ownership of consumed/produced slices)
         try self.diffs.append(self.allocator, diff);
@@ -302,6 +320,8 @@ pub const LedgerDB = struct {
             freeDRepChanges(self.allocator, old.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, old.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, old.drep_delegation_changes);
+            freeBlocksMadeChanges(self.allocator, old.previous_epoch_blocks_made_changes);
+            freeBlocksMadeChanges(self.allocator, old.current_epoch_blocks_made_changes);
         }
 
         self.tip_slot = diff.slot;
@@ -350,6 +370,8 @@ pub const LedgerDB = struct {
             rollbackDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
             rollbackStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
             rollbackDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
+            rollbackBlocksMadeChanges(&self.blocks_made_previous_epoch, diff.previous_epoch_blocks_made_changes);
+            rollbackBlocksMadeChanges(&self.blocks_made_current_epoch, diff.current_epoch_blocks_made_changes);
             freeStakeChanges(self.allocator, diff.stake_deposit_changes);
             freePoolChanges(self.allocator, diff.pool_deposit_changes);
             freePoolConfigChanges(self.allocator, diff.pool_config_changes);
@@ -361,6 +383,8 @@ pub const LedgerDB = struct {
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, diff.drep_delegation_changes);
+            freeBlocksMadeChanges(self.allocator, diff.previous_epoch_blocks_made_changes);
+            freeBlocksMadeChanges(self.allocator, diff.current_epoch_blocks_made_changes);
         }
 
         // Update tip
@@ -477,6 +501,16 @@ pub const LedgerDB = struct {
         try self.drep_delegations.put(credential, drep);
     }
 
+    pub fn importPreviousEpochBlocksMade(self: *LedgerDB, pool: KeyHash, count: u64) !void {
+        if (count == 0) return;
+        try self.blocks_made_previous_epoch.put(pool, count);
+    }
+
+    pub fn importCurrentEpochBlocksMade(self: *LedgerDB, pool: KeyHash, count: u64) !void {
+        if (count == 0) return;
+        try self.blocks_made_current_epoch.put(pool, count);
+    }
+
     pub fn setTipSlot(self: *LedgerDB, slot: ?SlotNo) void {
         self.tip_slot = slot;
     }
@@ -578,6 +612,14 @@ pub const LedgerDB = struct {
         return self.drep_delegations.get(credential);
     }
 
+    pub fn lookupPreviousEpochBlocksMade(self: *const LedgerDB, pool: KeyHash) ?u64 {
+        return self.blocks_made_previous_epoch.get(pool);
+    }
+
+    pub fn lookupCurrentEpochBlocksMade(self: *const LedgerDB, pool: KeyHash) ?u64 {
+        return self.blocks_made_current_epoch.get(pool);
+    }
+
     pub fn setRewardBalancesTracked(self: *LedgerDB, tracked: bool) void {
         self.reward_balances_tracked = tracked;
     }
@@ -636,6 +678,80 @@ pub const LedgerDB = struct {
                 .previous = self.snapshot_fees,
                 .next = self.snapshot_fees + self.fees_balance,
             },
+        };
+    }
+
+    pub fn buildCurrentEpochBlocksMadeDiff(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+        pool: KeyHash,
+    ) !?LedgerDiff {
+        const previous = self.lookupCurrentEpochBlocksMade(pool) orelse 0;
+        const next = previous + 1;
+        const changes = try allocator.alloc(BlocksMadeChange, 1);
+        changes[0] = .{
+            .pool = pool,
+            .previous = if (previous == 0) null else previous,
+            .next = next,
+        };
+
+        return .{
+            .slot = slot,
+            .block_hash = block_hash,
+            .consumed = try allocator.alloc(UtxoEntry, 0),
+            .produced = try allocator.alloc(UtxoEntry, 0),
+            .current_epoch_blocks_made_changes = changes,
+        };
+    }
+
+    pub fn buildEpochBlocksMadeShiftDiff(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+    ) !?LedgerDiff {
+        if (self.blocks_made_previous_epoch.count() == 0 and self.blocks_made_current_epoch.count() == 0) {
+            return null;
+        }
+
+        var previous_changes: std.ArrayList(BlocksMadeChange) = .empty;
+        defer previous_changes.deinit(allocator);
+        var current_changes: std.ArrayList(BlocksMadeChange) = .empty;
+        defer current_changes.deinit(allocator);
+
+        var current_it = self.blocks_made_current_epoch.iterator();
+        while (current_it.next()) |entry| {
+            try previous_changes.append(allocator, .{
+                .pool = entry.key_ptr.*,
+                .previous = self.lookupPreviousEpochBlocksMade(entry.key_ptr.*),
+                .next = entry.value_ptr.*,
+            });
+            try current_changes.append(allocator, .{
+                .pool = entry.key_ptr.*,
+                .previous = entry.value_ptr.*,
+                .next = null,
+            });
+        }
+
+        var previous_it = self.blocks_made_previous_epoch.iterator();
+        while (previous_it.next()) |entry| {
+            if (self.blocks_made_current_epoch.contains(entry.key_ptr.*)) continue;
+            try previous_changes.append(allocator, .{
+                .pool = entry.key_ptr.*,
+                .previous = entry.value_ptr.*,
+                .next = null,
+            });
+        }
+
+        return .{
+            .slot = slot,
+            .block_hash = block_hash,
+            .consumed = try allocator.alloc(UtxoEntry, 0),
+            .produced = try allocator.alloc(UtxoEntry, 0),
+            .previous_epoch_blocks_made_changes = try previous_changes.toOwnedSlice(allocator),
+            .current_epoch_blocks_made_changes = try current_changes.toOwnedSlice(allocator),
         };
     }
 
@@ -881,6 +997,7 @@ pub const LedgerDB = struct {
         slot: SlotNo,
         block_hash: HeaderHash,
         params: rewards_mod.RewardParams,
+        slots_per_epoch: u64,
     ) !?LedgerDiff {
         const go_dist = self.stake_snapshots.go orelse return null;
         if (go_dist.total_stake == 0) return null;
@@ -895,21 +1012,27 @@ pub const LedgerDB = struct {
         var reward_changes: std.ArrayList(RewardBalanceChange) = .empty;
         defer reward_changes.deinit(allocator);
 
+        const total_stake = params.total_lovelace -| self.reserves_balance;
+        const blocks_total = rewards_mod.calculateExpectedBlocks(slots_per_epoch, params.active_slot_coeff);
+
         var total_distributed: Coin = 0;
         var pool_it = go_dist.pools.iterator();
         while (pool_it.next()) |entry| {
             const pool_stake = entry.value_ptr;
             if (pool_stake.active_stake == 0) continue;
             if (pool_stake.self_delegated_owner_stake < pool_stake.pledge) continue;
+            const blocks_made = self.lookupPreviousEpochBlocksMade(entry.key_ptr.*) orelse 0;
+            if (blocks_made == 0) continue;
 
             const pool_reward = rewards_mod.calculatePoolReward(
                 pool_stake.active_stake,
+                total_stake,
                 go_dist.total_stake,
                 epoch_rewards.pool_rewards,
-                pool_stake.cost,
-                pool_stake.margin,
-                1,
-                1,
+                pool_stake.pledge,
+                params,
+                blocks_made,
+                blocks_total,
             );
             if (pool_reward == 0) continue;
 
@@ -1009,7 +1132,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 4, .big);
+        std.mem.writeInt(u32, buf[0..4], 5, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1161,6 +1284,26 @@ pub const LedgerDB = struct {
             try file.writeAll(&entry.key_ptr.pool);
             try file.writeAll(&entry.key_ptr.owner);
         }
+
+        // Section 15: Previous-epoch blocks made
+        std.mem.writeInt(u64, &buf, @intCast(self.blocks_made_previous_epoch.count()), .big);
+        try file.writeAll(&buf);
+        var prev_blocks_it = self.blocks_made_previous_epoch.iterator();
+        while (prev_blocks_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
+
+        // Section 16: Current-epoch blocks made
+        std.mem.writeInt(u64, &buf, @intCast(self.blocks_made_current_epoch.count()), .big);
+        try file.writeAll(&buf);
+        var cur_blocks_it = self.blocks_made_current_epoch.iterator();
+        while (cur_blocks_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -1184,7 +1327,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -1413,6 +1556,32 @@ pub const LedgerDB = struct {
             }
         }
 
+        if (version >= 5) {
+            _ = try file.readAll(&buf);
+            const previous_epoch_blocks_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < previous_epoch_blocks_count) : (i += 1) {
+                var entry_buf: [28 + 8]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                var pool: KeyHash = undefined;
+                @memcpy(&pool, entry_buf[0..28]);
+                const count = std.mem.readInt(u64, entry_buf[28..36], .big);
+                try self.blocks_made_previous_epoch.put(pool, count);
+            }
+
+            _ = try file.readAll(&buf);
+            const current_epoch_blocks_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < current_epoch_blocks_count) : (i += 1) {
+                var entry_buf: [28 + 8]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                var pool: KeyHash = undefined;
+                @memcpy(&pool, entry_buf[0..28]);
+                const count = std.mem.readInt(u64, entry_buf[28..36], .big);
+                try self.blocks_made_current_epoch.put(pool, count);
+            }
+        }
+
         return true;
     }
 
@@ -1435,6 +1604,8 @@ pub const LedgerDB = struct {
         self.drep_deposits.clearRetainingCapacity();
         self.stake_pool_delegations.clearRetainingCapacity();
         self.drep_delegations.clearRetainingCapacity();
+        self.blocks_made_previous_epoch.clearRetainingCapacity();
+        self.blocks_made_current_epoch.clearRetainingCapacity();
         self.stake_snapshots.deinit();
         self.stake_snapshots = StakeSnapshots.init(self.allocator);
     }
@@ -1580,6 +1751,10 @@ fn freeStakePoolDelegationChanges(allocator: Allocator, changes: []const StakePo
 }
 
 fn freeDRepDelegationChanges(allocator: Allocator, changes: []const DRepDelegationChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freeBlocksMadeChanges(allocator: Allocator, changes: []const BlocksMadeChange) void {
     if (changes.len > 0) allocator.free(changes);
 }
 
@@ -1910,6 +2085,35 @@ fn rollbackDRepDelegationChanges(
             map.put(change.credential, drep) catch unreachable;
         } else {
             _ = map.remove(change.credential);
+        }
+    }
+}
+
+fn applyBlocksMadeChanges(
+    map: *std.AutoHashMap(KeyHash, u64),
+    changes: []const BlocksMadeChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |count| {
+            map.put(change.pool, count) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn rollbackBlocksMadeChanges(
+    map: *std.AutoHashMap(KeyHash, u64),
+    changes: []const BlocksMadeChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |count| {
+            map.put(change.pool, count) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
         }
     }
 }
@@ -2471,6 +2675,8 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try db.importFuturePoolOwnerMembership(pool, [_]u8{0xbe} ** 28);
         try db.importPoolRetirement(pool, 10);
         try db.importStakePoolDelegation(account.credential, pool);
+        try db.importPreviousEpochBlocksMade(pool, 7);
+        try db.importCurrentEpochBlocksMade(pool, 3);
 
         const drep_cred = Credential{ .cred_type = .script_hash, .hash = [_]u8{0xcc} ** 28 };
         try db.importDRepDelegation(drep_cred, .{ .always_abstain = {} });
@@ -2526,6 +2732,8 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try std.testing.expect(db2.isFuturePoolOwner(pool, [_]u8{0xbe} ** 28));
         try std.testing.expectEqual(@as(?EpochNo, 10), db2.lookupPoolRetirement(pool));
         try std.testing.expectEqual(@as(?KeyHash, pool), db2.lookupStakePoolDelegation(account.credential));
+        try std.testing.expectEqual(@as(?u64, 7), db2.lookupPreviousEpochBlocksMade(pool));
+        try std.testing.expectEqual(@as(?u64, 3), db2.lookupCurrentEpochBlocksMade(pool));
 
         const drep_cred = Credential{ .cred_type = .script_hash, .hash = [_]u8{0xcc} ** 28 };
         try std.testing.expect(db2.lookupDRepDelegation(drep_cred) != null);
@@ -2568,6 +2776,7 @@ test "ledgerdb: epoch reward diff excludes owners from member rewards" {
     db.setRewardAccountNetwork(.testnet);
     db.importReservesBalance(14_000_000_000_000_000);
     db.importSnapshotFees(50_000_000_000);
+    try db.importPreviousEpochBlocksMade(pool, 21_600);
 
     // Build a "go" snapshot with one pool
     var go = stake_mod.StakeDistribution.init(allocator, 0);
@@ -2594,6 +2803,7 @@ test "ledgerdb: epoch reward diff excludes owners from member rewards" {
         100,
         [_]u8{0x93} ** 32,
         rewards_mod.RewardParams.mainnet_defaults,
+        432_000,
     );
     try std.testing.expect(diff != null);
 
@@ -2633,6 +2843,7 @@ test "ledgerdb: epoch reward diff requires owner pledge stake" {
     try db.importPoolRewardAccount(pool, reward_account);
     db.importReservesBalance(14_000_000_000_000_000);
     db.importSnapshotFees(50_000_000_000);
+    try db.importPreviousEpochBlocksMade(pool, 21_600);
 
     var go = stake_mod.StakeDistribution.init(allocator, 0);
     try go.setPoolStake(
@@ -2657,8 +2868,56 @@ test "ledgerdb: epoch reward diff requires owner pledge stake" {
         100,
         [_]u8{0x98} ** 32,
         rewards_mod.RewardParams.mainnet_defaults,
+        432_000,
     );
     try std.testing.expect(diff == null);
+}
+
+test "ledgerdb: current epoch blocks made diff is rollback-safe" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-blocks-made-current");
+    defer db.deinit();
+
+    const pool = [_]u8{0x99} ** 28;
+    const diff = (try db.buildCurrentEpochBlocksMadeDiff(
+        allocator,
+        100,
+        [_]u8{0x9a} ** 32,
+        pool,
+    )).?;
+    try db.applyDiff(diff);
+
+    try std.testing.expectEqual(@as(?u64, 1), db.lookupCurrentEpochBlocksMade(pool));
+    try std.testing.expectEqual(@as(?u64, null), db.lookupPreviousEpochBlocksMade(pool));
+
+    try db.rollback(1);
+    try std.testing.expectEqual(@as(?u64, null), db.lookupCurrentEpochBlocksMade(pool));
+}
+
+test "ledgerdb: epoch blocks made shift mirrors Haskell bcur to bprev rotation" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-blocks-made-shift");
+    defer db.deinit();
+
+    const prev_only_pool = [_]u8{0x9b} ** 28;
+    const current_pool = [_]u8{0x9c} ** 28;
+    try db.importPreviousEpochBlocksMade(prev_only_pool, 5);
+    try db.importCurrentEpochBlocksMade(current_pool, 3);
+
+    const diff = (try db.buildEpochBlocksMadeShiftDiff(
+        allocator,
+        200,
+        [_]u8{0x9d} ** 32,
+    )).?;
+    try db.applyDiff(diff);
+
+    try std.testing.expectEqual(@as(?u64, null), db.lookupPreviousEpochBlocksMade(prev_only_pool));
+    try std.testing.expectEqual(@as(?u64, 3), db.lookupPreviousEpochBlocksMade(current_pool));
+    try std.testing.expectEqual(@as(?u64, null), db.lookupCurrentEpochBlocksMade(current_pool));
+
+    try db.rollback(1);
+    try std.testing.expectEqual(@as(?u64, 5), db.lookupPreviousEpochBlocksMade(prev_only_pool));
+    try std.testing.expectEqual(@as(?u64, 3), db.lookupCurrentEpochBlocksMade(current_pool));
 }
 
 test "ledgerdb: epoch fee rollover moves accumulated fees into snapshot pot" {
