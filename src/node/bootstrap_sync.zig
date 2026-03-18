@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const types = @import("../types.zig");
 const block_mod = @import("../ledger/block.zig");
 const tx_mod = @import("../ledger/transaction.zig");
 const chainsync = @import("../network/chainsync.zig");
@@ -27,6 +28,11 @@ pub const BootstrapSyncResult = struct {
     txs_parsed: u64,
     validation_enabled: bool,
     base_utxos_primed: u64,
+    snapshot_reward_accounts_primed: u64,
+    snapshot_stake_deposits_primed: u64,
+    snapshot_stake_mark_pools_primed: u64,
+    snapshot_stake_set_pools_primed: u64,
+    snapshot_stake_go_pools_primed: u64,
     local_ledger_snapshot_slot: u64,
     immutable_blocks_replayed: u64,
     invalid_blocks: u64,
@@ -96,6 +102,7 @@ pub fn bootstrapSync(
 
     var chain_db = try ChainDB.open(allocator, db_path, 2160);
     defer chain_db.close();
+    chain_db.ledger.setRewardAccountNetwork(networkFromMagic(network_magic));
 
     if (shelley_genesis_path) |path| {
         if (genesis_mod.loadLedgerProtocolParams(allocator, path) catch null) |protocol_params| {
@@ -126,7 +133,12 @@ pub fn bootstrapSync(
             }
 
             std.debug.print("Loading local ledger snapshot at slot {}...\n", .{snapshot.slot});
-            const load_result = ledger_snapshot.loadSnapshotIntoLedger(allocator, &chain_db.ledger, snapshot) catch |err| switch (err) {
+            const load_result = ledger_snapshot.loadSnapshotIntoLedger(
+                allocator,
+                &chain_db.ledger,
+                snapshot,
+                networkFromMagic(network_magic),
+            ) catch |err| switch (err) {
                 error.Interrupted => {
                     result.stopped_by_signal = true;
                     return result;
@@ -134,6 +146,11 @@ pub fn bootstrapSync(
                 else => return err,
             };
             result.base_utxos_primed = load_result.utxos_loaded;
+            result.snapshot_reward_accounts_primed = load_result.reward_accounts_loaded;
+            result.snapshot_stake_deposits_primed = load_result.stake_deposits_loaded;
+            result.snapshot_stake_mark_pools_primed = load_result.stake_snapshot_mark_pools_loaded;
+            result.snapshot_stake_set_pools_primed = load_result.stake_snapshot_set_pools_loaded;
+            result.snapshot_stake_go_pools_primed = load_result.stake_snapshot_go_pools_loaded;
             result.local_ledger_snapshot_slot = load_result.slot;
 
             std.debug.print("Replaying immutable tail from slot {} to snapshot tip...\n", .{load_result.slot});
@@ -143,6 +160,7 @@ pub fn bootstrapSync(
                 layout.immutable_path,
                 load_result.slot,
                 chain_db.getProtocolParams(),
+                if (chain_db.shelley_governance_config) |config| config.epoch_length else null,
             ) catch |err| switch (err) {
                 error.Interrupted => {
                     result.stopped_by_signal = true;
@@ -154,8 +172,16 @@ pub fn bootstrapSync(
             local_validation_ready = true;
             result.validation_enabled = true;
             std.debug.print(
-                "Local ledger validation ready: {} UTxOs loaded, {} immutable blocks replayed.\n",
-                .{ result.base_utxos_primed, result.immutable_blocks_replayed },
+                "Local ledger validation ready: {} UTxOs loaded, {} reward accounts, {} stake deposits, stake snapshots mark/set/go = {}/{}/{}, {} immutable blocks replayed.\n",
+                .{
+                    result.base_utxos_primed,
+                    result.snapshot_reward_accounts_primed,
+                    result.snapshot_stake_deposits_primed,
+                    result.snapshot_stake_mark_pools_primed,
+                    result.snapshot_stake_set_pools_primed,
+                    result.snapshot_stake_go_pools_primed,
+                    result.immutable_blocks_replayed,
+                },
             );
         }
     }
@@ -189,58 +215,98 @@ pub fn bootstrapSync(
         .hash = block_hash,
     };
 
-    // Step 3: Connect to peer
-    std.debug.print("Connecting to {s}:{}...\n", .{ peer_host, peer_port });
-    var peer = peer_mod.Peer.connect(allocator, peer_host, peer_port, network_magic) catch |err| {
-        std.debug.print("Connection failed: {}\n", .{err});
-        return err;
-    };
-    defer peer.close();
-    std.debug.print("Connected (v{})\n", .{peer.negotiated_version.?});
-
-    // Step 4: FindIntersect at snapshot tip
-    std.debug.print("FindIntersect at slot {}...\n", .{intersect_point.slot});
-    const intersect_msg = try peer.chainSyncFindIntersect(&[_]chainsync.Point{intersect_point});
-
-    switch (intersect_msg) {
-        .intersect_found => |isf| {
-            result.network_tip_slot = isf.tip.slot;
-            result.network_tip_block = isf.tip.block_no;
-            std.debug.print("Intersect found! Network tip: slot={}, block={}\n", .{
-                result.network_tip_slot,
-                result.network_tip_block,
-            });
-
-            const gap = result.network_tip_block -| result.snapshot_tip_block;
-            std.debug.print("Gap to sync: ~{} blocks\n", .{gap});
-        },
-        .intersect_not_found => |inf| {
-            result.network_tip_slot = inf.tip.slot;
-            result.network_tip_block = inf.tip.block_no;
-            std.debug.print("Intersect NOT found — snapshot may be too old or wrong network\n", .{});
-            return error.IntersectNotFound;
-        },
-        else => return error.UnexpectedMessage,
-    }
-
-    // Step 5: Sync forward, fetching and parsing each block
-    if (max_blocks == 0) {
-        std.debug.print("Syncing forward until stopped...\n", .{});
-    } else {
-        std.debug.print("Syncing forward (max {} blocks)...\n", .{max_blocks});
-    }
     var synced: u64 = 0;
+    var reconnect_count: u32 = 0;
+    const max_reconnects: u32 = 50;
 
-    while (synced < max) {
+    reconnect: while (reconnect_count <= max_reconnects) {
         if (runtime_control.stopRequested()) {
             result.stopped_by_signal = true;
             break;
         }
 
-        const msg = peer.chainSyncRequestNext() catch |err| {
-            std.debug.print("Sync error: {}\n", .{err});
-            break;
+        // Step 3: Connect to peer
+        if (reconnect_count > 0) {
+            std.debug.print("Reconnecting ({}/{})...\n", .{ reconnect_count, max_reconnects });
+            std.Thread.sleep(2 * std.time.ns_per_s);
+        }
+        std.debug.print("Connecting to {s}:{}...\n", .{ peer_host, peer_port });
+        var peer = peer_mod.Peer.connect(allocator, peer_host, peer_port, network_magic) catch |err| {
+            std.debug.print("Connection failed: {}\n", .{err});
+            reconnect_count += 1;
+            continue :reconnect;
         };
+        std.debug.print("Connected (v{})\n", .{peer.negotiated_version.?});
+
+        // Use the chain tip as intersect if we've synced blocks, otherwise snapshot tip
+        const find_point = if (synced > 0)
+            chainsync.Point{ .slot = chain_db.getTip().slot, .hash = chain_db.getTip().hash }
+        else
+            intersect_point;
+
+        std.debug.print("FindIntersect at slot {}...\n", .{find_point.slot});
+        const intersect_msg = peer.chainSyncFindIntersect(&[_]chainsync.Point{find_point}) catch {
+            peer.close();
+            reconnect_count += 1;
+            continue :reconnect;
+        };
+
+        switch (intersect_msg) {
+            .intersect_found => |isf| {
+                result.network_tip_slot = isf.tip.slot;
+                result.network_tip_block = isf.tip.block_no;
+                std.debug.print("Intersect found! Network tip: slot={}, block={}\n", .{
+                    result.network_tip_slot,
+                    result.network_tip_block,
+                });
+
+                const gap = result.network_tip_block -| result.snapshot_tip_block;
+                std.debug.print("Gap to sync: ~{} blocks\n", .{gap});
+            },
+            .intersect_not_found => |inf| {
+                result.network_tip_slot = inf.tip.slot;
+                result.network_tip_block = inf.tip.block_no;
+                std.debug.print("Intersect NOT found — snapshot may be too old or wrong network\n", .{});
+                peer.close();
+                return error.IntersectNotFound;
+            },
+            else => {
+                peer.close();
+                return error.UnexpectedMessage;
+            },
+        }
+
+        // Step 5: Sync forward, fetching and parsing each block
+        if (max_blocks == 0) {
+            std.debug.print("Syncing forward until stopped...\n", .{});
+        } else {
+            std.debug.print("Syncing forward (max {} blocks)...\n", .{max_blocks});
+        }
+
+        var last_keepalive = std.time.timestamp();
+
+        while (synced < max) {
+            if (runtime_control.stopRequested()) {
+                result.stopped_by_signal = true;
+                peer.close();
+                break :reconnect;
+            }
+
+            // Send keep-alive every ~30 seconds to prevent relay timeout
+            // Haskell KeepAlive StServer timeout is 60s; ping at half that interval
+            const now = std.time.timestamp();
+            if (now - last_keepalive >= 30) {
+                const cookie: u16 = @truncate(synced);
+                _ = peer.keepAlivePing(cookie) catch {};
+                last_keepalive = now;
+            }
+
+            const msg = peer.chainSyncRequestNext() catch |err| {
+                std.debug.print("Sync error after {} blocks: {} — will reconnect\n", .{ synced, err });
+                peer.close();
+                reconnect_count += 1;
+                continue :reconnect;
+            };
 
         switch (msg) {
             .roll_forward => |rf| {
@@ -254,7 +320,12 @@ pub fn bootstrapSync(
                     continue;
                 };
 
-                const block_raw = try peer.blockFetchSingle(point) orelse {
+                const block_raw = peer.blockFetchSingle(point) catch |err| {
+                    std.debug.print("  Block fetch error after {} blocks: {} — will reconnect\n", .{ synced, err });
+                    peer.close();
+                    reconnect_count += 1;
+                    continue :reconnect;
+                } orelse {
                     std.debug.print("  Header {}: no block returned for slot {}\n", .{ synced, point.slot });
                     continue;
                 };
@@ -306,7 +377,8 @@ pub fn bootstrapSync(
             .await_reply => {
                 if (runtime_control.stopRequested()) {
                     result.stopped_by_signal = true;
-                    break;
+                    peer.close();
+                    break :reconnect;
                 }
                 std.debug.print("At tip! Synced {} blocks forward.\n", .{synced});
                 const cookie: u16 = @truncate(synced);
@@ -318,8 +390,15 @@ pub fn bootstrapSync(
                 _ = chain_db.rollbackToPoint(rb.point) catch 0;
                 std.debug.print("  Rollback\n", .{});
             },
-            else => break,
+            else => {
+                peer.close();
+                break :reconnect;
+            },
         }
+    }
+    // Inner loop finished normally (hit max) — exit outer loop too
+    peer.close();
+    break;
     }
 
     return result;
@@ -383,4 +462,8 @@ fn hydrateMissingSnapshotInputs(
     defer dolos_grpc_mod.freeReadUtxos(allocator, base_entries);
 
     return chain_db.primeBaseUtxos(base_entries);
+}
+
+fn networkFromMagic(network_magic: u32) types.Network {
+    return if (network_magic == protocol.NetworkMagic.mainnet) .mainnet else .testnet;
 }

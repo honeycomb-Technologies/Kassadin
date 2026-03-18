@@ -28,6 +28,7 @@ fn freeOwnedEntries(allocator: Allocator, entries: []const UtxoEntry) void {
 pub const ApplyResult = struct {
     txs_applied: u32,
     txs_failed: u32,
+    txs_skipped: u32, // parse failures (our limitation, not invalid blocks)
     total_fees: Coin,
     protocol_updates: []protocol_update.TxProtocolUpdate,
 
@@ -72,6 +73,9 @@ fn buildDiff(
     const produced = try produced_list.toOwnedSlice(allocator);
     errdefer freeOwnedEntries(allocator, produced);
 
+    var withdrawal_effect = try rules.evaluateWithdrawalEffect(allocator, tx, ledger);
+    errdefer withdrawal_effect.deinit(allocator);
+
     var cert_effect = try rules.evaluateCertificateEffect(allocator, tx, ledger, pp);
     errdefer cert_effect.deinit(allocator);
 
@@ -80,9 +84,16 @@ fn buildDiff(
         .block_hash = block.hash(),
         .consumed = consumed,
         .produced = produced,
+        .reward_balance_changes = withdrawal_effect.reward_balance_changes,
         .stake_deposit_changes = cert_effect.stake_deposit_changes,
         .pool_deposit_changes = cert_effect.pool_deposit_changes,
+        .pool_config_changes = cert_effect.pool_config_changes,
+        .future_pool_param_changes = cert_effect.future_pool_param_changes,
+        .pool_reward_account_changes = cert_effect.pool_reward_account_changes,
+        .pool_retirement_changes = cert_effect.pool_retirement_changes,
         .drep_deposit_changes = cert_effect.drep_deposit_changes,
+        .stake_pool_delegation_changes = cert_effect.stake_pool_delegation_changes,
+        .drep_delegation_changes = cert_effect.drep_delegation_changes,
     };
 }
 
@@ -95,6 +106,7 @@ fn applyShelleyLikeBlock(
     var result = ApplyResult{
         .txs_applied = 0,
         .txs_failed = 0,
+        .txs_skipped = 0,
         .total_fees = 0,
         .protocol_updates = try allocator.alloc(protocol_update.TxProtocolUpdate, 0),
     };
@@ -117,9 +129,10 @@ fn applyShelleyLikeBlock(
 
         var tx = tx_mod.parseTxBody(allocator, tx_raw) catch |err| {
             if (!builtin.is_test) {
-                std.debug.print("    Tx {}: parse failed: {}\n", .{ tx_idx, err });
+                std.debug.print("    Tx {}: parse skipped: {} (len={})\n", .{ tx_idx, err, tx_raw.len });
             }
-            result.txs_failed += 1;
+            // Parse failures are our limitation — skip the tx, don't reject the block
+            result.txs_skipped += 1;
             continue;
         };
         defer tx_mod.freeTxBody(allocator, &tx);
@@ -163,6 +176,7 @@ fn applyByronBlock(
     var result = ApplyResult{
         .txs_applied = 0,
         .txs_failed = 0,
+        .txs_skipped = 0,
         .total_fees = 0,
         .protocol_updates = try allocator.alloc(protocol_update.TxProtocolUpdate, 0),
     };

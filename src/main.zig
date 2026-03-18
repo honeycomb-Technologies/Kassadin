@@ -224,6 +224,16 @@ pub fn main() !void {
         std.debug.print("  Validation enabled: {}\n", .{result.validation_enabled});
         std.debug.print("  Snapshot tip: block={}, slot={}\n", .{ result.snapshot_tip_block, result.snapshot_tip_slot });
         std.debug.print("  Base UTxOs primed: {}\n", .{result.base_utxos_primed});
+        std.debug.print("  Snapshot reward accounts primed: {}\n", .{result.snapshot_reward_accounts_primed});
+        std.debug.print("  Snapshot stake deposits primed: {}\n", .{result.snapshot_stake_deposits_primed});
+        std.debug.print(
+            "  Snapshot stake pools (mark/set/go): {}/{}/{}\n",
+            .{
+                result.snapshot_stake_mark_pools_primed,
+                result.snapshot_stake_set_pools_primed,
+                result.snapshot_stake_go_pools_primed,
+            },
+        );
         std.debug.print("  Local ledger snapshot slot: {}\n", .{result.local_ledger_snapshot_slot});
         std.debug.print("  Immutable blocks replayed: {}\n", .{result.immutable_blocks_replayed});
         std.debug.print("  Stopped by signal: {}\n", .{result.stopped_by_signal});
@@ -383,6 +393,16 @@ pub fn main() !void {
         std.debug.print("  Transactions parsed: {}\n", .{result.txs_parsed});
         std.debug.print("  Validation enabled: {}\n", .{result.validation_enabled});
         std.debug.print("  Base UTxOs primed: {}\n", .{result.base_utxos_primed});
+        std.debug.print("  Snapshot reward accounts primed: {}\n", .{result.snapshot_reward_accounts_primed});
+        std.debug.print("  Snapshot stake deposits primed: {}\n", .{result.snapshot_stake_deposits_primed});
+        std.debug.print(
+            "  Snapshot stake pools (mark/set/go): {}/{}/{}\n",
+            .{
+                result.snapshot_stake_mark_pools_primed,
+                result.snapshot_stake_set_pools_primed,
+                result.snapshot_stake_go_pools_primed,
+            },
+        );
         std.debug.print("  Local ledger snapshot slot: {}\n", .{result.local_ledger_snapshot_slot});
         std.debug.print("  Immutable blocks replayed: {}\n", .{result.immutable_blocks_replayed});
         std.debug.print("  Invalid blocks: {}\n", .{result.invalid_blocks});

@@ -10,6 +10,7 @@ pub const Coin = types.Coin;
 pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
 pub const CredentialType = types.CredentialType;
+pub const RewardAccount = types.RewardAccount;
 
 /// Parsed certificate (Shelley through Conway).
 pub const Certificate = union(enum) {
@@ -49,7 +50,9 @@ pub const PoolParams = struct {
     vrf_keyhash: Hash32,
     pledge: Coin,
     cost: Coin,
-    // margin, reward_account, owners, relays, metadata deferred for now
+    margin: types.UnitInterval,
+    reward_account: RewardAccount,
+    // owners, relays, metadata deferred for now
 };
 
 /// Parse a credential from CBOR: [0, keyhash] or [1, scripthash]
@@ -87,6 +90,26 @@ fn parseDRep(dec: *Decoder) !DRep {
     }
 }
 
+fn parseUnitInterval(dec: *Decoder) !types.UnitInterval {
+    const raw = try dec.sliceOfNextValue();
+    var inner = Decoder.init(raw);
+
+    if (raw.len > 0 and (raw[0] & 0xe0) == 0xc0) {
+        const tag = try inner.decodeTag();
+        if (tag != 30) return error.InvalidCbor;
+    }
+
+    const len = (try inner.decodeArrayLen()) orelse return error.InvalidCbor;
+    if (len != 2) return error.InvalidCbor;
+
+    const interval = types.UnitInterval{
+        .numerator = try inner.decodeUint(),
+        .denominator = try inner.decodeUint(),
+    };
+    if (!interval.isValid()) return error.InvalidCbor;
+    return interval;
+}
+
 /// Parse a certificate from CBOR.
 pub fn parseCertificate(dec: *Decoder) !Certificate {
     _ = try dec.decodeArrayLen();
@@ -109,6 +132,11 @@ pub fn parseCertificate(dec: *Decoder) !Certificate {
             if (vrf_bytes.len != 32) return error.InvalidCbor;
             const pledge = try dec.decodeUint();
             const cost = try dec.decodeUint();
+            const margin = try parseUnitInterval(dec);
+            const reward_bytes = try dec.decodeBytes();
+            if (reward_bytes.len != 29) return error.InvalidCbor;
+            var reward_raw: [29]u8 = undefined;
+            @memcpy(&reward_raw, reward_bytes);
             // Skip remaining pool params for now
             while (!dec.isComplete()) {
                 dec.skipValue() catch break;
@@ -118,6 +146,8 @@ pub fn parseCertificate(dec: *Decoder) !Certificate {
                 .vrf_keyhash = vrf_bytes[0..32].*,
                 .pledge = pledge,
                 .cost = cost,
+                .margin = margin,
+                .reward_account = try RewardAccount.fromBytes(reward_raw),
             } };
         },
         4 => {
@@ -277,6 +307,49 @@ test "certificates: parse stake delegation" {
         .stake_delegation => |sd| {
             try std.testing.expectEqual(CredentialType.key_hash, sd.cred.cred_type);
             try std.testing.expectEqual(@as(u8, 0xdd), sd.pool[0]);
+        },
+        else => return error.InvalidCbor,
+    }
+}
+
+test "certificates: parse pool registration" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+    var enc = Encoder.init(allocator);
+    defer enc.deinit();
+
+    const reward = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0xa4} ** 28,
+        },
+    };
+    const reward_bytes = reward.toBytes();
+
+    try enc.encodeArrayLen(9);
+    try enc.encodeUint(3);
+    try enc.encodeBytes(&([_]u8{0xa1} ** 28));
+    try enc.encodeBytes(&([_]u8{0xa2} ** 32));
+    try enc.encodeUint(1_000_000);
+    try enc.encodeUint(500_000);
+    try enc.encodeArrayLen(2); // margin
+    try enc.encodeUint(1);
+    try enc.encodeUint(2);
+    try enc.encodeBytes(&reward_bytes);
+    try enc.encodeArrayLen(0); // owners
+    try enc.encodeArrayLen(0); // relays
+    try enc.encodeNull(); // metadata
+
+    var dec = Decoder.init(enc.getWritten());
+    const cert = try parseCertificate(&dec);
+
+    switch (cert) {
+        .pool_registration => |pool| {
+            try std.testing.expectEqual(@as(Coin, 1_000_000), pool.pledge);
+            try std.testing.expectEqual(@as(Coin, 500_000), pool.cost);
+            try std.testing.expectEqual(types.UnitInterval{ .numerator = 1, .denominator = 2 }, pool.margin);
+            try std.testing.expectEqual(reward, pool.reward_account);
         },
         else => return error.InvalidCbor,
     }

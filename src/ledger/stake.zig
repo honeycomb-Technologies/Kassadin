@@ -6,6 +6,14 @@ pub const KeyHash = types.KeyHash;
 pub const Coin = types.Coin;
 pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
+pub const RewardAccount = types.RewardAccount;
+pub const UnitInterval = types.UnitInterval;
+
+pub const DelegatedStake = struct {
+    credential: Credential,
+    pool_id: KeyHash,
+    active_stake: Coin,
+};
 
 /// Individual pool's stake information.
 pub const PoolStake = struct {
@@ -13,6 +21,8 @@ pub const PoolStake = struct {
     active_stake: Coin,
     pledge: Coin,
     cost: Coin,
+    margin: UnitInterval,
+    reward_account: RewardAccount,
     total_stake: Coin, // total active stake across all pools (for relative calc)
 
     /// Relative stake: pool_stake / total_active_stake
@@ -26,6 +36,7 @@ pub const PoolStake = struct {
 pub const StakeDistribution = struct {
     allocator: Allocator,
     pools: std.AutoHashMap(KeyHash, PoolStake),
+    delegators: std.AutoHashMap(Credential, DelegatedStake),
     total_stake: Coin,
     epoch: EpochNo,
 
@@ -33,6 +44,7 @@ pub const StakeDistribution = struct {
         return .{
             .allocator = allocator,
             .pools = std.AutoHashMap(KeyHash, PoolStake).init(allocator),
+            .delegators = std.AutoHashMap(Credential, DelegatedStake).init(allocator),
             .total_stake = 0,
             .epoch = epoch,
         };
@@ -40,16 +52,40 @@ pub const StakeDistribution = struct {
 
     pub fn deinit(self: *StakeDistribution) void {
         self.pools.deinit();
+        self.delegators.deinit();
     }
 
     /// Register a pool's stake.
-    pub fn setPoolStake(self: *StakeDistribution, pool_id: KeyHash, active_stake: Coin, pledge: Coin, cost: Coin) !void {
+    pub fn setPoolStake(
+        self: *StakeDistribution,
+        pool_id: KeyHash,
+        active_stake: Coin,
+        pledge: Coin,
+        cost: Coin,
+        margin: UnitInterval,
+        reward_account: RewardAccount,
+    ) !void {
         try self.pools.put(pool_id, .{
             .pool_id = pool_id,
             .active_stake = active_stake,
             .pledge = pledge,
             .cost = cost,
+            .margin = margin,
+            .reward_account = reward_account,
             .total_stake = 0, // updated in finalize
+        });
+    }
+
+    pub fn setDelegatedStake(
+        self: *StakeDistribution,
+        credential: Credential,
+        pool_id: KeyHash,
+        active_stake: Coin,
+    ) !void {
+        try self.delegators.put(credential, .{
+            .credential = credential,
+            .pool_id = pool_id,
+            .active_stake = active_stake,
         });
     }
 
@@ -74,9 +110,17 @@ pub const StakeDistribution = struct {
         return self.pools.getPtr(pool_id);
     }
 
+    pub fn getDelegatedStake(self: *const StakeDistribution, credential: Credential) ?*const DelegatedStake {
+        return self.delegators.getPtr(credential);
+    }
+
     /// Number of pools.
     pub fn poolCount(self: *const StakeDistribution) usize {
         return self.pools.count();
+    }
+
+    pub fn delegatorCount(self: *const StakeDistribution) usize {
+        return self.delegators.count();
     }
 };
 
@@ -133,6 +177,11 @@ test "stake: pool relative stake" {
         .active_stake = 1_000_000_000, // 1000 ADA
         .pledge = 500_000_000,
         .cost = 340_000_000,
+        .margin = .{ .numerator = 0, .denominator = 1 },
+        .reward_account = .{
+            .network = .testnet,
+            .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x04} ** 28 },
+        },
         .total_stake = 20_000_000_000, // 20000 ADA total
     };
     const rel = pool.relativeStake();
@@ -144,9 +193,13 @@ test "stake: distribution finalize" {
     var dist = StakeDistribution.init(allocator, 100);
     defer dist.deinit();
 
-    try dist.setPoolStake([_]u8{0x01} ** 28, 1_000_000, 500_000, 340_000);
-    try dist.setPoolStake([_]u8{0x02} ** 28, 2_000_000, 1_000_000, 340_000);
-    try dist.setPoolStake([_]u8{0x03} ** 28, 3_000_000, 1_500_000, 340_000);
+    const reward_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x04} ** 28 },
+    };
+    try dist.setPoolStake([_]u8{0x01} ** 28, 1_000_000, 500_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
+    try dist.setPoolStake([_]u8{0x02} ** 28, 2_000_000, 1_000_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
+    try dist.setPoolStake([_]u8{0x03} ** 28, 3_000_000, 1_500_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
 
     dist.finalize();
 
@@ -189,13 +242,27 @@ test "stake: 2-epoch delay" {
     // Build up through 3 epoch boundaries
     snaps.onEpochBoundary(0);
     if (snaps.mark) |*m| {
-        try m.setPoolStake([_]u8{0xaa} ** 28, 10_000_000, 5_000_000, 340_000);
+        try m.setPoolStake(
+            [_]u8{0xaa} ** 28,
+            10_000_000,
+            5_000_000,
+            340_000,
+            .{ .numerator = 0, .denominator = 1 },
+            .{ .network = .testnet, .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x0a} ** 28 } },
+        );
         m.finalize();
     }
 
     snaps.onEpochBoundary(1);
     if (snaps.mark) |*m| {
-        try m.setPoolStake([_]u8{0xbb} ** 28, 20_000_000, 10_000_000, 340_000);
+        try m.setPoolStake(
+            [_]u8{0xbb} ** 28,
+            20_000_000,
+            10_000_000,
+            340_000,
+            .{ .numerator = 0, .denominator = 1 },
+            .{ .network = .testnet, .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x0b} ** 28 } },
+        );
         m.finalize();
     }
 

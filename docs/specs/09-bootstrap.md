@@ -6,13 +6,17 @@ Fast sync via Mithril snapshot download, plus genesis sync fallback, node config
 
 Current implementation note:
 - `bootstrap --download` restores under `db/<network>/`, downloads Mithril ancillary data when local ledger state is absent, and validates that immutable chunks exist before reporting success
-- `bootstrap-sync` resolves the snapshot root from `db/<network>/`, reads the snapshot tip, loads the latest local ledger snapshot from `ledger/<slot>/tables/tvar`, replays the immutable tail to the immutable tip, anchors `ChainDB` there, and fetches/parses real forward blocks with local validation enabled
+- `bootstrap-sync` resolves the snapshot root from `db/<network>/`, reads the snapshot tip, loads the latest local ledger snapshot from `ledger/<slot>/tables/tvar`, hydrates reward balances, stake deposits, current/future pool params, pool reward accounts, pool retirements, chain-account pots, fee pots, and Haskell-shaped mark/set/go stake snapshots from `ledger/<slot>/state`, replays the immutable tail to the immutable tip, anchors `ChainDB` there, and fetches/parses real forward blocks with local validation enabled
 - `bootstrap-sync --validate-dolos` remains available as an optional comparison/fallback path via Dolos gRPC `ReadTx`
 - Bootstrap/runtime local validation now load Shelley genesis protocol params from configured/local genesis JSON when available, and the CLI can resolve those genesis files from official cardano-node config JSON
 - Byron genesis parsing now loads protocol constants and initial AVVM/non-AVVM balance distributions from official/local genesis JSON, Byron fee/size parameters can seed origin-side validation, and Kassadin now derives Byron genesis UTxOs locally from non-AVVM base58 addresses plus AVVM redeem keys, seeds empty-chain ledger state before `FindIntersectGenesis`, switches to Shelley genesis protocol params on the first post-Byron block, and parses/applies Byron regular/EBB block/header golden data; fresh-db preprod origin runs now validate the first 5 blocks locally from genesis and also validate across the Byron-to-Shelley transition, while general Byron/bootstrap address validation outside the genesis seeding path is still pending
 - The CLI can also load relay peers from official topology JSON (`Producers`, `bootstrapPeers`, `localRoots`, `publicRoots`) and use the first resolved access point for `sync` / `bootstrap-sync`
 - `sync` and `bootstrap-sync` now run until stopped by default, and both exit cleanly on `SIGINT`/`SIGTERM`
-- Shelley-era tx-body protocol-parameter updates are now parsed, staged by epoch, adopted on quorum at epoch boundaries, and kept rollback-safe in `ChainDB`; modern-era governance/Conway parameter changes, modern min-ADA/cost-model handling, and final shutdown snapshot/checkpoint persistence are still pending
+- Shelley-era tx-body protocol-parameter updates are now parsed, staged by epoch, adopted on quorum at epoch boundaries, and kept rollback-safe in `ChainDB`
+- Tx-body withdrawals now parse into reward accounts, `LedgerDB` can roll back tracked reward-balance withdrawals locally, and tracked withdrawals now follow the Haskell exact-drain rule once local reward state is loaded
+- Bootstrap/runtime snapshot state now hydrates reward balances, stake deposits, current/future pool state, chain-account pots, fee pots, and modern Haskell `SnapShots = [mark,set,go,fee]` stake snapshots before immutable-tail replay; observed 9-field pool entries are handled compatibly by deriving active stake from the outer active-stake maps, mark/set/go now retain credential-level active stake plus the snapshot-era pool reward account locally, pool re-registration now stages future params locally instead of mutating live pool state immediately, those staged params activate at epoch processing, and the current epoch reward path now uses `go`-snapshot credential stake to credit delegator reward accounts as well as pool reward accounts
+- Block fees now accumulate locally during replay/forward sync, pool retirements are reaped locally at epoch boundaries with rollback-safe deposit refunds, treasury routing for unclaimed refunds, and delegation clearing, and sync-point resume via `db/<network>/sync.resume` remains active
+- Modern-era governance/Conway parameter changes, modern min-ADA/cost-model handling, full epoch reward/state maintenance, and final ledger snapshot/checkpoint persistence on shutdown are still pending
 
 ---
 
@@ -36,8 +40,9 @@ Mithril uses Stake-based Threshold Multi-signatures (STM) to certify snapshots o
    a. ImmutableDB files → db/<network>/immutable/
    b. Ledger state snapshot(s) → db/<network>/ledger/<slot>/{meta,state,tables/tvar}
 8. Load the latest local ledger snapshot at or before the immutable tip
-9. Replay immutable tail blocks from the ledger snapshot slot to the immutable tip
-10. Start node, which continues syncing from snapshot tip
+9. Hydrate UTxOs from `tables/tvar` plus reward balances / stake deposits / current+future pool state / chain-account pots / fee pots from `state`
+10. Replay immutable tail blocks from the ledger snapshot slot to the immutable tip, including staged future-pool activation, epoch-boundary pool reaping, and local fee-pot accumulation
+11. Start node, which continues syncing from snapshot tip
 ```
 
 ### Snapshot Contents

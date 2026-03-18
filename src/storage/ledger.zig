@@ -1,13 +1,22 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
+const certificates = @import("../ledger/certificates.zig");
+const rewards_mod = @import("../ledger/rewards.zig");
+const stake_mod = @import("../ledger/stake.zig");
 
 pub const SlotNo = types.SlotNo;
 pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
 pub const HeaderHash = types.HeaderHash;
+pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
 pub const KeyHash = types.KeyHash;
+pub const RewardAccount = types.RewardAccount;
+pub const UnitInterval = types.UnitInterval;
+pub const DRep = certificates.DRep;
+pub const StakeSnapshots = stake_mod.StakeSnapshots;
+pub const StakeDistribution = stake_mod.StakeDistribution;
 
 /// A simplified UTxO entry (full TxOut support comes in Phase 3).
 pub const UtxoEntry = struct {
@@ -22,9 +31,31 @@ pub const LedgerDiff = struct {
     block_hash: HeaderHash,
     consumed: []const UtxoEntry, // UTxOs consumed (full entries for rollback)
     produced: []const UtxoEntry, // UTxOs produced (outputs)
+    treasury_balance_change: ?CoinStateChange = null,
+    reserves_balance_change: ?CoinStateChange = null,
+    fees_balance_change: ?CoinStateChange = null,
+    snapshot_fees_change: ?CoinStateChange = null,
+    reward_balance_changes: []const RewardBalanceChange = &.{},
     stake_deposit_changes: []const StakeDepositChange = &.{},
     pool_deposit_changes: []const PoolDepositChange = &.{},
+    pool_config_changes: []const PoolConfigChange = &.{},
+    future_pool_param_changes: []const FuturePoolParamsChange = &.{},
+    pool_reward_account_changes: []const PoolRewardAccountChange = &.{},
+    pool_retirement_changes: []const PoolRetirementChange = &.{},
     drep_deposit_changes: []const DRepDepositChange = &.{},
+    stake_pool_delegation_changes: []const StakePoolDelegationChange = &.{},
+    drep_delegation_changes: []const DRepDelegationChange = &.{},
+};
+
+pub const RewardBalanceChange = struct {
+    account: RewardAccount,
+    previous: ?Coin,
+    next: ?Coin,
+};
+
+pub const CoinStateChange = struct {
+    previous: Coin,
+    next: Coin,
 };
 
 pub const StakeDepositChange = struct {
@@ -39,10 +70,57 @@ pub const PoolDepositChange = struct {
     next: ?Coin,
 };
 
+pub const PoolConfig = struct {
+    pledge: Coin,
+    cost: Coin,
+    margin: UnitInterval,
+};
+
+pub const PoolConfigChange = struct {
+    pool: KeyHash,
+    previous: ?PoolConfig,
+    next: ?PoolConfig,
+};
+
+pub const FuturePoolParams = struct {
+    config: PoolConfig,
+    reward_account: RewardAccount,
+};
+
+pub const FuturePoolParamsChange = struct {
+    pool: KeyHash,
+    previous: ?FuturePoolParams,
+    next: ?FuturePoolParams,
+};
+
+pub const PoolRewardAccountChange = struct {
+    pool: KeyHash,
+    previous: ?RewardAccount,
+    next: ?RewardAccount,
+};
+
+pub const PoolRetirementChange = struct {
+    pool: KeyHash,
+    previous: ?EpochNo,
+    next: ?EpochNo,
+};
+
 pub const DRepDepositChange = struct {
     credential: Credential,
     previous: ?Coin,
     next: ?Coin,
+};
+
+pub const StakePoolDelegationChange = struct {
+    credential: Credential,
+    previous: ?KeyHash,
+    next: ?KeyHash,
+};
+
+pub const DRepDelegationChange = struct {
+    credential: Credential,
+    previous: ?DRep,
+    next: ?DRep,
 };
 
 /// Manages the ledger state: UTxO set, stake distribution, protocol parameters.
@@ -53,9 +131,23 @@ pub const LedgerDB = struct {
 
     /// Current UTxO set (in-memory for now — LMDB for production).
     utxo_set: std.AutoHashMap(TxIn, UtxoEntry),
+    reward_balances: std.AutoHashMap(RewardAccount, Coin),
+    reward_balances_tracked: bool,
+    reward_account_network: types.Network,
+    treasury_balance: Coin,
+    reserves_balance: Coin,
+    fees_balance: Coin,
+    snapshot_fees: Coin,
+    stake_snapshots: StakeSnapshots,
     stake_deposits: std.AutoHashMap(Credential, Coin),
     pool_deposits: std.AutoHashMap(KeyHash, Coin),
+    pool_configs: std.AutoHashMap(KeyHash, PoolConfig),
+    future_pool_params: std.AutoHashMap(KeyHash, FuturePoolParams),
+    pool_reward_accounts: std.AutoHashMap(KeyHash, RewardAccount),
+    pool_retirements: std.AutoHashMap(KeyHash, EpochNo),
     drep_deposits: std.AutoHashMap(Credential, Coin),
+    stake_pool_delegations: std.AutoHashMap(Credential, KeyHash),
+    drep_delegations: std.AutoHashMap(Credential, DRep),
 
     /// Ring buffer of recent diffs for rollback support.
     /// Keeps the last k=2160 diffs.
@@ -75,9 +167,23 @@ pub const LedgerDB = struct {
         return .{
             .allocator = allocator,
             .utxo_set = std.AutoHashMap(TxIn, UtxoEntry).init(allocator),
+            .reward_balances = std.AutoHashMap(RewardAccount, Coin).init(allocator),
+            .reward_balances_tracked = false,
+            .reward_account_network = .testnet,
+            .treasury_balance = 0,
+            .reserves_balance = 0,
+            .fees_balance = 0,
+            .snapshot_fees = 0,
+            .stake_snapshots = StakeSnapshots.init(allocator),
             .stake_deposits = std.AutoHashMap(Credential, Coin).init(allocator),
             .pool_deposits = std.AutoHashMap(KeyHash, Coin).init(allocator),
+            .pool_configs = std.AutoHashMap(KeyHash, PoolConfig).init(allocator),
+            .future_pool_params = std.AutoHashMap(KeyHash, FuturePoolParams).init(allocator),
+            .pool_reward_accounts = std.AutoHashMap(KeyHash, RewardAccount).init(allocator),
+            .pool_retirements = std.AutoHashMap(KeyHash, EpochNo).init(allocator),
             .drep_deposits = std.AutoHashMap(Credential, Coin).init(allocator),
+            .stake_pool_delegations = std.AutoHashMap(Credential, KeyHash).init(allocator),
+            .drep_delegations = std.AutoHashMap(Credential, DRep).init(allocator),
             .diffs = .empty,
             .tip_slot = null,
             .snapshot_path = snapshot_path,
@@ -91,17 +197,32 @@ pub const LedgerDB = struct {
             self.allocator.free(entry.raw_cbor);
         }
         self.utxo_set.deinit();
+        self.reward_balances.deinit();
+        self.stake_snapshots.deinit();
         self.stake_deposits.deinit();
         self.pool_deposits.deinit();
+        self.pool_configs.deinit();
+        self.future_pool_params.deinit();
+        self.pool_reward_accounts.deinit();
+        self.pool_retirements.deinit();
         self.drep_deposits.deinit();
+        self.stake_pool_delegations.deinit();
+        self.drep_delegations.deinit();
 
         // Diffs own their consumed/produced slices
         for (self.diffs.items) |diff| {
             freeEntries(self.allocator, diff.consumed);
             freeEntries(self.allocator, diff.produced);
+            freeRewardChanges(self.allocator, diff.reward_balance_changes);
             freeStakeChanges(self.allocator, diff.stake_deposit_changes);
             freePoolChanges(self.allocator, diff.pool_deposit_changes);
+            freePoolConfigChanges(self.allocator, diff.pool_config_changes);
+            freeFuturePoolParamChanges(self.allocator, diff.future_pool_param_changes);
+            freePoolRewardAccountChanges(self.allocator, diff.pool_reward_account_changes);
+            freePoolRetirementChanges(self.allocator, diff.pool_retirement_changes);
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
+            freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
+            freeDRepDelegationChanges(self.allocator, diff.drep_delegation_changes);
         }
         self.diffs.deinit(self.allocator);
     }
@@ -126,9 +247,20 @@ pub const LedgerDB = struct {
             });
         }
 
+        applyCoinStateChange(&self.treasury_balance, diff.treasury_balance_change);
+        applyCoinStateChange(&self.reserves_balance, diff.reserves_balance_change);
+        applyCoinStateChange(&self.fees_balance, diff.fees_balance_change);
+        applyCoinStateChange(&self.snapshot_fees, diff.snapshot_fees_change);
+        applyRewardBalanceChanges(&self.reward_balances, diff.reward_balance_changes);
         applyStakeDepositChanges(&self.stake_deposits, diff.stake_deposit_changes);
         applyPoolDepositChanges(&self.pool_deposits, diff.pool_deposit_changes);
+        applyPoolConfigChanges(&self.pool_configs, diff.pool_config_changes);
+        applyFuturePoolParamChanges(&self.future_pool_params, diff.future_pool_param_changes);
+        applyPoolRewardAccountChanges(&self.pool_reward_accounts, diff.pool_reward_account_changes);
+        applyPoolRetirementChanges(&self.pool_retirements, diff.pool_retirement_changes);
         applyDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
+        applyStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
+        applyDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
 
         // Store diff for rollback (we take ownership of consumed/produced slices)
         try self.diffs.append(self.allocator, diff);
@@ -139,9 +271,16 @@ pub const LedgerDB = struct {
             const old = self.diffs.orderedRemove(0);
             freeEntries(self.allocator, old.consumed);
             freeEntries(self.allocator, old.produced);
+            freeRewardChanges(self.allocator, old.reward_balance_changes);
             freeStakeChanges(self.allocator, old.stake_deposit_changes);
             freePoolChanges(self.allocator, old.pool_deposit_changes);
+            freePoolConfigChanges(self.allocator, old.pool_config_changes);
+            freeFuturePoolParamChanges(self.allocator, old.future_pool_param_changes);
+            freePoolRewardAccountChanges(self.allocator, old.pool_reward_account_changes);
+            freePoolRetirementChanges(self.allocator, old.pool_retirement_changes);
             freeDRepChanges(self.allocator, old.drep_deposit_changes);
+            freeStakePoolDelegationChanges(self.allocator, old.stake_pool_delegation_changes);
+            freeDRepDelegationChanges(self.allocator, old.drep_delegation_changes);
         }
 
         self.tip_slot = diff.slot;
@@ -173,12 +312,30 @@ pub const LedgerDB = struct {
             // Free diff-owned slices
             freeEntries(self.allocator, diff.consumed);
             freeEntries(self.allocator, diff.produced);
+            rollbackCoinStateChange(&self.treasury_balance, diff.treasury_balance_change);
+            rollbackCoinStateChange(&self.reserves_balance, diff.reserves_balance_change);
+            rollbackCoinStateChange(&self.fees_balance, diff.fees_balance_change);
+            rollbackCoinStateChange(&self.snapshot_fees, diff.snapshot_fees_change);
+            rollbackRewardBalanceChanges(&self.reward_balances, diff.reward_balance_changes);
+            freeRewardChanges(self.allocator, diff.reward_balance_changes);
             rollbackStakeDepositChanges(&self.stake_deposits, diff.stake_deposit_changes);
             rollbackPoolDepositChanges(&self.pool_deposits, diff.pool_deposit_changes);
+            rollbackPoolConfigChanges(&self.pool_configs, diff.pool_config_changes);
+            rollbackFuturePoolParamChanges(&self.future_pool_params, diff.future_pool_param_changes);
+            rollbackPoolRewardAccountChanges(&self.pool_reward_accounts, diff.pool_reward_account_changes);
+            rollbackPoolRetirementChanges(&self.pool_retirements, diff.pool_retirement_changes);
             rollbackDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
+            rollbackStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
+            rollbackDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
             freeStakeChanges(self.allocator, diff.stake_deposit_changes);
             freePoolChanges(self.allocator, diff.pool_deposit_changes);
+            freePoolConfigChanges(self.allocator, diff.pool_config_changes);
+            freeFuturePoolParamChanges(self.allocator, diff.future_pool_param_changes);
+            freePoolRewardAccountChanges(self.allocator, diff.pool_reward_account_changes);
+            freePoolRetirementChanges(self.allocator, diff.pool_retirement_changes);
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
+            freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
+            freeDRepDelegationChanges(self.allocator, diff.drep_delegation_changes);
         }
 
         // Update tip
@@ -221,6 +378,66 @@ pub const LedgerDB = struct {
         });
     }
 
+    pub fn importStakeDeposit(self: *LedgerDB, credential: Credential, deposit: Coin) !void {
+        if (deposit == 0) return;
+        try self.stake_deposits.put(credential, deposit);
+    }
+
+    pub fn importPoolDeposit(self: *LedgerDB, pool: KeyHash, deposit: Coin) !void {
+        if (deposit == 0) return;
+        try self.pool_deposits.put(pool, deposit);
+    }
+
+    pub fn importRewardBalance(self: *LedgerDB, account: RewardAccount, amount: Coin) !void {
+        if (amount == 0) return;
+        try self.reward_balances.put(account, amount);
+    }
+
+    pub fn importTreasuryBalance(self: *LedgerDB, amount: Coin) void {
+        self.treasury_balance = amount;
+    }
+
+    pub fn importReservesBalance(self: *LedgerDB, amount: Coin) void {
+        self.reserves_balance = amount;
+    }
+
+    pub fn importFeesBalance(self: *LedgerDB, amount: Coin) void {
+        self.fees_balance = amount;
+    }
+
+    pub fn importSnapshotFees(self: *LedgerDB, amount: Coin) void {
+        self.snapshot_fees = amount;
+    }
+
+    pub fn replaceStakeSnapshots(self: *LedgerDB, snapshots: StakeSnapshots) void {
+        self.stake_snapshots.deinit();
+        self.stake_snapshots = snapshots;
+    }
+
+    pub fn importPoolRewardAccount(self: *LedgerDB, pool: KeyHash, account: RewardAccount) !void {
+        try self.pool_reward_accounts.put(pool, account);
+    }
+
+    pub fn importPoolConfig(self: *LedgerDB, pool: KeyHash, config: PoolConfig) !void {
+        try self.pool_configs.put(pool, config);
+    }
+
+    pub fn importFuturePoolParams(self: *LedgerDB, pool: KeyHash, params: FuturePoolParams) !void {
+        try self.future_pool_params.put(pool, params);
+    }
+
+    pub fn importPoolRetirement(self: *LedgerDB, pool: KeyHash, epoch: EpochNo) !void {
+        try self.pool_retirements.put(pool, epoch);
+    }
+
+    pub fn importStakePoolDelegation(self: *LedgerDB, credential: Credential, pool: KeyHash) !void {
+        try self.stake_pool_delegations.put(credential, pool);
+    }
+
+    pub fn importDRepDelegation(self: *LedgerDB, credential: Credential, drep: DRep) !void {
+        try self.drep_delegations.put(credential, drep);
+    }
+
     pub fn setTipSlot(self: *LedgerDB, slot: ?SlotNo) void {
         self.tip_slot = slot;
     }
@@ -234,12 +451,788 @@ pub const LedgerDB = struct {
         return self.stake_deposits.get(credential);
     }
 
+    pub fn lookupRewardBalance(self: *const LedgerDB, account: RewardAccount) ?Coin {
+        return self.reward_balances.get(account);
+    }
+
+    pub fn getTreasuryBalance(self: *const LedgerDB) Coin {
+        return self.treasury_balance;
+    }
+
+    pub fn getReservesBalance(self: *const LedgerDB) Coin {
+        return self.reserves_balance;
+    }
+
+    pub fn getFeesBalance(self: *const LedgerDB) Coin {
+        return self.fees_balance;
+    }
+
+    pub fn getSnapshotFees(self: *const LedgerDB) Coin {
+        return self.snapshot_fees;
+    }
+
+    pub fn getStakeSnapshots(self: *const LedgerDB) *const StakeSnapshots {
+        return &self.stake_snapshots;
+    }
+
     pub fn lookupPoolDeposit(self: *const LedgerDB, pool: KeyHash) ?Coin {
         return self.pool_deposits.get(pool);
     }
 
+    pub fn lookupPoolConfig(self: *const LedgerDB, pool: KeyHash) ?PoolConfig {
+        return self.pool_configs.get(pool);
+    }
+
+    pub fn lookupFuturePoolParams(self: *const LedgerDB, pool: KeyHash) ?FuturePoolParams {
+        return self.future_pool_params.get(pool);
+    }
+
+    pub fn lookupPoolRewardAccount(self: *const LedgerDB, pool: KeyHash) ?RewardAccount {
+        return self.pool_reward_accounts.get(pool);
+    }
+
+    pub fn lookupPoolRetirement(self: *const LedgerDB, pool: KeyHash) ?EpochNo {
+        return self.pool_retirements.get(pool);
+    }
+
     pub fn lookupDRepDeposit(self: *const LedgerDB, credential: Credential) ?Coin {
         return self.drep_deposits.get(credential);
+    }
+
+    pub fn lookupStakePoolDelegation(self: *const LedgerDB, credential: Credential) ?KeyHash {
+        return self.stake_pool_delegations.get(credential);
+    }
+
+    pub fn lookupDRepDelegation(self: *const LedgerDB, credential: Credential) ?DRep {
+        return self.drep_delegations.get(credential);
+    }
+
+    pub fn setRewardBalancesTracked(self: *LedgerDB, tracked: bool) void {
+        self.reward_balances_tracked = tracked;
+    }
+
+    pub fn areRewardBalancesTracked(self: *const LedgerDB) bool {
+        return self.reward_balances_tracked;
+    }
+
+    pub fn setRewardAccountNetwork(self: *LedgerDB, network: types.Network) void {
+        self.reward_account_network = network;
+    }
+
+    pub fn setRewardBalance(self: *LedgerDB, account: RewardAccount, amount: Coin) !void {
+        try self.reward_balances.put(account, amount);
+    }
+
+    pub fn buildFeePotDiff(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+        added_fees: Coin,
+    ) !?LedgerDiff {
+        if (added_fees == 0) return null;
+
+        return .{
+            .slot = slot,
+            .block_hash = block_hash,
+            .consumed = try allocator.alloc(UtxoEntry, 0),
+            .produced = try allocator.alloc(UtxoEntry, 0),
+            .fees_balance_change = .{
+                .previous = self.fees_balance,
+                .next = self.fees_balance + added_fees,
+            },
+        };
+    }
+
+    pub fn buildEpochFeeRolloverDiff(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+    ) !?LedgerDiff {
+        if (self.fees_balance == 0) return null;
+
+        return .{
+            .slot = slot,
+            .block_hash = block_hash,
+            .consumed = try allocator.alloc(UtxoEntry, 0),
+            .produced = try allocator.alloc(UtxoEntry, 0),
+            .fees_balance_change = .{
+                .previous = self.fees_balance,
+                .next = 0,
+            },
+            .snapshot_fees_change = .{
+                .previous = self.snapshot_fees,
+                .next = self.snapshot_fees + self.fees_balance,
+            },
+        };
+    }
+
+    pub fn buildPoolReapDiff(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+        epoch: EpochNo,
+    ) !?LedgerDiff {
+        var retired_pools: std.ArrayList(KeyHash) = .empty;
+        defer retired_pools.deinit(allocator);
+
+        var retirements = self.pool_retirements.iterator();
+        while (retirements.next()) |entry| {
+            if (entry.value_ptr.* == epoch) {
+                try retired_pools.append(allocator, entry.key_ptr.*);
+            }
+        }
+
+        var reward_changes: std.ArrayList(RewardBalanceChange) = .empty;
+        defer reward_changes.deinit(allocator);
+        var pool_changes: std.ArrayList(PoolDepositChange) = .empty;
+        defer pool_changes.deinit(allocator);
+        var pool_config_changes: std.ArrayList(PoolConfigChange) = .empty;
+        defer pool_config_changes.deinit(allocator);
+        var future_pool_param_changes: std.ArrayList(FuturePoolParamsChange) = .empty;
+        defer future_pool_param_changes.deinit(allocator);
+        var pool_reward_account_changes: std.ArrayList(PoolRewardAccountChange) = .empty;
+        defer pool_reward_account_changes.deinit(allocator);
+        var pool_retirement_changes: std.ArrayList(PoolRetirementChange) = .empty;
+        defer pool_retirement_changes.deinit(allocator);
+        var stake_pool_delegation_changes: std.ArrayList(StakePoolDelegationChange) = .empty;
+        defer stake_pool_delegation_changes.deinit(allocator);
+        var treasury_delta: Coin = 0;
+
+        var future_params = self.future_pool_params.iterator();
+        while (future_params.next()) |entry| {
+            try pool_config_changes.append(allocator, .{
+                .pool = entry.key_ptr.*,
+                .previous = self.lookupPoolConfig(entry.key_ptr.*),
+                .next = entry.value_ptr.config,
+            });
+            try pool_reward_account_changes.append(allocator, .{
+                .pool = entry.key_ptr.*,
+                .previous = self.lookupPoolRewardAccount(entry.key_ptr.*),
+                .next = entry.value_ptr.reward_account,
+            });
+            try future_pool_param_changes.append(allocator, .{
+                .pool = entry.key_ptr.*,
+                .previous = entry.value_ptr.*,
+                .next = null,
+            });
+        }
+
+        if (retired_pools.items.len == 0 and future_pool_param_changes.items.len == 0) return null;
+
+        for (retired_pools.items) |pool| {
+            if (self.lookupPoolDeposit(pool)) |deposit| {
+                try pool_changes.append(allocator, .{
+                    .pool = pool,
+                    .previous = deposit,
+                    .next = null,
+                });
+
+                if (self.lookupPoolRewardAccount(pool)) |reward_account| {
+                    if (self.lookupRewardBalance(reward_account) != null or self.lookupStakeDeposit(reward_account.credential) != null) {
+                        try appendPoolReapRewardChange(
+                            allocator,
+                            &reward_changes,
+                            self,
+                            reward_account,
+                            deposit,
+                        );
+                    } else {
+                        treasury_delta += deposit;
+                    }
+
+                    try pool_reward_account_changes.append(allocator, .{
+                        .pool = pool,
+                        .previous = reward_account,
+                        .next = null,
+                    });
+                }
+            }
+
+            if (self.lookupPoolConfig(pool)) |config| {
+                try pool_config_changes.append(allocator, .{
+                    .pool = pool,
+                    .previous = config,
+                    .next = null,
+                });
+            }
+
+            try pool_retirement_changes.append(allocator, .{
+                .pool = pool,
+                .previous = epoch,
+                .next = null,
+            });
+
+            var delegations = self.stake_pool_delegations.iterator();
+            while (delegations.next()) |entry| {
+                if (std.mem.eql(u8, &entry.value_ptr.*, &pool)) {
+                    try stake_pool_delegation_changes.append(allocator, .{
+                        .credential = entry.key_ptr.*,
+                        .previous = pool,
+                        .next = null,
+                    });
+                }
+            }
+        }
+
+        return .{
+            .slot = slot,
+            .block_hash = block_hash,
+            .consumed = try allocator.alloc(UtxoEntry, 0),
+            .produced = try allocator.alloc(UtxoEntry, 0),
+            .treasury_balance_change = if (treasury_delta > 0) .{
+                .previous = self.treasury_balance,
+                .next = self.treasury_balance + treasury_delta,
+            } else null,
+            .reward_balance_changes = try reward_changes.toOwnedSlice(allocator),
+            .pool_deposit_changes = try pool_changes.toOwnedSlice(allocator),
+            .pool_config_changes = try pool_config_changes.toOwnedSlice(allocator),
+            .future_pool_param_changes = try future_pool_param_changes.toOwnedSlice(allocator),
+            .pool_reward_account_changes = try pool_reward_account_changes.toOwnedSlice(allocator),
+            .pool_retirement_changes = try pool_retirement_changes.toOwnedSlice(allocator),
+            .stake_pool_delegation_changes = try stake_pool_delegation_changes.toOwnedSlice(allocator),
+        };
+    }
+
+    /// Rotate stake snapshots at an epoch boundary and build the new mark
+    /// distribution from currently tracked delegations and reward balances.
+    pub fn rotateStakeSnapshots(self: *LedgerDB, new_epoch: EpochNo) void {
+        self.stake_snapshots.onEpochBoundary(new_epoch);
+
+        // Populate the new mark snapshot from current delegations.
+        if (self.stake_snapshots.mark) |*mark| {
+            var it = self.stake_pool_delegations.iterator();
+            while (it.next()) |entry| {
+                const cred = entry.key_ptr.*;
+                const pool = entry.value_ptr.*;
+                const acct = RewardAccount{ .network = self.reward_account_network, .credential = cred };
+                const balance = self.reward_balances.get(acct) orelse 0;
+                const deposit = self.stake_deposits.get(cred) orelse 0;
+                const delegated = balance + deposit;
+                if (delegated == 0) continue;
+
+                mark.setDelegatedStake(cred, pool, delegated) catch {};
+                if (mark.pools.getPtr(pool)) |existing| {
+                    existing.active_stake += delegated;
+                } else {
+                    const current_config = self.lookupPoolConfig(pool);
+                    const current_reward_account = self.lookupPoolRewardAccount(pool);
+                    const pool_template = self.lookupSnapshotPoolStake(pool);
+                    const pledge = if (current_config) |config| config.pledge else if (pool_template) |template| template.pledge else 0;
+                    const cost = if (current_config) |config| config.cost else if (pool_template) |template| template.cost else 0;
+                    const margin = if (current_config) |config| config.margin else if (pool_template) |template| template.margin else types.UnitInterval{ .numerator = 0, .denominator = 1 };
+                    const reward_account = if (current_reward_account) |account| account else if (pool_template) |template| template.reward_account else continue;
+                    mark.setPoolStake(pool, delegated, pledge, cost, margin, reward_account) catch {};
+                }
+            }
+            mark.finalize();
+        }
+    }
+
+    /// Build a reward distribution diff for an epoch boundary.
+    /// Uses the "go" snapshot (2 epochs prior) to distribute rewards.
+    pub fn buildEpochRewardDiff(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+        params: rewards_mod.RewardParams,
+    ) !?LedgerDiff {
+        const go_dist = self.stake_snapshots.go orelse return null;
+        if (go_dist.total_stake == 0) return null;
+
+        const epoch_rewards = rewards_mod.calculateEpochRewards(
+            self.reserves_balance,
+            self.snapshot_fees,
+            params,
+        );
+        if (epoch_rewards.pool_rewards == 0) return null;
+
+        var reward_changes: std.ArrayList(RewardBalanceChange) = .empty;
+        defer reward_changes.deinit(allocator);
+
+        var total_distributed: Coin = 0;
+        var pool_it = go_dist.pools.iterator();
+        while (pool_it.next()) |entry| {
+            const pool_stake = entry.value_ptr;
+            if (pool_stake.active_stake == 0) continue;
+
+            const pool_reward = rewards_mod.calculatePoolReward(
+                pool_stake.active_stake,
+                go_dist.total_stake,
+                epoch_rewards.pool_rewards,
+                pool_stake.cost,
+                pool_stake.margin,
+                1,
+                1,
+            );
+            if (pool_reward == 0) continue;
+
+            const split = rewards_mod.splitPoolReward(
+                pool_reward,
+                pool_stake.cost,
+                pool_stake.margin,
+            );
+
+            if (split.leader_reward > 0) {
+                try appendPoolReapRewardChange(
+                    allocator,
+                    &reward_changes,
+                    self,
+                    pool_stake.reward_account,
+                    split.leader_reward,
+                );
+                total_distributed += split.leader_reward;
+            }
+
+            if (split.member_rewards > 0) {
+                var member_distributed: Coin = 0;
+                var deleg_it = go_dist.delegators.iterator();
+                while (deleg_it.next()) |deleg_entry| {
+                    const delegated = deleg_entry.value_ptr.*;
+                    if (!std.mem.eql(u8, &delegated.pool_id, entry.key_ptr)) continue;
+                    if (delegated.active_stake == 0) continue;
+
+                    const reward = @as(Coin, @intCast(
+                        (@as(u128, split.member_rewards) * delegated.active_stake) / pool_stake.active_stake,
+                    ));
+                    if (reward == 0) continue;
+
+                    try appendPoolReapRewardChange(
+                        allocator,
+                        &reward_changes,
+                        self,
+                        .{ .network = self.reward_account_network, .credential = delegated.credential },
+                        reward,
+                    );
+                    member_distributed += reward;
+                }
+                total_distributed += member_distributed;
+            }
+        }
+
+        if (total_distributed == 0) return null;
+
+        return .{
+            .slot = slot,
+            .block_hash = block_hash,
+            .consumed = try allocator.alloc(UtxoEntry, 0),
+            .produced = try allocator.alloc(UtxoEntry, 0),
+            .treasury_balance_change = .{
+                .previous = self.treasury_balance,
+                .next = self.treasury_balance + epoch_rewards.treasury_cut,
+            },
+            .reserves_balance_change = .{
+                .previous = self.reserves_balance,
+                .next = self.reserves_balance -| (total_distributed + epoch_rewards.treasury_cut),
+            },
+            .snapshot_fees_change = .{
+                .previous = self.snapshot_fees,
+                .next = 0,
+            },
+            .reward_balance_changes = try reward_changes.toOwnedSlice(allocator),
+        };
+    }
+
+    fn lookupSnapshotPoolStake(self: *const LedgerDB, pool: KeyHash) ?stake_mod.PoolStake {
+        if (self.stake_snapshots.mark) |*mark| {
+            if (mark.getPool(pool)) |entry| return entry.*;
+        }
+        if (self.stake_snapshots.set) |*set| {
+            if (set.getPool(pool)) |entry| return entry.*;
+        }
+        if (self.stake_snapshots.go) |*go| {
+            if (go.getPool(pool)) |entry| return entry.*;
+        }
+        return null;
+    }
+
+    /// Save ledger state to a binary checkpoint file.
+    pub fn saveCheckpoint(self: *const LedgerDB, path: []const u8) !void {
+        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+
+        // Helper to write big-endian integers
+        var buf: [8]u8 = undefined;
+
+        // Header: magic + version + tip_slot
+        try file.writeAll("KLED");
+        std.mem.writeInt(u32, buf[0..4], 3, .big);
+        try file.writeAll(buf[0..4]);
+        std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
+        try file.writeAll(&buf);
+        try file.writeAll(&[_]u8{if (self.tip_slot != null) 1 else 0});
+
+        // Section 1: Scalar state
+        std.mem.writeInt(u64, &buf, self.treasury_balance, .big);
+        try file.writeAll(&buf);
+        std.mem.writeInt(u64, &buf, self.reserves_balance, .big);
+        try file.writeAll(&buf);
+        std.mem.writeInt(u64, &buf, self.fees_balance, .big);
+        try file.writeAll(&buf);
+        std.mem.writeInt(u64, &buf, self.snapshot_fees, .big);
+        try file.writeAll(&buf);
+        try file.writeAll(&[_]u8{if (self.reward_balances_tracked) 1 else 0});
+
+        // Section 2: UTxO count (we skip UTxOs — loaded from Mithril snapshot)
+        std.mem.writeInt(u64, &buf, 0, .big);
+        try file.writeAll(&buf);
+
+        // Section 3: Reward balances
+        std.mem.writeInt(u64, &buf, @intCast(self.reward_balances.count()), .big);
+        try file.writeAll(&buf);
+        var reward_it = self.reward_balances.iterator();
+        while (reward_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.network)});
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.credential.cred_type)});
+            try file.writeAll(&entry.key_ptr.credential.hash);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
+
+        // Section 4: Stake deposits
+        std.mem.writeInt(u64, &buf, @intCast(self.stake_deposits.count()), .big);
+        try file.writeAll(&buf);
+        var stake_it = self.stake_deposits.iterator();
+        while (stake_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
+
+        // Section 5: Pool deposits
+        std.mem.writeInt(u64, &buf, @intCast(self.pool_deposits.count()), .big);
+        try file.writeAll(&buf);
+        var pool_dep_it = self.pool_deposits.iterator();
+        while (pool_dep_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
+
+        // Section 6: Pool reward accounts
+        std.mem.writeInt(u64, &buf, @intCast(self.pool_reward_accounts.count()), .big);
+        try file.writeAll(&buf);
+        var pool_acct_it = self.pool_reward_accounts.iterator();
+        while (pool_acct_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            try file.writeAll(&[_]u8{@intFromEnum(entry.value_ptr.network)});
+            try file.writeAll(&[_]u8{@intFromEnum(entry.value_ptr.credential.cred_type)});
+            try file.writeAll(&entry.value_ptr.credential.hash);
+        }
+
+        // Section 7: Pool retirements
+        std.mem.writeInt(u64, &buf, @intCast(self.pool_retirements.count()), .big);
+        try file.writeAll(&buf);
+        var pool_ret_it = self.pool_retirements.iterator();
+        while (pool_ret_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
+
+        // Section 8: Stake pool delegations
+        std.mem.writeInt(u64, &buf, @intCast(self.stake_pool_delegations.count()), .big);
+        try file.writeAll(&buf);
+        var deleg_it = self.stake_pool_delegations.iterator();
+        while (deleg_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            try file.writeAll(entry.value_ptr);
+        }
+
+        // Section 9: DRep deposits
+        std.mem.writeInt(u64, &buf, @intCast(self.drep_deposits.count()), .big);
+        try file.writeAll(&buf);
+        var drep_dep_it = self.drep_deposits.iterator();
+        while (drep_dep_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
+
+        // Section 10: DRep delegations
+        std.mem.writeInt(u64, &buf, @intCast(self.drep_delegations.count()), .big);
+        try file.writeAll(&buf);
+        var drep_deleg_it = self.drep_delegations.iterator();
+        while (drep_deleg_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            try writeDRepToFile(file, entry.value_ptr.*);
+        }
+
+        // Section 11: Pool configs
+        std.mem.writeInt(u64, &buf, @intCast(self.pool_configs.count()), .big);
+        try file.writeAll(&buf);
+        var pool_cfg_it = self.pool_configs.iterator();
+        while (pool_cfg_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.pledge, .big);
+            try file.writeAll(&buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.cost, .big);
+            try file.writeAll(&buf);
+            try writeUnitIntervalToFile(file, entry.value_ptr.margin);
+        }
+
+        // Section 12: Future pool params
+        std.mem.writeInt(u64, &buf, @intCast(self.future_pool_params.count()), .big);
+        try file.writeAll(&buf);
+        var future_pool_it = self.future_pool_params.iterator();
+        while (future_pool_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.config.pledge, .big);
+            try file.writeAll(&buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.config.cost, .big);
+            try file.writeAll(&buf);
+            try writeUnitIntervalToFile(file, entry.value_ptr.config.margin);
+            try file.writeAll(&[_]u8{@intFromEnum(entry.value_ptr.reward_account.network)});
+            try file.writeAll(&[_]u8{@intFromEnum(entry.value_ptr.reward_account.credential.cred_type)});
+            try file.writeAll(&entry.value_ptr.reward_account.credential.hash);
+        }
+    }
+
+    /// Load ledger state from a binary checkpoint file.
+    /// Returns true if a valid checkpoint was loaded, false if not found.
+    pub fn loadCheckpoint(self: *LedgerDB, path: []const u8) !bool {
+        var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer file.close();
+
+        self.resetCheckpointState();
+
+        var buf: [8]u8 = undefined;
+
+        // Header
+        var magic: [4]u8 = undefined;
+        _ = file.readAll(&magic) catch return false;
+        if (!std.mem.eql(u8, &magic, "KLED")) return false;
+
+        var ver_buf: [4]u8 = undefined;
+        _ = file.readAll(&ver_buf) catch return false;
+        const version = std.mem.readInt(u32, &ver_buf, .big);
+        if (version != 1 and version != 2 and version != 3) return false;
+
+        _ = file.readAll(&buf) catch return false;
+        const tip_slot_val = std.mem.readInt(u64, &buf, .big);
+        var has_tip_buf: [1]u8 = undefined;
+        _ = file.readAll(&has_tip_buf) catch return false;
+        self.tip_slot = if (has_tip_buf[0] != 0) tip_slot_val else null;
+
+        // Section 1: Scalars
+        _ = try file.readAll(&buf);
+        self.treasury_balance = std.mem.readInt(u64, &buf, .big);
+        _ = try file.readAll(&buf);
+        self.reserves_balance = std.mem.readInt(u64, &buf, .big);
+        _ = try file.readAll(&buf);
+        self.fees_balance = std.mem.readInt(u64, &buf, .big);
+        _ = try file.readAll(&buf);
+        self.snapshot_fees = std.mem.readInt(u64, &buf, .big);
+        var tracked_buf: [1]u8 = undefined;
+        _ = try file.readAll(&tracked_buf);
+        self.reward_balances_tracked = tracked_buf[0] != 0;
+
+        // Section 2: UTxO count (skipped — loaded from Mithril)
+        _ = try file.readAll(&buf);
+
+        // Section 3: Reward balances
+        _ = try file.readAll(&buf);
+        const reward_count = std.mem.readInt(u64, &buf, .big);
+        var i: u64 = 0;
+        while (i < reward_count) : (i += 1) {
+            var entry_buf: [1 + 1 + 28 + 8]u8 = undefined;
+            _ = try file.readAll(&entry_buf);
+            const network: types.Network = @enumFromInt(entry_buf[0]);
+            const cred_type: types.CredentialType = @enumFromInt(entry_buf[1]);
+            var hash: types.Hash28 = undefined;
+            @memcpy(&hash, entry_buf[2..30]);
+            const amount = std.mem.readInt(u64, entry_buf[30..38], .big);
+            try self.reward_balances.put(
+                .{ .network = network, .credential = .{ .cred_type = cred_type, .hash = hash } },
+                amount,
+            );
+        }
+
+        // Section 4: Stake deposits
+        _ = try file.readAll(&buf);
+        const stake_count = std.mem.readInt(u64, &buf, .big);
+        i = 0;
+        while (i < stake_count) : (i += 1) {
+            var entry_buf: [1 + 28 + 8]u8 = undefined;
+            _ = try file.readAll(&entry_buf);
+            const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+            var hash: types.Hash28 = undefined;
+            @memcpy(&hash, entry_buf[1..29]);
+            const amount = std.mem.readInt(u64, entry_buf[29..37], .big);
+            try self.stake_deposits.put(.{ .cred_type = cred_type, .hash = hash }, amount);
+        }
+
+        // Section 5: Pool deposits
+        _ = try file.readAll(&buf);
+        const pool_dep_count = std.mem.readInt(u64, &buf, .big);
+        i = 0;
+        while (i < pool_dep_count) : (i += 1) {
+            var entry_buf: [28 + 8]u8 = undefined;
+            _ = try file.readAll(&entry_buf);
+            var pool: KeyHash = undefined;
+            @memcpy(&pool, entry_buf[0..28]);
+            const amount = std.mem.readInt(u64, entry_buf[28..36], .big);
+            try self.pool_deposits.put(pool, amount);
+        }
+
+        // Section 6: Pool reward accounts
+        _ = try file.readAll(&buf);
+        const pool_acct_count = std.mem.readInt(u64, &buf, .big);
+        i = 0;
+        while (i < pool_acct_count) : (i += 1) {
+            var entry_buf: [28 + 1 + 1 + 28]u8 = undefined;
+            _ = try file.readAll(&entry_buf);
+            var pool: KeyHash = undefined;
+            @memcpy(&pool, entry_buf[0..28]);
+            const network: types.Network = @enumFromInt(entry_buf[28]);
+            const cred_type: types.CredentialType = @enumFromInt(entry_buf[29]);
+            var hash: types.Hash28 = undefined;
+            @memcpy(&hash, entry_buf[30..58]);
+            try self.pool_reward_accounts.put(pool, .{
+                .network = network,
+                .credential = .{ .cred_type = cred_type, .hash = hash },
+            });
+        }
+
+        // Section 7: Pool retirements
+        _ = try file.readAll(&buf);
+        const pool_ret_count = std.mem.readInt(u64, &buf, .big);
+        i = 0;
+        while (i < pool_ret_count) : (i += 1) {
+            var entry_buf: [28 + 8]u8 = undefined;
+            _ = try file.readAll(&entry_buf);
+            var pool: KeyHash = undefined;
+            @memcpy(&pool, entry_buf[0..28]);
+            const epoch = std.mem.readInt(u64, entry_buf[28..36], .big);
+            try self.pool_retirements.put(pool, epoch);
+        }
+
+        // Section 8: Stake pool delegations
+        _ = try file.readAll(&buf);
+        const deleg_count = std.mem.readInt(u64, &buf, .big);
+        i = 0;
+        while (i < deleg_count) : (i += 1) {
+            var entry_buf: [1 + 28 + 28]u8 = undefined;
+            _ = try file.readAll(&entry_buf);
+            const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+            var hash: types.Hash28 = undefined;
+            @memcpy(&hash, entry_buf[1..29]);
+            var pool: KeyHash = undefined;
+            @memcpy(&pool, entry_buf[29..57]);
+            try self.stake_pool_delegations.put(.{ .cred_type = cred_type, .hash = hash }, pool);
+        }
+
+        // Section 9: DRep deposits
+        _ = try file.readAll(&buf);
+        const drep_dep_count = std.mem.readInt(u64, &buf, .big);
+        i = 0;
+        while (i < drep_dep_count) : (i += 1) {
+            var entry_buf: [1 + 28 + 8]u8 = undefined;
+            _ = try file.readAll(&entry_buf);
+            const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+            var hash: types.Hash28 = undefined;
+            @memcpy(&hash, entry_buf[1..29]);
+            const amount = std.mem.readInt(u64, entry_buf[29..37], .big);
+            try self.drep_deposits.put(.{ .cred_type = cred_type, .hash = hash }, amount);
+        }
+
+        // Section 10: DRep delegations
+        _ = try file.readAll(&buf);
+        const drep_deleg_count = std.mem.readInt(u64, &buf, .big);
+        i = 0;
+        while (i < drep_deleg_count) : (i += 1) {
+            var entry_buf: [1 + 28]u8 = undefined;
+            _ = try file.readAll(&entry_buf);
+            const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+            var hash: types.Hash28 = undefined;
+            @memcpy(&hash, entry_buf[1..29]);
+            const drep = try readDRepFromFile(file);
+            try self.drep_delegations.put(.{ .cred_type = cred_type, .hash = hash }, drep);
+        }
+
+        if (version >= 2) {
+            _ = try file.readAll(&buf);
+            const pool_cfg_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < pool_cfg_count) : (i += 1) {
+                var entry_buf: [28 + 8 + 8]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                var pool: KeyHash = undefined;
+                @memcpy(&pool, entry_buf[0..28]);
+                const pledge = std.mem.readInt(u64, entry_buf[28..36], .big);
+                const cost = std.mem.readInt(u64, entry_buf[36..44], .big);
+                const margin = try readUnitIntervalFromFile(file);
+                try self.pool_configs.put(pool, .{
+                    .pledge = pledge,
+                    .cost = cost,
+                    .margin = margin,
+                });
+            }
+        }
+
+        if (version >= 3) {
+            _ = try file.readAll(&buf);
+            const future_pool_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < future_pool_count) : (i += 1) {
+                var entry_buf: [28 + 8 + 8 + 1 + 1 + 28]u8 = undefined;
+                _ = try file.readAll(entry_buf[0..44]);
+                var pool: KeyHash = undefined;
+                @memcpy(&pool, entry_buf[0..28]);
+                const pledge = std.mem.readInt(u64, entry_buf[28..36], .big);
+                const cost = std.mem.readInt(u64, entry_buf[36..44], .big);
+                const margin = try readUnitIntervalFromFile(file);
+                _ = try file.readAll(entry_buf[44..74]);
+                const network: types.Network = @enumFromInt(entry_buf[44]);
+                const cred_type: types.CredentialType = @enumFromInt(entry_buf[45]);
+                var hash: types.Hash28 = undefined;
+                @memcpy(&hash, entry_buf[46..74]);
+                try self.future_pool_params.put(pool, .{
+                    .config = .{
+                        .pledge = pledge,
+                        .cost = cost,
+                        .margin = margin,
+                    },
+                    .reward_account = .{
+                        .network = network,
+                        .credential = .{ .cred_type = cred_type, .hash = hash },
+                    },
+                });
+            }
+        }
+
+        return true;
+    }
+
+    fn resetCheckpointState(self: *LedgerDB) void {
+        self.tip_slot = null;
+        self.treasury_balance = 0;
+        self.reserves_balance = 0;
+        self.fees_balance = 0;
+        self.snapshot_fees = 0;
+        self.reward_balances_tracked = false;
+        self.reward_balances.clearRetainingCapacity();
+        self.stake_deposits.clearRetainingCapacity();
+        self.pool_deposits.clearRetainingCapacity();
+        self.pool_configs.clearRetainingCapacity();
+        self.future_pool_params.clearRetainingCapacity();
+        self.pool_reward_accounts.clearRetainingCapacity();
+        self.pool_retirements.clearRetainingCapacity();
+        self.drep_deposits.clearRetainingCapacity();
+        self.stake_pool_delegations.clearRetainingCapacity();
+        self.drep_delegations.clearRetainingCapacity();
+        self.stake_snapshots.deinit();
+        self.stake_snapshots = StakeSnapshots.init(self.allocator);
     }
 
     /// Total number of UTxOs in the set.
@@ -253,11 +1246,97 @@ pub const LedgerDB = struct {
     }
 };
 
+fn writeDRepToFile(file: std.fs.File, drep: DRep) !void {
+    switch (drep) {
+        .key_hash => |h| {
+            try file.writeAll(&[_]u8{0});
+            try file.writeAll(&h);
+        },
+        .script_hash => |h| {
+            try file.writeAll(&[_]u8{1});
+            try file.writeAll(&h);
+        },
+        .always_abstain => try file.writeAll(&[_]u8{2}),
+        .always_no_confidence => try file.writeAll(&[_]u8{3}),
+    }
+}
+
+fn writeUnitIntervalToFile(file: std.fs.File, interval: UnitInterval) !void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, interval.numerator, .big);
+    try file.writeAll(&buf);
+    std.mem.writeInt(u64, &buf, interval.denominator, .big);
+    try file.writeAll(&buf);
+}
+
+fn readDRepFromFile(file: std.fs.File) !DRep {
+    var tag_buf: [1]u8 = undefined;
+    _ = try file.readAll(&tag_buf);
+    switch (tag_buf[0]) {
+        0 => {
+            var h: types.Hash28 = undefined;
+            _ = try file.readAll(&h);
+            return .{ .key_hash = h };
+        },
+        1 => {
+            var h: types.Hash28 = undefined;
+            _ = try file.readAll(&h);
+            return .{ .script_hash = h };
+        },
+        2 => return .{ .always_abstain = {} },
+        3 => return .{ .always_no_confidence = {} },
+        else => return error.InvalidCheckpoint,
+    }
+}
+
+fn readUnitIntervalFromFile(file: std.fs.File) !UnitInterval {
+    var buf: [8]u8 = undefined;
+    _ = try file.readAll(&buf);
+    const numerator = std.mem.readInt(u64, &buf, .big);
+    _ = try file.readAll(&buf);
+    const denominator = std.mem.readInt(u64, &buf, .big);
+    const interval = UnitInterval{
+        .numerator = numerator,
+        .denominator = denominator,
+    };
+    if (!interval.isValid()) return error.InvalidCheckpoint;
+    return interval;
+}
+
 fn freeEntries(allocator: Allocator, entries: []const UtxoEntry) void {
     for (entries) |entry| {
         allocator.free(entry.raw_cbor);
     }
     allocator.free(entries);
+}
+
+fn appendPoolReapRewardChange(
+    allocator: Allocator,
+    changes: *std.ArrayList(RewardBalanceChange),
+    ledger: *const LedgerDB,
+    account: RewardAccount,
+    added: Coin,
+) !void {
+    for (changes.items) |*change| {
+        if (change.account.network == account.network and
+            Credential.eql(change.account.credential, account.credential))
+        {
+            const current = change.next orelse 0;
+            change.next = current + added;
+            return;
+        }
+    }
+
+    const previous = ledger.lookupRewardBalance(account);
+    try changes.append(allocator, .{
+        .account = account,
+        .previous = previous,
+        .next = (previous orelse 0) + added,
+    });
+}
+
+fn freeRewardChanges(allocator: Allocator, changes: []const RewardBalanceChange) void {
+    if (changes.len > 0) allocator.free(changes);
 }
 
 fn freeStakeChanges(allocator: Allocator, changes: []const StakeDepositChange) void {
@@ -268,8 +1347,73 @@ fn freePoolChanges(allocator: Allocator, changes: []const PoolDepositChange) voi
     if (changes.len > 0) allocator.free(changes);
 }
 
+fn freePoolConfigChanges(allocator: Allocator, changes: []const PoolConfigChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freeFuturePoolParamChanges(allocator: Allocator, changes: []const FuturePoolParamsChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freePoolRewardAccountChanges(allocator: Allocator, changes: []const PoolRewardAccountChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freePoolRetirementChanges(allocator: Allocator, changes: []const PoolRetirementChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
 fn freeDRepChanges(allocator: Allocator, changes: []const DRepDepositChange) void {
     if (changes.len > 0) allocator.free(changes);
+}
+
+fn freeStakePoolDelegationChanges(allocator: Allocator, changes: []const StakePoolDelegationChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freeDRepDelegationChanges(allocator: Allocator, changes: []const DRepDelegationChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn applyCoinStateChange(state: *Coin, change: ?CoinStateChange) void {
+    if (change) |updated| {
+        state.* = updated.next;
+    }
+}
+
+fn rollbackCoinStateChange(state: *Coin, change: ?CoinStateChange) void {
+    if (change) |updated| {
+        state.* = updated.previous;
+    }
+}
+
+fn applyRewardBalanceChanges(
+    map: *std.AutoHashMap(RewardAccount, Coin),
+    changes: []const RewardBalanceChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |balance| {
+            map.put(change.account, balance) catch unreachable;
+        } else {
+            _ = map.remove(change.account);
+        }
+    }
+}
+
+fn rollbackRewardBalanceChanges(
+    map: *std.AutoHashMap(RewardAccount, Coin),
+    changes: []const RewardBalanceChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |balance| {
+            map.put(change.account, balance) catch unreachable;
+        } else {
+            _ = map.remove(change.account);
+        }
+    }
 }
 
 fn applyStakeDepositChanges(
@@ -330,6 +1474,122 @@ fn rollbackPoolDepositChanges(
     }
 }
 
+fn applyPoolConfigChanges(
+    map: *std.AutoHashMap(KeyHash, PoolConfig),
+    changes: []const PoolConfigChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |config| {
+            map.put(change.pool, config) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn rollbackPoolConfigChanges(
+    map: *std.AutoHashMap(KeyHash, PoolConfig),
+    changes: []const PoolConfigChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |config| {
+            map.put(change.pool, config) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn applyFuturePoolParamChanges(
+    map: *std.AutoHashMap(KeyHash, FuturePoolParams),
+    changes: []const FuturePoolParamsChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |params| {
+            map.put(change.pool, params) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn rollbackFuturePoolParamChanges(
+    map: *std.AutoHashMap(KeyHash, FuturePoolParams),
+    changes: []const FuturePoolParamsChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |params| {
+            map.put(change.pool, params) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn applyPoolRewardAccountChanges(
+    map: *std.AutoHashMap(KeyHash, RewardAccount),
+    changes: []const PoolRewardAccountChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |account| {
+            map.put(change.pool, account) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn rollbackPoolRewardAccountChanges(
+    map: *std.AutoHashMap(KeyHash, RewardAccount),
+    changes: []const PoolRewardAccountChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |account| {
+            map.put(change.pool, account) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn applyPoolRetirementChanges(
+    map: *std.AutoHashMap(KeyHash, EpochNo),
+    changes: []const PoolRetirementChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |epoch| {
+            map.put(change.pool, epoch) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn rollbackPoolRetirementChanges(
+    map: *std.AutoHashMap(KeyHash, EpochNo),
+    changes: []const PoolRetirementChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |epoch| {
+            map.put(change.pool, epoch) catch unreachable;
+        } else {
+            _ = map.remove(change.pool);
+        }
+    }
+}
+
 fn applyDRepDepositChanges(
     map: *std.AutoHashMap(Credential, Coin),
     changes: []const DRepDepositChange,
@@ -353,6 +1613,64 @@ fn rollbackDRepDepositChanges(
         const change = changes[i];
         if (change.previous) |deposit| {
             map.put(change.credential, deposit) catch unreachable;
+        } else {
+            _ = map.remove(change.credential);
+        }
+    }
+}
+
+fn applyStakePoolDelegationChanges(
+    map: *std.AutoHashMap(Credential, KeyHash),
+    changes: []const StakePoolDelegationChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |pool| {
+            map.put(change.credential, pool) catch unreachable;
+        } else {
+            _ = map.remove(change.credential);
+        }
+    }
+}
+
+fn rollbackStakePoolDelegationChanges(
+    map: *std.AutoHashMap(Credential, KeyHash),
+    changes: []const StakePoolDelegationChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |pool| {
+            map.put(change.credential, pool) catch unreachable;
+        } else {
+            _ = map.remove(change.credential);
+        }
+    }
+}
+
+fn applyDRepDelegationChanges(
+    map: *std.AutoHashMap(Credential, DRep),
+    changes: []const DRepDelegationChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |drep| {
+            map.put(change.credential, drep) catch unreachable;
+        } else {
+            _ = map.remove(change.credential);
+        }
+    }
+}
+
+fn rollbackDRepDelegationChanges(
+    map: *std.AutoHashMap(Credential, DRep),
+    changes: []const DRepDelegationChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |drep| {
+            map.put(change.credential, drep) catch unreachable;
         } else {
             _ = map.remove(change.credential);
         }
@@ -427,6 +1745,322 @@ test "ledgerdb: apply diff tracks and rolls back stake deposits" {
 
     try db.rollback(1);
     try std.testing.expect(db.lookupStakeDeposit(cred) == null);
+}
+
+test "ledgerdb: apply diff tracks and rolls back reward balances" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-reward-balances");
+    defer db.deinit();
+
+    const account = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0xdd} ** 28,
+        },
+    };
+
+    try db.applyDiff(.{
+        .slot = 10,
+        .block_hash = [_]u8{0x22} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = try allocator.alloc(UtxoEntry, 0),
+        .reward_balance_changes = try allocator.dupe(RewardBalanceChange, &[_]RewardBalanceChange{
+            .{
+                .account = account,
+                .previous = 4_000_000,
+                .next = null,
+            },
+        }),
+    });
+
+    try std.testing.expect(db.lookupRewardBalance(account) == null);
+
+    try db.rollback(1);
+    try std.testing.expectEqual(@as(?Coin, 4_000_000), db.lookupRewardBalance(account));
+}
+
+test "ledgerdb: apply diff tracks and rolls back accounting pots" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-accounting-pots");
+    defer db.deinit();
+
+    db.importTreasuryBalance(10);
+    db.importReservesBalance(20);
+    db.importFeesBalance(30);
+    db.importSnapshotFees(40);
+
+    try db.applyDiff(.{
+        .slot = 10,
+        .block_hash = [_]u8{0x23} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = try allocator.alloc(UtxoEntry, 0),
+        .treasury_balance_change = .{ .previous = 10, .next = 15 },
+        .reserves_balance_change = .{ .previous = 20, .next = 18 },
+        .fees_balance_change = .{ .previous = 30, .next = 35 },
+        .snapshot_fees_change = .{ .previous = 40, .next = 50 },
+    });
+
+    try std.testing.expectEqual(@as(Coin, 15), db.getTreasuryBalance());
+    try std.testing.expectEqual(@as(Coin, 18), db.getReservesBalance());
+    try std.testing.expectEqual(@as(Coin, 35), db.getFeesBalance());
+    try std.testing.expectEqual(@as(Coin, 50), db.getSnapshotFees());
+
+    try db.rollback(1);
+    try std.testing.expectEqual(@as(Coin, 10), db.getTreasuryBalance());
+    try std.testing.expectEqual(@as(Coin, 20), db.getReservesBalance());
+    try std.testing.expectEqual(@as(Coin, 30), db.getFeesBalance());
+    try std.testing.expectEqual(@as(Coin, 40), db.getSnapshotFees());
+}
+
+test "ledgerdb: apply diff tracks and rolls back delegations" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-delegations");
+    defer db.deinit();
+
+    const cred = Credential{
+        .cred_type = .key_hash,
+        .hash = [_]u8{0xee} ** 28,
+    };
+    const pool = [_]u8{0x44} ** 28;
+    const drep = DRep{ .always_abstain = {} };
+
+    try db.applyDiff(.{
+        .slot = 10,
+        .block_hash = [_]u8{0x33} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = try allocator.alloc(UtxoEntry, 0),
+        .stake_pool_delegation_changes = try allocator.dupe(StakePoolDelegationChange, &[_]StakePoolDelegationChange{
+            .{
+                .credential = cred,
+                .previous = null,
+                .next = pool,
+            },
+        }),
+        .drep_delegation_changes = try allocator.dupe(DRepDelegationChange, &[_]DRepDelegationChange{
+            .{
+                .credential = cred,
+                .previous = null,
+                .next = drep,
+            },
+        }),
+    });
+
+    try std.testing.expectEqual(@as(?KeyHash, pool), db.lookupStakePoolDelegation(cred));
+    try std.testing.expectEqual(drep, db.lookupDRepDelegation(cred).?);
+
+    try db.rollback(1);
+    try std.testing.expect(db.lookupStakePoolDelegation(cred) == null);
+    try std.testing.expect(db.lookupDRepDelegation(cred) == null);
+}
+
+test "ledgerdb: apply diff tracks and rolls back pool state" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-pool-state");
+    defer db.deinit();
+
+    const pool = [_]u8{0x51} ** 28;
+    const account = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0x52} ** 28,
+        },
+    };
+    const future_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0x53} ** 28,
+        },
+    };
+
+    try db.applyDiff(.{
+        .slot = 10,
+        .block_hash = [_]u8{0x34} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = try allocator.alloc(UtxoEntry, 0),
+        .pool_deposit_changes = try allocator.dupe(PoolDepositChange, &[_]PoolDepositChange{
+            .{
+                .pool = pool,
+                .previous = null,
+                .next = 500_000_000,
+            },
+        }),
+        .pool_config_changes = try allocator.dupe(PoolConfigChange, &[_]PoolConfigChange{
+            .{
+                .pool = pool,
+                .previous = null,
+                .next = .{
+                    .pledge = 250_000_000,
+                    .cost = 340_000_000,
+                    .margin = .{ .numerator = 1, .denominator = 20 },
+                },
+            },
+        }),
+        .future_pool_param_changes = try allocator.dupe(FuturePoolParamsChange, &[_]FuturePoolParamsChange{
+            .{
+                .pool = pool,
+                .previous = null,
+                .next = .{
+                    .config = .{
+                        .pledge = 300_000_000,
+                        .cost = 345_000_000,
+                        .margin = .{ .numerator = 1, .denominator = 10 },
+                    },
+                    .reward_account = future_account,
+                },
+            },
+        }),
+        .pool_reward_account_changes = try allocator.dupe(PoolRewardAccountChange, &[_]PoolRewardAccountChange{
+            .{
+                .pool = pool,
+                .previous = null,
+                .next = account,
+            },
+        }),
+        .pool_retirement_changes = try allocator.dupe(PoolRetirementChange, &[_]PoolRetirementChange{
+            .{
+                .pool = pool,
+                .previous = null,
+                .next = 9,
+            },
+        }),
+    });
+
+    try std.testing.expectEqual(@as(?Coin, 500_000_000), db.lookupPoolDeposit(pool));
+    try std.testing.expectEqual(PoolConfig{
+        .pledge = 250_000_000,
+        .cost = 340_000_000,
+        .margin = .{ .numerator = 1, .denominator = 20 },
+    }, db.lookupPoolConfig(pool).?);
+    try std.testing.expectEqual(FuturePoolParams{
+        .config = .{
+            .pledge = 300_000_000,
+            .cost = 345_000_000,
+            .margin = .{ .numerator = 1, .denominator = 10 },
+        },
+        .reward_account = future_account,
+    }, db.lookupFuturePoolParams(pool).?);
+    try std.testing.expectEqual(account, db.lookupPoolRewardAccount(pool).?);
+    try std.testing.expectEqual(@as(?EpochNo, 9), db.lookupPoolRetirement(pool));
+
+    try db.rollback(1);
+    try std.testing.expect(db.lookupPoolDeposit(pool) == null);
+    try std.testing.expect(db.lookupPoolConfig(pool) == null);
+    try std.testing.expect(db.lookupFuturePoolParams(pool) == null);
+    try std.testing.expect(db.lookupPoolRewardAccount(pool) == null);
+    try std.testing.expect(db.lookupPoolRetirement(pool) == null);
+}
+
+test "ledgerdb: pool reap routes unclaimed refunds to treasury" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-pool-reap-treasury");
+    defer db.deinit();
+
+    const pool = [_]u8{0x61} ** 28;
+    const reward_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0x62} ** 28,
+        },
+    };
+
+    db.importTreasuryBalance(500);
+    try db.importPoolDeposit(pool, 2_000_000);
+    try db.importPoolConfig(pool, .{
+        .pledge = 500_000_000,
+        .cost = 340_000_000,
+        .margin = .{ .numerator = 1, .denominator = 10 },
+    });
+    try db.importPoolRewardAccount(pool, reward_account);
+    try db.importPoolRetirement(pool, 9);
+
+    const diff = (try db.buildPoolReapDiff(allocator, 90, [_]u8{0x63} ** 32, 9)).?;
+    try db.applyDiff(diff);
+
+    try std.testing.expectEqual(@as(Coin, 2_000_500), db.getTreasuryBalance());
+    try std.testing.expect(db.lookupRewardBalance(reward_account) == null);
+    try std.testing.expect(db.lookupPoolDeposit(pool) == null);
+    try std.testing.expect(db.lookupPoolConfig(pool) == null);
+    try std.testing.expect(db.lookupPoolRewardAccount(pool) == null);
+    try std.testing.expect(db.lookupPoolRetirement(pool) == null);
+
+    try db.rollback(1);
+    try std.testing.expectEqual(@as(Coin, 500), db.getTreasuryBalance());
+    try std.testing.expectEqual(@as(?Coin, 2_000_000), db.lookupPoolDeposit(pool));
+    try std.testing.expectEqual(PoolConfig{
+        .pledge = 500_000_000,
+        .cost = 340_000_000,
+        .margin = .{ .numerator = 1, .denominator = 10 },
+    }, db.lookupPoolConfig(pool).?);
+    try std.testing.expectEqual(reward_account, db.lookupPoolRewardAccount(pool).?);
+    try std.testing.expectEqual(@as(?EpochNo, 9), db.lookupPoolRetirement(pool));
+}
+
+test "ledgerdb: pool epoch transition activates future params" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-future-pool-params");
+    defer db.deinit();
+
+    const pool = [_]u8{0x64} ** 28;
+    const current_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0x65} ** 28,
+        },
+    };
+    const future_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0x66} ** 28,
+        },
+    };
+
+    try db.importPoolConfig(pool, .{
+        .pledge = 200_000_000,
+        .cost = 340_000_000,
+        .margin = .{ .numerator = 1, .denominator = 20 },
+    });
+    try db.importPoolRewardAccount(pool, current_account);
+    try db.importFuturePoolParams(pool, .{
+        .config = .{
+            .pledge = 300_000_000,
+            .cost = 350_000_000,
+            .margin = .{ .numerator = 1, .denominator = 10 },
+        },
+        .reward_account = future_account,
+    });
+
+    const diff = (try db.buildPoolReapDiff(allocator, 90, [_]u8{0x67} ** 32, 9)).?;
+    try db.applyDiff(diff);
+
+    try std.testing.expectEqual(PoolConfig{
+        .pledge = 300_000_000,
+        .cost = 350_000_000,
+        .margin = .{ .numerator = 1, .denominator = 10 },
+    }, db.lookupPoolConfig(pool).?);
+    try std.testing.expectEqual(future_account, db.lookupPoolRewardAccount(pool).?);
+    try std.testing.expect(db.lookupFuturePoolParams(pool) == null);
+
+    try db.rollback(1);
+    try std.testing.expectEqual(PoolConfig{
+        .pledge = 200_000_000,
+        .cost = 340_000_000,
+        .margin = .{ .numerator = 1, .denominator = 20 },
+    }, db.lookupPoolConfig(pool).?);
+    try std.testing.expectEqual(current_account, db.lookupPoolRewardAccount(pool).?);
+    try std.testing.expectEqual(FuturePoolParams{
+        .config = .{
+            .pledge = 300_000_000,
+            .cost = 350_000_000,
+            .margin = .{ .numerator = 1, .denominator = 10 },
+        },
+        .reward_account = future_account,
+    }, db.lookupFuturePoolParams(pool).?);
 }
 
 test "ledgerdb: apply diff consumes utxos" {
@@ -524,4 +2158,236 @@ test "ledgerdb: rollback restores consumed utxos" {
     try db.rollback(1);
     try std.testing.expect(db.lookupUtxo(makeTxIn(0x09, 0)) != null);
     try std.testing.expect(db.lookupUtxo(makeTxIn(0x0a, 0)) == null);
+}
+
+test "ledgerdb: checkpoint save and load round-trip" {
+    const allocator = std.testing.allocator;
+    const ckpt_path = "/tmp/kassadin-test-ledger-checkpoint/ledger/checkpoint";
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-ledger-checkpoint") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-ledger-checkpoint") catch {};
+
+    // Build source DB with state
+    {
+        var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-checkpoint/ledger");
+        defer db.deinit();
+
+        db.importTreasuryBalance(42_000);
+        db.importReservesBalance(99_000);
+        db.importFeesBalance(500);
+        db.importSnapshotFees(100);
+        db.setRewardBalancesTracked(true);
+
+        const account = RewardAccount{
+            .network = .testnet,
+            .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xaa} ** 28 },
+        };
+        try db.importRewardBalance(account, 7_000);
+        try db.importStakeDeposit(account.credential, 2_000_000);
+
+        const pool = [_]u8{0xbb} ** 28;
+        try db.importPoolDeposit(pool, 500_000_000);
+        try db.importPoolConfig(pool, .{
+            .pledge = 250_000_000,
+            .cost = 340_000_000,
+            .margin = .{ .numerator = 1, .denominator = 20 },
+        });
+        try db.importFuturePoolParams(pool, .{
+            .config = .{
+                .pledge = 300_000_000,
+                .cost = 345_000_000,
+                .margin = .{ .numerator = 1, .denominator = 10 },
+            },
+            .reward_account = .{
+                .network = .testnet,
+                .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xbc} ** 28 },
+            },
+        });
+        try db.importPoolRewardAccount(pool, account);
+        try db.importPoolRetirement(pool, 10);
+        try db.importStakePoolDelegation(account.credential, pool);
+
+        const drep_cred = Credential{ .cred_type = .script_hash, .hash = [_]u8{0xcc} ** 28 };
+        try db.importDRepDelegation(drep_cred, .{ .always_abstain = {} });
+        try db.drep_deposits.put(drep_cred, 500_000_000);
+
+        db.setTipSlot(12345);
+
+        try db.saveCheckpoint(ckpt_path);
+    }
+
+    // Load into fresh DB
+    {
+        var db2 = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-checkpoint/ledger2");
+        defer db2.deinit();
+
+        const loaded = try db2.loadCheckpoint(ckpt_path);
+        try std.testing.expect(loaded);
+
+        try std.testing.expectEqual(@as(Coin, 42_000), db2.getTreasuryBalance());
+        try std.testing.expectEqual(@as(Coin, 99_000), db2.getReservesBalance());
+        try std.testing.expectEqual(@as(Coin, 500), db2.getFeesBalance());
+        try std.testing.expectEqual(@as(Coin, 100), db2.getSnapshotFees());
+        try std.testing.expect(db2.areRewardBalancesTracked());
+        try std.testing.expectEqual(@as(?SlotNo, 12345), db2.getTipSlot());
+
+        const account = RewardAccount{
+            .network = .testnet,
+            .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xaa} ** 28 },
+        };
+        try std.testing.expectEqual(@as(?Coin, 7_000), db2.lookupRewardBalance(account));
+        try std.testing.expectEqual(@as(?Coin, 2_000_000), db2.lookupStakeDeposit(account.credential));
+
+        const pool = [_]u8{0xbb} ** 28;
+        try std.testing.expectEqual(@as(?Coin, 500_000_000), db2.lookupPoolDeposit(pool));
+        try std.testing.expectEqual(PoolConfig{
+            .pledge = 250_000_000,
+            .cost = 340_000_000,
+            .margin = .{ .numerator = 1, .denominator = 20 },
+        }, db2.lookupPoolConfig(pool).?);
+        try std.testing.expectEqual(FuturePoolParams{
+            .config = .{
+                .pledge = 300_000_000,
+                .cost = 345_000_000,
+                .margin = .{ .numerator = 1, .denominator = 10 },
+            },
+            .reward_account = .{
+                .network = .testnet,
+                .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xbc} ** 28 },
+            },
+        }, db2.lookupFuturePoolParams(pool).?);
+        try std.testing.expectEqual(account, db2.lookupPoolRewardAccount(pool).?);
+        try std.testing.expectEqual(@as(?EpochNo, 10), db2.lookupPoolRetirement(pool));
+        try std.testing.expectEqual(@as(?KeyHash, pool), db2.lookupStakePoolDelegation(account.credential));
+
+        const drep_cred = Credential{ .cred_type = .script_hash, .hash = [_]u8{0xcc} ** 28 };
+        try std.testing.expect(db2.lookupDRepDelegation(drep_cred) != null);
+        try std.testing.expectEqual(@as(?Coin, 500_000_000), db2.lookupDRepDeposit(drep_cred));
+    }
+}
+
+test "ledgerdb: checkpoint not found returns false" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-no-ckpt");
+    defer db.deinit();
+
+    const loaded = try db.loadCheckpoint("/tmp/kassadin-test-ledger-no-ckpt-does-not-exist");
+    try std.testing.expect(!loaded);
+}
+
+test "ledgerdb: epoch reward diff distributes to pool reward accounts and delegators" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-epoch-reward");
+    defer db.deinit();
+
+    const pool = [_]u8{0x91} ** 28;
+    const reward_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x92} ** 28 },
+    };
+    const delegator_cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0x94} ** 28 };
+    const delegator_account = RewardAccount{
+        .network = .testnet,
+        .credential = delegator_cred,
+    };
+
+    try db.importPoolRewardAccount(pool, reward_account);
+    try db.importRewardBalance(reward_account, 1_000);
+    db.setRewardAccountNetwork(.testnet);
+    db.importReservesBalance(14_000_000_000_000_000);
+    db.importSnapshotFees(50_000_000_000);
+
+    // Build a "go" snapshot with one pool
+    var go = stake_mod.StakeDistribution.init(allocator, 0);
+    try go.setPoolStake(
+        pool,
+        1_000_000_000_000,
+        500_000_000_000,
+        340_000_000,
+        .{ .numerator = 0, .denominator = 1 },
+        reward_account,
+    );
+    try go.setDelegatedStake(delegator_cred, pool, 1_000_000_000_000);
+    go.finalize();
+
+    var snapshots = StakeSnapshots.init(allocator);
+    snapshots.go = go;
+    db.replaceStakeSnapshots(snapshots);
+
+    const diff = try db.buildEpochRewardDiff(
+        allocator,
+        100,
+        [_]u8{0x93} ** 32,
+        rewards_mod.RewardParams.mainnet_defaults,
+    );
+    try std.testing.expect(diff != null);
+
+    try db.applyDiff(diff.?);
+
+    // Reward account should have increased
+    const new_balance = db.lookupRewardBalance(reward_account).?;
+    try std.testing.expect(new_balance > 1_000);
+    try std.testing.expect(db.lookupRewardBalance(delegator_account) != null);
+    try std.testing.expect(db.lookupRewardBalance(delegator_account).? > 0);
+    // Treasury should have increased
+    try std.testing.expect(db.getTreasuryBalance() > 0);
+    // Snapshot fees should be reset to 0
+    try std.testing.expectEqual(@as(Coin, 0), db.getSnapshotFees());
+
+    // Rollback restores original state
+    try db.rollback(1);
+    try std.testing.expectEqual(@as(?Coin, 1_000), db.lookupRewardBalance(reward_account));
+    try std.testing.expect(db.lookupRewardBalance(delegator_account) == null);
+    try std.testing.expectEqual(@as(Coin, 50_000_000_000), db.getSnapshotFees());
+}
+
+test "ledgerdb: epoch fee rollover moves accumulated fees into snapshot pot" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-fee-rollover");
+    defer db.deinit();
+
+    db.importFeesBalance(1_500);
+    db.importSnapshotFees(250);
+
+    const diff = (try db.buildEpochFeeRolloverDiff(
+        allocator,
+        100,
+        [_]u8{0x94} ** 32,
+    )).?;
+    try db.applyDiff(diff);
+
+    try std.testing.expectEqual(@as(Coin, 0), db.getFeesBalance());
+    try std.testing.expectEqual(@as(Coin, 1_750), db.getSnapshotFees());
+
+    try db.rollback(1);
+    try std.testing.expectEqual(@as(Coin, 1_500), db.getFeesBalance());
+    try std.testing.expectEqual(@as(Coin, 250), db.getSnapshotFees());
+}
+
+test "ledgerdb: rotate stake snapshots builds mark from delegations" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-stake-rotate");
+    defer db.deinit();
+
+    const pool = [_]u8{0xa1} ** 28;
+    const cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0xa2} ** 28 };
+    const account = RewardAccount{ .network = .testnet, .credential = cred };
+
+    try db.importRewardBalance(account, 5_000_000);
+    try db.importStakeDeposit(cred, 2_000_000);
+    try db.importPoolDeposit(pool, 500_000_000);
+    try db.importPoolRewardAccount(pool, account);
+    try db.importStakePoolDelegation(cred, pool);
+
+    db.rotateStakeSnapshots(1);
+
+    // mark should exist and contain our pool
+    try std.testing.expect(db.getStakeSnapshots().mark != null);
+    const mark = db.getStakeSnapshots().mark.?;
+    try std.testing.expectEqual(@as(usize, 1), mark.poolCount());
+    try std.testing.expectEqual(@as(usize, 1), mark.delegatorCount());
+    const ps = mark.getPool(pool).?;
+    try std.testing.expectEqual(@as(Coin, 7_000_000), ps.active_stake); // reward + deposit
+    const delegated = mark.getDelegatedStake(cred).?;
+    try std.testing.expectEqual(pool, delegated.pool_id);
+    try std.testing.expectEqual(@as(Coin, 7_000_000), delegated.active_stake);
 }

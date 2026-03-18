@@ -34,6 +34,11 @@ pub const EpochRewards = struct {
     fees_collected: Coin, // transaction fees from this epoch
 };
 
+pub const PoolRewardSplit = struct {
+    leader_reward: Coin,
+    member_rewards: Coin,
+};
+
 /// Calculate the epoch reward pot.
 /// rewards = rho * reserve + fees
 /// treasury = tau * rewards
@@ -105,6 +110,30 @@ pub fn calculatePoolReward(
     return raw_reward;
 }
 
+pub fn splitPoolReward(
+    raw_reward: Coin,
+    pool_cost: Coin,
+    pool_margin: UnitInterval,
+) PoolRewardSplit {
+    if (raw_reward == 0) {
+        return .{ .leader_reward = 0, .member_rewards = 0 };
+    }
+    if (raw_reward <= pool_cost) {
+        return .{ .leader_reward = raw_reward, .member_rewards = 0 };
+    }
+
+    const net_reward = raw_reward - pool_cost;
+    const margin_cut = @as(Coin, @intCast(
+        (@as(u128, net_reward) * pool_margin.numerator) / pool_margin.denominator,
+    ));
+    const leader_reward = pool_cost + margin_cut;
+
+    return .{
+        .leader_reward = leader_reward,
+        .member_rewards = raw_reward - leader_reward,
+    };
+}
+
 // ──────────────────────────────────── Tests ────────────────────────────────────
 
 test "rewards: epoch reward calculation" {
@@ -150,6 +179,17 @@ test "rewards: pool reward calculation" {
 
     // Should get approximately 5% of reward pot (10M/200M = 5%)
     try std.testing.expect(pool_reward > 0);
+}
+
+test "rewards: split pool reward into leader and member shares" {
+    const split = splitPoolReward(
+        1_000_000_000,
+        340_000_000,
+        .{ .numerator = 5, .denominator = 100 },
+    );
+
+    try std.testing.expectEqual(@as(Coin, 373_000_000), split.leader_reward);
+    try std.testing.expectEqual(@as(Coin, 627_000_000), split.member_rewards);
 }
 
 test "rewards: mainnet default parameters" {

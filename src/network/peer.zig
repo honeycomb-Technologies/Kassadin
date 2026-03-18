@@ -63,6 +63,7 @@ pub const Peer = struct {
 
         if (self.last_cs_response) |prev| {
             self.allocator.free(prev);
+            self.last_cs_response = null;
         }
 
         const response = try self.bearer.readProtocolMessage(
@@ -91,6 +92,7 @@ pub const Peer = struct {
         // Free previous response if any
         if (self.last_cs_response) |prev| {
             self.allocator.free(prev);
+            self.last_cs_response = null;
         }
 
         const response = try self.bearer.readProtocolMessage(

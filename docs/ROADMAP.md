@@ -412,8 +412,8 @@ chain-sync/query parity still require Phase 7 chain state integration.
 
 ## Phase 7: Mithril Bootstrap & Full Integration -- IN PROGRESS
 
-**Status:** 351 tests. Preview sync fetches real blocks from genesis or a saved
-checkpoint, stores them through `ChainDB`, and resumes from `db/preview/sync.resume`.
+**Status:** Local tests pass. Preview sync fetches real blocks from genesis or a saved
+sync point, stores them through `ChainDB`, and resumes from `db/<network>/sync.resume`.
 Mithril metadata query works, snapshot restore validates extracted layout under
 `db/<network>/`, and both `bootstrap-sync` and normal runtime `sync` can now
 read the restored immutable tip, anchor `ChainDB` there, load the latest
@@ -423,9 +423,35 @@ locally, and then validate/follow real forward blocks. `bootstrap-sync
 the verified bootstrap/runtime path no longer depends on Dolos. Both follower
 commands now run until stopped by default and handle `SIGINT`/`SIGTERM` without
 crashing. Genesis-seeded runtime validation and Shelley-era protocol-parameter
-update tracking are now in place; modern min-ADA/cost-model handling, Conway-era
-governance parameter changes, and final shutdown snapshot/checkpoint persistence
-are still pending. The current local validation path now loads Shelley genesis
+update tracking are now in place; tx-body withdrawals now parse into reward
+accounts, and the ledger diff path can roll back tracked reward-balance
+withdrawals locally; once reward state is loaded, tracked withdrawals now follow
+the Haskell exact-drain rule instead of accepting stale/missing balances on
+faith. Snapshot/runtime validation now hydrates reward balances, stake
+deposits, current/future pool params, pool reward accounts, pool retirement schedules, chain-account pots,
+fee pots, and Haskell-shaped mark/set/go stake snapshots from the local
+ancillary `state` payload before replaying the immutable tail, so live
+withdrawal, deposit, fee, and pool-retirement checks can use real
+snapshot-backed state. The modern Haskell `SnapShots = [mark,set,go,fee]` /
+`StakePoolSnapShot` path is now the primary import path, with compatibility
+handling for observed 9-field pool entries that derives active stake from the
+outer active-stake map instead of zeroing it, and immutable replay now applies
+the same reward/snapshot/fee/pool epoch-boundary effects as live `ChainDB`.
+Epoch reward distribution is also no longer pool-account-only: the current
+simplified reward model now credits both pool reward accounts and delegator
+reward accounts from the `go` snapshot's credential-level stake data, and the
+pool leader reward path now uses the snapshot-era pool reward account instead
+of the live pool map.
+Epoch-boundary pool processing is now rollback-safe in both immutable-tail replay and
+forward sync: pool re-registration stages future params locally instead of
+mutating live pool state immediately, those staged params activate at epoch
+processing, retiring pools are removed at the scheduled epoch, their deposits
+are refunded to tracked reward accounts when the stake credential is
+registered, unclaimed refunds are routed to treasury, and stake delegations to
+those pools are cleared. Full epoch reward/stake maintenance, modern
+min-ADA/cost-model handling, Conway-era governance parameter changes, and final
+ledger snapshot/checkpoint persistence on shutdown are still pending. The current
+local validation path now loads Shelley genesis
 parameters from configured/local genesis JSON and applies those real
 fee/size/deposit limits during immutable replay and forward sync. The CLI can
 also parse official cardano-node config JSON, resolve genesis file paths
@@ -456,7 +482,7 @@ headers from ouroboros-consensus golden data.
 - [x] Node runner: genesis config + ChainDB + sync loop
 - [x] Real block points derived from chain-sync headers for block-fetch
 - [x] CLI: `kassadin sync` fetches 20 preview blocks from genesis (WORKING)
-- [x] Resume checkpoint: subsequent preview sync runs continue from the last saved point
+- [x] Resume checkpoint: subsequent preview sync runs continue from the last saved sync point
 - [x] CLI: `kassadin bootstrap` queries Mithril (WORKING)
 - [x] Official cardano-node config JSON parser resolves genesis file paths relative to config bundles
 - [x] Byron genesis parser loads protocol constants and initial AVVM/non-AVVM balance maps from official/local genesis JSON
@@ -478,6 +504,16 @@ headers from ouroboros-consensus golden data.
 - [x] Switch local validation from Byron protocol params to Shelley genesis params on the first post-Byron block
 - [x] Prove origin-start validation end-to-end across the Byron-to-Shelley transition on a live chain (`test-origin-transition`: 46 Byron blocks + first Shelley block validated locally from a fresh DB)
 - [x] Parse Shelley tx-body field `6` updates, stage identical-vote quorum by epoch, adopt supported protocol-parameter changes at epoch boundaries, and keep that state rollback-safe in `ChainDB`
+- [x] Parse tx-body withdrawals into reward accounts and make tracked reward-balance withdrawals rollback-safe in `LedgerDB`
+- [x] Make tracked withdrawals follow the Haskell exact-drain rule once local reward state is loaded
+- [x] Hydrate reward-account balances and stake deposits from ancillary snapshot state during bootstrap/runtime sync
+- [x] Validate stake/vote delegation certificates against tracked stake-key, pool, and DRep registration state
+- [x] Hydrate pool reward accounts and scheduled retirements from ancillary snapshot state, then reap retiring pools rollback-safely at epoch boundaries during immutable replay and forward sync
+- [x] Hydrate treasury/reserves/current-fee/snapshot-fee pots from ancillary snapshot state, accumulate block fees locally, and route unclaimed pool-retirement refunds to treasury
+- [x] Import modern Haskell `SnapShots` / `StakePoolSnapShot` ancillary state as the primary path, retain credential-level active stake in mark/set/go, and handle observed 9-field pool entries compatibly
+- [x] Hydrate current + future pool params from ancillary snapshot state, track them rollback-safely in `LedgerDB`, and activate staged pool re-registration params at epoch processing
+- [x] Credit delegator reward accounts as well as pool reward accounts from `go`-snapshot stake during epoch reward distribution (current simplified reward model)
+- [ ] Maintain full reward-account and deposit state across epoch reward/stake updates during long-running sync
 
 ### 7.3 Full Integration
 - [x] Shelley genesis config parsing (real mainnet genesis verified)

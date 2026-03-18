@@ -889,6 +889,7 @@ test "script_context: TxInfo.fromTxBody helper" {
         .outputs = &outputs,
         .certificates = &[_]transaction.Certificate{},
         .fee = 180_000,
+        .withdrawals = &[_]transaction.Withdrawal{},
         .withdrawal_total = 0,
         .ttl = 50_000_000,
         .validity_start = 49_000_000,

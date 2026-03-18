@@ -6,6 +6,7 @@ const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
 const block_mod = @import("../ledger/block.zig");
 const ledger_apply = @import("../ledger/apply.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
+const rewards_mod = @import("../ledger/rewards.zig");
 const rules = @import("../ledger/rules.zig");
 const ImmutableDB = @import("immutable.zig").ImmutableDB;
 const VolatileDB = @import("volatile.zig").VolatileDB;
@@ -37,7 +38,7 @@ pub const ChainDB = struct {
     const CurrentChainEntry = struct {
         point: Point,
         block_no: BlockNo,
-        txs_applied: u32,
+        ledger_diffs_applied: u32,
         governance_snapshot: ?protocol_update.GovernanceSnapshot,
     };
 
@@ -223,7 +224,7 @@ pub const ChainDB = struct {
             );
         }
 
-        var txs_applied: u32 = 0;
+        var ledger_diffs_applied: u32 = 0;
         var apply_result: ?ledger_apply.ApplyResult = null;
         defer {
             if (apply_result) |*result| result.deinit(self.allocator);
@@ -240,6 +241,7 @@ pub const ChainDB = struct {
                 return .invalid;
             }
 
+            ledger_diffs_applied = try self.applyEpochBoundaryEffects(slot, hash);
             apply_result = ledger_apply.applyBlock(
                 self.allocator,
                 &self.ledger,
@@ -248,6 +250,9 @@ pub const ChainDB = struct {
             ) catch |err| {
                 if (!builtin.is_test) {
                     std.debug.print("ChainDB validation apply failed for block {}: {}\n", .{ block_no, err });
+                }
+                if (ledger_diffs_applied > 0) {
+                    try self.ledger.rollback(ledger_diffs_applied);
                 }
                 if (governance_snapshot) |*snapshot| {
                     try self.governance_state.restoreSnapshot(self.allocator, snapshot);
@@ -264,8 +269,9 @@ pub const ChainDB = struct {
                         apply_result.?.txs_applied,
                     });
                 }
-                if (apply_result.?.txs_applied > 0) {
-                    try self.ledger.rollback(apply_result.?.txs_applied);
+                ledger_diffs_applied += apply_result.?.txs_applied;
+                if (ledger_diffs_applied > 0) {
+                    try self.ledger.rollback(ledger_diffs_applied);
                 }
                 if (governance_snapshot) |*snapshot| {
                     try self.governance_state.restoreSnapshot(self.allocator, snapshot);
@@ -273,8 +279,17 @@ pub const ChainDB = struct {
                 }
                 return .invalid;
             }
+            // Parse-skipped txs are our limitation (unsupported CBOR features),
+            // not invalid blocks. Log but don't reject.
+            if (apply_result.?.txs_skipped > 0 and !builtin.is_test) {
+                std.debug.print("ChainDB block {}: {} txs skipped (parse limitation), {} applied\n", .{
+                    block_no,
+                    apply_result.?.txs_skipped,
+                    apply_result.?.txs_applied,
+                });
+            }
 
-            txs_applied = apply_result.?.txs_applied;
+            ledger_diffs_applied += apply_result.?.txs_applied;
         }
 
         if (self.shelley_governance_config) |*config| {
@@ -291,8 +306,8 @@ pub const ChainDB = struct {
                         if (!builtin.is_test) {
                             std.debug.print("ChainDB governance rejected block {}: {}\n", .{ block_no, err });
                         }
-                        if (txs_applied > 0) {
-                            try self.ledger.rollback(txs_applied);
+                        if (ledger_diffs_applied > 0) {
+                            try self.ledger.rollback(ledger_diffs_applied);
                         }
                         if (governance_snapshot) |*snapshot| {
                             try self.governance_state.restoreSnapshot(self.allocator, snapshot);
@@ -304,6 +319,15 @@ pub const ChainDB = struct {
             }
         }
 
+        if (self.ledger_validation_enabled) {
+            if (apply_result) |*result| {
+                if (try self.ledger.buildFeePotDiff(self.allocator, slot, hash, result.total_fees)) |diff| {
+                    try self.ledger.applyDiff(diff);
+                    ledger_diffs_applied += 1;
+                }
+            }
+        }
+
         try self.@"volatile".putBlock(hash, block_data, slot, block_no, prev_hash);
         self.tip_slot = slot;
         self.tip_hash = hash;
@@ -311,7 +335,7 @@ pub const ChainDB = struct {
         try self.current_chain.append(self.allocator, .{
             .point = .{ .slot = slot, .hash = hash },
             .block_no = block_no,
-            .txs_applied = txs_applied,
+            .ledger_diffs_applied = ledger_diffs_applied,
             .governance_snapshot = governance_snapshot,
         });
         governance_snapshot = null;
@@ -373,8 +397,8 @@ pub const ChainDB = struct {
             }
 
             const removed = self.current_chain.pop().?;
-            if (self.ledger_validation_enabled and removed.txs_applied > 0) {
-                try self.ledger.rollback(removed.txs_applied);
+            if (self.ledger_validation_enabled and removed.ledger_diffs_applied > 0) {
+                try self.ledger.rollback(removed.ledger_diffs_applied);
             }
             var mutable_removed = removed;
             if (mutable_removed.governance_snapshot) |*snapshot| {
@@ -419,6 +443,50 @@ pub const ChainDB = struct {
     /// Total blocks across volatile + immutable.
     pub fn totalBlocks(self: *const ChainDB) usize {
         return self.@"volatile".count() + self.immutable.blockCount();
+    }
+
+    fn applyEpochBoundaryEffects(
+        self: *ChainDB,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+    ) !u32 {
+        const config = self.shelley_governance_config orelse return 0;
+
+        const current_epoch = types.slotToEpoch(self.tip_slot, config.epoch_length);
+        const target_epoch = types.slotToEpoch(slot, config.epoch_length);
+        if (target_epoch <= current_epoch) return 0;
+
+        var applied: u32 = 0;
+        var epoch = current_epoch + 1;
+        while (epoch <= target_epoch) : (epoch += 1) {
+            // 1. Distribute rewards from the "go" snapshot
+            if (try self.ledger.buildEpochRewardDiff(
+                self.allocator,
+                slot,
+                block_hash,
+                rewards_mod.RewardParams.mainnet_defaults,
+            )) |diff| {
+                try self.ledger.applyDiff(diff);
+                applied += 1;
+            }
+
+            // 2. Rotate stake snapshots: go ← set ← mark ← new
+            self.ledger.rotateStakeSnapshots(epoch);
+
+            // 3. Roll the fee pot into the next snapshot epoch
+            if (try self.ledger.buildEpochFeeRolloverDiff(self.allocator, slot, block_hash)) |diff| {
+                try self.ledger.applyDiff(diff);
+                applied += 1;
+            }
+
+            // 4. Reap retiring pools
+            if (try self.ledger.buildPoolReapDiff(self.allocator, slot, block_hash, epoch)) |diff| {
+                try self.ledger.applyDiff(diff);
+                applied += 1;
+            }
+        }
+
+        return applied;
     }
 };
 
@@ -614,7 +682,198 @@ test "chaindb: ledger validation applies a real block" {
     try std.testing.expectEqual(@as(BlockNo, 1), db.getTip().block_no);
     try std.testing.expectEqual(@as(SlotNo, 42), db.getTip().slot);
     try std.testing.expectEqual(@as(usize, 1), db.current_chain.items.len);
-    try std.testing.expectEqual(@as(u32, 1), db.current_chain.items[0].txs_applied);
+    try std.testing.expectEqual(@as(u32, 2), db.current_chain.items[0].ledger_diffs_applied);
+    try std.testing.expectEqual(@as(types.Coin, 200_000), db.ledger.getFeesBalance());
+}
+
+test "chaindb: epoch boundary reaps retiring pool" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-pool-reap") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-pool-reap") catch {};
+
+    var tx_array_enc = Encoder.init(allocator);
+    defer tx_array_enc.deinit();
+    try tx_array_enc.encodeArrayLen(0);
+    const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
+    defer allocator.free(tx_bodies_raw);
+
+    var header_body_enc = Encoder.init(allocator);
+    defer header_body_enc.deinit();
+    try header_body_enc.encodeArrayLen(10);
+    try header_body_enc.encodeUint(1); // block_no
+    try header_body_enc.encodeUint(100); // slot
+    try header_body_enc.encodeNull(); // prev_hash
+    try header_body_enc.encodeBytes(&([_]u8{0x72} ** 32));
+    try header_body_enc.encodeBytes(&([_]u8{0x73} ** 32));
+    try header_body_enc.encodeArrayLen(0); // vrf result
+    try header_body_enc.encodeUint(tx_bodies_raw.len);
+    try header_body_enc.encodeBytes(&([_]u8{0x74} ** 32)); // body hash placeholder
+    try header_body_enc.encodeArrayLen(0); // opcert placeholder
+    try header_body_enc.encodeArrayLen(2);
+    try header_body_enc.encodeUint(1);
+    try header_body_enc.encodeUint(0);
+    const header_body_raw = try header_body_enc.toOwnedSlice();
+    defer allocator.free(header_body_raw);
+
+    var header_enc = Encoder.init(allocator);
+    defer header_enc.deinit();
+    try header_enc.encodeArrayLen(2);
+    try header_enc.writeRaw(header_body_raw);
+    try header_enc.encodeBytes(&[_]u8{}); // kes signature placeholder
+    const header_raw = try header_enc.toOwnedSlice();
+    defer allocator.free(header_raw);
+
+    var block_enc = Encoder.init(allocator);
+    defer block_enc.deinit();
+    try block_enc.encodeArrayLen(4);
+    try block_enc.writeRaw(header_raw);
+    try block_enc.writeRaw(tx_bodies_raw);
+    try block_enc.encodeArrayLen(0); // witnesses
+    try block_enc.encodeMapLen(0); // auxiliary data
+    const block_data = try block_enc.toOwnedSlice();
+    defer allocator.free(block_data);
+
+    const block = try block_mod.parseBlock(block_data);
+
+    var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-pool-reap", 2160);
+    defer db.close();
+
+    const pool = [_]u8{0x75} ** 28;
+    const delegated_cred = types.Credential{
+        .cred_type = .key_hash,
+        .hash = [_]u8{0x76} ** 28,
+    };
+    const reward_account = types.RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0x77} ** 28,
+        },
+    };
+
+    try db.ledger.importStakeDeposit(reward_account.credential, rules.ProtocolParams.mainnet_defaults.key_deposit);
+    try db.ledger.importPoolDeposit(pool, rules.ProtocolParams.mainnet_defaults.pool_deposit);
+    try db.ledger.importPoolRewardAccount(pool, reward_account);
+    try db.ledger.importPoolRetirement(pool, 1);
+    try db.ledger.importStakePoolDelegation(delegated_cred, pool);
+
+    try db.configureShelleyGovernanceTracking(.{
+        .epoch_length = 100,
+        .stability_window = 10,
+        .update_quorum = 1,
+        .genesis_delegate_hashes = try allocator.alloc(types.Hash28, 0),
+    });
+    try db.enableLedgerValidation();
+
+    const result = try db.addBlock(
+        block.hash(),
+        block_data,
+        block.header.slot,
+        block.header.block_no,
+        block.header.prev_hash,
+    );
+
+    try std.testing.expect(result == .added_to_current_chain);
+    try std.testing.expect(db.ledger.lookupPoolDeposit(pool) == null);
+    try std.testing.expect(db.ledger.lookupPoolRewardAccount(pool) == null);
+    try std.testing.expect(db.ledger.lookupPoolRetirement(pool) == null);
+    try std.testing.expect(db.ledger.lookupStakePoolDelegation(delegated_cred) == null);
+    try std.testing.expectEqual(@as(?types.Coin, rules.ProtocolParams.mainnet_defaults.pool_deposit), db.ledger.lookupRewardBalance(reward_account));
+    try std.testing.expectEqual(@as(u32, 1), db.current_chain.items[0].ledger_diffs_applied);
+}
+
+test "chaindb: epoch boundary sends unclaimed pool refunds to treasury" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-pool-reap-treasury") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-pool-reap-treasury") catch {};
+
+    var tx_array_enc = Encoder.init(allocator);
+    defer tx_array_enc.deinit();
+    try tx_array_enc.encodeArrayLen(0);
+    const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
+    defer allocator.free(tx_bodies_raw);
+
+    var header_body_enc = Encoder.init(allocator);
+    defer header_body_enc.deinit();
+    try header_body_enc.encodeArrayLen(10);
+    try header_body_enc.encodeUint(1);
+    try header_body_enc.encodeUint(100);
+    try header_body_enc.encodeNull();
+    try header_body_enc.encodeBytes(&([_]u8{0x81} ** 32));
+    try header_body_enc.encodeBytes(&([_]u8{0x82} ** 32));
+    try header_body_enc.encodeArrayLen(0);
+    try header_body_enc.encodeUint(tx_bodies_raw.len);
+    try header_body_enc.encodeBytes(&([_]u8{0x83} ** 32));
+    try header_body_enc.encodeArrayLen(0);
+    try header_body_enc.encodeArrayLen(2);
+    try header_body_enc.encodeUint(1);
+    try header_body_enc.encodeUint(0);
+    const header_body_raw = try header_body_enc.toOwnedSlice();
+    defer allocator.free(header_body_raw);
+
+    var header_enc = Encoder.init(allocator);
+    defer header_enc.deinit();
+    try header_enc.encodeArrayLen(2);
+    try header_enc.writeRaw(header_body_raw);
+    try header_enc.encodeBytes(&[_]u8{});
+    const header_raw = try header_enc.toOwnedSlice();
+    defer allocator.free(header_raw);
+
+    var block_enc = Encoder.init(allocator);
+    defer block_enc.deinit();
+    try block_enc.encodeArrayLen(4);
+    try block_enc.writeRaw(header_raw);
+    try block_enc.writeRaw(tx_bodies_raw);
+    try block_enc.encodeArrayLen(0);
+    try block_enc.encodeMapLen(0);
+    const block_data = try block_enc.toOwnedSlice();
+    defer allocator.free(block_data);
+
+    const block = try block_mod.parseBlock(block_data);
+
+    var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-pool-reap-treasury", 2160);
+    defer db.close();
+
+    const pool = [_]u8{0x84} ** 28;
+    const reward_account = types.RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0x85} ** 28,
+        },
+    };
+
+    db.ledger.importTreasuryBalance(7);
+    try db.ledger.importPoolDeposit(pool, rules.ProtocolParams.mainnet_defaults.pool_deposit);
+    try db.ledger.importPoolRewardAccount(pool, reward_account);
+    try db.ledger.importPoolRetirement(pool, 1);
+
+    try db.configureShelleyGovernanceTracking(.{
+        .epoch_length = 100,
+        .stability_window = 10,
+        .update_quorum = 1,
+        .genesis_delegate_hashes = try allocator.alloc(types.Hash28, 0),
+    });
+    try db.enableLedgerValidation();
+
+    const result = try db.addBlock(
+        block.hash(),
+        block_data,
+        block.header.slot,
+        block.header.block_no,
+        block.header.prev_hash,
+    );
+
+    try std.testing.expect(result == .added_to_current_chain);
+    try std.testing.expectEqual(
+        @as(types.Coin, 7 + rules.ProtocolParams.mainnet_defaults.pool_deposit),
+        db.ledger.getTreasuryBalance(),
+    );
+    try std.testing.expect(db.ledger.lookupRewardBalance(reward_account) == null);
 }
 
 test "chaindb: duplicate block returns already_known" {

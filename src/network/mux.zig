@@ -61,12 +61,23 @@ pub const Bearer = struct {
     stream: std.net.Stream,
     leftover: std.ArrayList(u8) = .empty,
     leftover_allocator: ?std.mem.Allocator = null,
+    /// Per-protocol incoming queues so SDUs for non-target protocols are buffered
+    /// instead of silently discarded. Keyed by mini-protocol number.
+    protocol_queues: ?std.AutoHashMap(u15, std.ArrayList(u8)) = null,
 
     pub fn deinit(self: *Bearer) void {
         if (self.leftover_allocator) |allocator| {
             self.leftover.deinit(allocator);
             self.leftover = .empty;
             self.leftover_allocator = null;
+        }
+        if (self.protocol_queues) |*pq| {
+            var it = pq.valueIterator();
+            while (it.next()) |queue| {
+                queue.deinit(pq.allocator);
+            }
+            pq.deinit();
+            self.protocol_queues = null;
         }
         self.stream.close();
     }
@@ -131,8 +142,8 @@ pub const Bearer = struct {
     /// Read a complete protocol message that may span multiple SDUs.
     ///
     /// Following the Haskell mux design (Network/Mux.hs, Network/Mux/Ingress.hs):
-    /// 1. Check leftover buffer from previous call (handles pipelined messages)
-    /// 2. Read SDUs from the bearer and accumulate
+    /// 1. Check per-protocol queue and leftover from previous calls
+    /// 2. Read SDUs from the bearer and accumulate (queue non-target SDUs)
     /// 3. Try to parse a complete CBOR value
     /// 4. If complete, save remaining bytes as leftover, return the message
     /// 5. If incomplete, read more SDUs
@@ -144,21 +155,41 @@ pub const Bearer = struct {
             self.leftover_allocator = allocator;
             self.leftover = .empty;
         }
+        if (self.protocol_queues == null) {
+            self.protocol_queues = std.AutoHashMap(u15, std.ArrayList(u8)).init(allocator);
+        }
 
         var accumulated: std.ArrayList(u8) = .empty;
         defer accumulated.deinit(allocator);
 
-        // Start with any leftover data from the previous call
+        // Start with any queued data for this protocol
+        if (self.protocol_queues.?.getPtr(protocol_num)) |queue| {
+            if (queue.items.len > 0) {
+                try accumulated.appendSlice(allocator, queue.items);
+                queue.clearRetainingCapacity();
+
+                var dec = Decoder.init(accumulated.items);
+                if (dec.sliceOfNextValue()) |complete_msg| {
+                    const result = try allocator.alloc(u8, complete_msg.len);
+                    @memcpy(result, complete_msg);
+                    const remaining = accumulated.items[dec.pos..];
+                    if (remaining.len > 0) {
+                        try queue.appendSlice(allocator, remaining);
+                    }
+                    return result;
+                } else |_| {}
+            }
+        }
+
+        // Then check same-protocol leftover (pipelined messages)
         if (self.leftover.items.len > 0) {
             try accumulated.appendSlice(allocator, self.leftover.items);
             self.leftover.clearRetainingCapacity();
 
-            // Check if leftover already contains a complete message
             var dec = Decoder.init(accumulated.items);
             if (dec.sliceOfNextValue()) |complete_msg| {
                 const result = try allocator.alloc(u8, complete_msg.len);
                 @memcpy(result, complete_msg);
-                // Save remaining bytes as leftover
                 const remaining = accumulated.items[dec.pos..];
                 if (remaining.len > 0) {
                     try self.leftover.appendSlice(allocator, remaining);
@@ -173,8 +204,16 @@ pub const Bearer = struct {
             // Read one SDU from the wire
             const sdu = try self.readSDU(&sdu_buf);
 
-            // Only buffer SDUs for our target protocol (discard others)
-            if (sdu.header.protocol_num != protocol_num) continue;
+            // Queue SDUs for non-target protocols instead of discarding
+            if (sdu.header.protocol_num != protocol_num) {
+                var pq = &self.protocol_queues.?;
+                const gop = try pq.getOrPut(sdu.header.protocol_num);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .empty;
+                }
+                try gop.value_ptr.appendSlice(allocator, sdu.payload);
+                continue;
+            }
 
             try accumulated.appendSlice(allocator, sdu.payload);
 

@@ -10,8 +10,13 @@ pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
 pub const Hash32 = types.Hash32;
 pub const Hash28 = types.Hash28;
+pub const RewardAccount = types.RewardAccount;
 pub const TxProtocolUpdate = protocol_update.TxProtocolUpdate;
 pub const Certificate = cert_mod.Certificate;
+pub const Withdrawal = struct {
+    account: RewardAccount,
+    amount: Coin,
+};
 
 /// A parsed transaction output (simplified for Phase 3).
 pub const TxOut = struct {
@@ -28,6 +33,7 @@ pub const TxBody = struct {
     outputs: []const TxOut,
     certificates: []const Certificate,
     fee: Coin,
+    withdrawals: []const Withdrawal,
     withdrawal_total: Coin,
     ttl: ?u64, // Shelley time-to-live
     validity_start: ?u64, // Allegra+ validity interval start
@@ -96,7 +102,14 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
     const tx_id = Blake2b256.hash(data);
     var dec = Decoder.init(data);
 
-    const map_len = try dec.decodeMapLen() orelse return error.InvalidCbor;
+    const map_len = dec.decodeMapLen() catch |err| {
+        // Handle indefinite-length maps (major type 5, additional 31)
+        if (!@import("builtin").is_test) {
+            const preview_len = @min(data.len, 8);
+            std.debug.print("    tx body map decode failed: {} (head={x})\n", .{ err, data[0..preview_len] });
+        }
+        return err;
+    } orelse return error.InvalidCbor;
 
     var inputs: std.ArrayList(TxIn) = .empty;
     defer inputs.deinit(allocator);
@@ -104,6 +117,8 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
     defer outputs.deinit(allocator);
     var certificates: std.ArrayList(Certificate) = .empty;
     defer certificates.deinit(allocator);
+    var withdrawals: std.ArrayList(Withdrawal) = .empty;
+    defer withdrawals.deinit(allocator);
     var fee: Coin = 0;
     var withdrawal_total: Coin = 0;
     var ttl: ?u64 = null;
@@ -112,7 +127,18 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
 
     var i: u64 = 0;
     while (i < map_len) : (i += 1) {
-        const key = try dec.decodeUint();
+        const key = dec.decodeUint() catch |err| {
+            // Conway-era tx bodies may have keys we can't parse as uint;
+            // skip the key-value pair entirely
+            if (!@import("builtin").is_test) {
+                const pos = dec.pos;
+                const preview_len = @min(data.len - pos, 8);
+                std.debug.print("    tx body key {}/{} decode failed at pos {}: {} (next={x})\n", .{ i, map_len, pos, err, data[pos..][0..preview_len] });
+            }
+            try dec.skipValue(); // skip the key
+            try dec.skipValue(); // skip the value
+            continue;
+        };
 
         switch (key) {
             0 => {
@@ -163,7 +189,15 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
                 ttl = try dec.decodeUint();
             },
             4 => {
-                const num_certs = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                const cert_container = try dec.peekMajorType();
+                var num_certs: u64 = 0;
+                if (cert_container == 6) {
+                    // Tagged set (#6.258) — Conway certificates may be in a set
+                    _ = try dec.decodeTag();
+                    num_certs = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                } else {
+                    num_certs = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                }
                 var j: u64 = 0;
                 while (j < num_certs) : (j += 1) {
                     var cert_dec = Decoder.init(try dec.sliceOfNextValue());
@@ -175,13 +209,29 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
                 if (withdrawals_len) |count| {
                     var j: u64 = 0;
                     while (j < count) : (j += 1) {
-                        try dec.skipValue();
-                        withdrawal_total += try dec.decodeUint();
+                        const reward_bytes = try dec.decodeBytes();
+                        if (reward_bytes.len != 29) return error.InvalidCbor;
+                        var reward_raw: [29]u8 = undefined;
+                        @memcpy(&reward_raw, reward_bytes);
+                        const amount = try dec.decodeUint();
+                        withdrawal_total += amount;
+                        try withdrawals.append(allocator, .{
+                            .account = try RewardAccount.fromBytes(reward_raw),
+                            .amount = amount,
+                        });
                     }
                 } else {
                     while (!dec.isBreak()) {
-                        try dec.skipValue();
-                        withdrawal_total += try dec.decodeUint();
+                        const reward_bytes = try dec.decodeBytes();
+                        if (reward_bytes.len != 29) return error.InvalidCbor;
+                        var reward_raw: [29]u8 = undefined;
+                        @memcpy(&reward_raw, reward_bytes);
+                        const amount = try dec.decodeUint();
+                        withdrawal_total += amount;
+                        try withdrawals.append(allocator, .{
+                            .account = try RewardAccount.fromBytes(reward_raw),
+                            .amount = amount,
+                        });
                     }
                     try dec.decodeBreak();
                 }
@@ -206,6 +256,7 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
         .outputs = try outputs.toOwnedSlice(allocator),
         .certificates = try certificates.toOwnedSlice(allocator),
         .fee = fee,
+        .withdrawals = try withdrawals.toOwnedSlice(allocator),
         .withdrawal_total = withdrawal_total,
         .ttl = ttl,
         .validity_start = validity_start,
@@ -265,6 +316,7 @@ pub fn parseByronTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody 
         .outputs = try outputs.toOwnedSlice(allocator),
         .certificates = try allocator.alloc(Certificate, 0),
         .fee = 0,
+        .withdrawals = try allocator.alloc(Withdrawal, 0),
         .withdrawal_total = 0,
         .ttl = null,
         .validity_start = null,
@@ -347,6 +399,7 @@ pub fn freeTxBody(allocator: std.mem.Allocator, body: *TxBody) void {
     allocator.free(body.inputs);
     allocator.free(body.outputs);
     allocator.free(body.certificates);
+    allocator.free(body.withdrawals);
 }
 
 // ──────────────────────────────────── Tests ────────────────────────────────────
@@ -398,6 +451,53 @@ test "transaction: parse Alonzo golden tx body" {
         0x45, 0x0f, 0x19, 0xd0, 0x67, 0x23, 0x20, 0x0a,
     };
     try std.testing.expectEqualSlices(u8, &expected_txid, &tx.tx_id);
+}
+
+test "transaction: parse withdrawals into reward accounts" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+
+    const reward = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0xab} ** 28,
+        },
+    };
+    const reward_bytes = reward.toBytes();
+
+    var enc = Encoder.init(allocator);
+    defer enc.deinit();
+
+    try enc.encodeMapLen(4);
+    try enc.encodeUint(0);
+    try enc.encodeArrayLen(1);
+    try enc.encodeArrayLen(2);
+    try enc.encodeBytes(&([_]u8{0x11} ** 32));
+    try enc.encodeUint(0);
+    try enc.encodeUint(1);
+    try enc.encodeArrayLen(1);
+    try enc.encodeArrayLen(2);
+    try enc.encodeBytes(&([_]u8{0x61} ++ [_]u8{0xcd} ** 28));
+    try enc.encodeUint(1_844_619);
+    try enc.encodeUint(2);
+    try enc.encodeUint(200_000);
+    try enc.encodeUint(5);
+    try enc.encodeMapLen(1);
+    try enc.encodeBytes(&reward_bytes);
+    try enc.encodeUint(3_333_333);
+
+    var tx = try parseTxBody(allocator, enc.getWritten());
+    defer freeTxBody(allocator, &tx);
+
+    try std.testing.expectEqual(@as(usize, 1), tx.withdrawals.len);
+    try std.testing.expectEqual(@as(Coin, 3_333_333), tx.withdrawals[0].amount);
+    try std.testing.expectEqual(@as(Coin, 3_333_333), tx.withdrawal_total);
+    try std.testing.expectEqual(reward.network, tx.withdrawals[0].account.network);
+    try std.testing.expect(types.Credential.eql(
+        reward.credential,
+        tx.withdrawals[0].account.credential,
+    ));
 }
 
 test "transaction: golden Alonzo tx fields match Python analysis" {

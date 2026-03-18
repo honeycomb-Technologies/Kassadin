@@ -3,8 +3,11 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Decoder = @import("../cbor/decoder.zig").Decoder;
 const block_mod = @import("../ledger/block.zig");
+const certificates = @import("../ledger/certificates.zig");
 const ledger_apply = @import("../ledger/apply.zig");
+const rewards_mod = @import("../ledger/rewards.zig");
 const rules = @import("../ledger/rules.zig");
+const stake_mod = @import("../ledger/stake.zig");
 const runtime_control = @import("runtime_control.zig");
 const types = @import("../types.zig");
 const LedgerDB = @import("../storage/ledger.zig").LedgerDB;
@@ -12,6 +15,13 @@ const LedgerDB = @import("../storage/ledger.zig").LedgerDB;
 pub const SlotNo = types.SlotNo;
 pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
+pub const Network = types.Network;
+pub const Credential = types.Credential;
+pub const CredentialType = types.CredentialType;
+pub const RewardAccount = types.RewardAccount;
+pub const DRep = certificates.DRep;
+
+const zero_margin = types.UnitInterval{ .numerator = 0, .denominator = 1 };
 
 pub const LocalLedgerSnapshot = struct {
     slot: SlotNo,
@@ -25,6 +35,11 @@ pub const LocalLedgerSnapshot = struct {
 pub const LoadSnapshotResult = struct {
     slot: SlotNo,
     utxos_loaded: u64,
+    reward_accounts_loaded: u64,
+    stake_deposits_loaded: u64,
+    stake_snapshot_mark_pools_loaded: u64,
+    stake_snapshot_set_pools_loaded: u64,
+    stake_snapshot_go_pools_loaded: u64,
 };
 
 pub const ReplayResult = struct {
@@ -72,7 +87,10 @@ pub fn loadSnapshotIntoLedger(
     allocator: Allocator,
     ledger: *LedgerDB,
     snapshot: LocalLedgerSnapshot,
+    network: Network,
 ) !LoadSnapshotResult {
+    ledger.setRewardAccountNetwork(network);
+
     const meta_path = try std.fmt.allocPrint(allocator, "{s}/meta", .{snapshot.path});
     defer allocator.free(meta_path);
     try validateSnapshotMetadata(allocator, meta_path);
@@ -145,10 +163,28 @@ pub fn loadSnapshotIntoLedger(
         }
     }
 
+    var state_import = SnapshotAccountImport{
+        .reward_accounts_loaded = 0,
+        .stake_deposits_loaded = 0,
+        .stake_snapshot_mark_pools_loaded = 0,
+        .stake_snapshot_set_pools_loaded = 0,
+        .stake_snapshot_go_pools_loaded = 0,
+    };
+    const state_path = try std.fmt.allocPrint(allocator, "{s}/state", .{snapshot.path});
+    defer allocator.free(state_path);
+    if (fileExists(state_path)) {
+        state_import = try importSnapshotAccountState(allocator, ledger, state_path, network);
+    }
+
     ledger.setTipSlot(snapshot.slot);
     return .{
         .slot = snapshot.slot,
         .utxos_loaded = loaded,
+        .reward_accounts_loaded = state_import.reward_accounts_loaded,
+        .stake_deposits_loaded = state_import.stake_deposits_loaded,
+        .stake_snapshot_mark_pools_loaded = state_import.stake_snapshot_mark_pools_loaded,
+        .stake_snapshot_set_pools_loaded = state_import.stake_snapshot_set_pools_loaded,
+        .stake_snapshot_go_pools_loaded = state_import.stake_snapshot_go_pools_loaded,
     };
 }
 
@@ -158,6 +194,7 @@ pub fn replayImmutableFromSlot(
     immutable_path: []const u8,
     from_slot: SlotNo,
     pp: rules.ProtocolParams,
+    epoch_length: ?u64,
 ) !ReplayResult {
     var result = ReplayResult{
         .blocks_replayed = 0,
@@ -171,6 +208,7 @@ pub fn replayImmutableFromSlot(
 
     result.start_chunk = try findReplayStartChunk(allocator, immutable_path, total_chunks, from_slot);
 
+    var last_slot = from_slot;
     var chunk_num = result.start_chunk;
     while (chunk_num < total_chunks) : (chunk_num += 1) {
         if (runtime_control.stopRequested()) return error.Interrupted;
@@ -191,6 +229,24 @@ pub fn replayImmutableFromSlot(
             if (block.era == .byron) continue;
             if (block.header.slot <= from_slot) continue;
 
+            var ledger_diffs_applied: u32 = 0;
+            if (epoch_length) |slots_per_epoch| {
+                const current_epoch = types.slotToEpoch(last_slot, slots_per_epoch);
+                const target_epoch = types.slotToEpoch(block.header.slot, slots_per_epoch);
+                if (target_epoch > current_epoch) {
+                    var epoch = current_epoch + 1;
+                    while (epoch <= target_epoch) : (epoch += 1) {
+                        ledger_diffs_applied += try applyReplayEpochBoundaryEffects(
+                            allocator,
+                            ledger,
+                            block.header.slot,
+                            block.hash(),
+                            epoch,
+                        );
+                    }
+                }
+            }
+
             var apply_result = try ledger_apply.applyBlock(
                 allocator,
                 ledger,
@@ -200,20 +256,66 @@ pub fn replayImmutableFromSlot(
             defer apply_result.deinit(allocator);
 
             if (apply_result.txs_failed > 0) {
-                if (apply_result.txs_applied > 0) {
-                    try ledger.rollback(apply_result.txs_applied);
+                ledger_diffs_applied += apply_result.txs_applied;
+                if (ledger_diffs_applied > 0) {
+                    try ledger.rollback(ledger_diffs_applied);
                 }
                 return error.InvalidImmutableReplay;
+            }
+
+            if (try ledger.buildFeePotDiff(
+                allocator,
+                block.header.slot,
+                block.hash(),
+                apply_result.total_fees,
+            )) |diff| {
+                try ledger.applyDiff(diff);
+                ledger_diffs_applied += 1;
             }
 
             result.blocks_replayed += 1;
             result.txs_applied += apply_result.txs_applied;
             result.txs_failed += apply_result.txs_failed;
             ledger.setTipSlot(block.header.slot);
+            last_slot = block.header.slot;
         }
     }
 
     return result;
+}
+
+fn applyReplayEpochBoundaryEffects(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    slot: SlotNo,
+    block_hash: types.HeaderHash,
+    epoch: types.EpochNo,
+) !u32 {
+    var applied: u32 = 0;
+
+    if (try ledger.buildEpochRewardDiff(
+        allocator,
+        slot,
+        block_hash,
+        rewards_mod.RewardParams.mainnet_defaults,
+    )) |diff| {
+        try ledger.applyDiff(diff);
+        applied += 1;
+    }
+
+    ledger.rotateStakeSnapshots(epoch);
+
+    if (try ledger.buildEpochFeeRolloverDiff(allocator, slot, block_hash)) |diff| {
+        try ledger.applyDiff(diff);
+        applied += 1;
+    }
+
+    if (try ledger.buildPoolReapDiff(allocator, slot, block_hash, epoch)) |diff| {
+        try ledger.applyDiff(diff);
+        applied += 1;
+    }
+
+    return applied;
 }
 
 fn fileExists(path: []const u8) bool {
@@ -228,6 +330,1011 @@ fn validateSnapshotMetadata(allocator: Allocator, path: []const u8) !void {
     if (std.mem.indexOf(u8, meta, "\"backend\":\"utxohd-mem\"") == null) {
         return error.UnsupportedSnapshotBackend;
     }
+}
+
+const SnapshotAccountImport = struct {
+    reward_accounts_loaded: u64,
+    stake_deposits_loaded: u64,
+    stake_snapshot_mark_pools_loaded: u64,
+    stake_snapshot_set_pools_loaded: u64,
+    stake_snapshot_go_pools_loaded: u64,
+};
+
+fn importSnapshotAccountState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    state_path: []const u8,
+    network: Network,
+) !SnapshotAccountImport {
+    const state_data = try std.fs.cwd().readFileAlloc(allocator, state_path, 128 * 1024 * 1024);
+    defer allocator.free(state_data);
+
+    var dec = Decoder.init(state_data);
+
+    const top_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (top_len != 2) {
+        std.debug.print("Snapshot state: unexpected top-level len {}\n", .{top_len});
+        return error.InvalidSnapshotState;
+    }
+    const encoding_version = try dec.decodeUint();
+    if (encoding_version != 1) {
+        std.debug.print("Snapshot state: unsupported encoding version {}\n", .{encoding_version});
+        return error.UnsupportedSnapshotEncodingVersion;
+    }
+
+    const ext_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (ext_len != 2) {
+        std.debug.print("Snapshot state: unexpected extension len {}\n", .{ext_len});
+        return error.InvalidSnapshotState;
+    }
+
+    const active_era = try parseCardanoLedgerState(allocator, ledger, network, &dec);
+    _ = active_era;
+    try dec.skipValue(); // headerState
+
+    ledger.setRewardBalancesTracked(true);
+    return parse_import_result;
+}
+
+var parse_import_result: SnapshotAccountImport = .{
+    .reward_accounts_loaded = 0,
+    .stake_deposits_loaded = 0,
+    .stake_snapshot_mark_pools_loaded = 0,
+    .stake_snapshot_set_pools_loaded = 0,
+    .stake_snapshot_go_pools_loaded = 0,
+};
+
+fn parseCardanoLedgerState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    dec: *Decoder,
+) !u8 {
+    parse_import_result = .{
+        .reward_accounts_loaded = 0,
+        .stake_deposits_loaded = 0,
+        .stake_snapshot_mark_pools_loaded = 0,
+        .stake_snapshot_set_pools_loaded = 0,
+        .stake_snapshot_go_pools_loaded = 0,
+    };
+
+    const telescope_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (telescope_len == 0 or telescope_len > 8) {
+        std.debug.print("Snapshot state: unexpected telescope len {}\n", .{telescope_len});
+        return error.InvalidSnapshotState;
+    }
+
+    var i: u64 = 1;
+    while (i < telescope_len) : (i += 1) {
+        try dec.skipValue();
+    }
+
+    const active_era: u8 = @intCast(telescope_len - 1);
+    const current_era_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (current_era_len != 2) {
+        std.debug.print("Snapshot state: unexpected current-era len {} for era {}\n", .{ current_era_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+
+    try dec.skipValue(); // current-era bound
+
+    if (active_era == 0) {
+        try dec.skipValue(); // Byron ledger state
+        return active_era;
+    }
+
+    try parseVersionedShelleyLedgerState(allocator, ledger, network, active_era, dec);
+    return active_era;
+}
+
+fn parseVersionedShelleyLedgerState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const versioned_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (versioned_len != 2) {
+        std.debug.print("Snapshot state: unexpected versioned ledger len {} for era {}\n", .{ versioned_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+    const ledger_version = try dec.decodeUint();
+    if (ledger_version != 2) {
+        std.debug.print("Snapshot state: unsupported ledger version {} for era {}\n", .{ ledger_version, active_era });
+        return error.UnsupportedSnapshotLedgerVersion;
+    }
+
+    const shelley_state_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (shelley_state_len != 3 and shelley_state_len != 4) {
+        std.debug.print("Snapshot state: unexpected Shelley state len {} for era {}\n", .{ shelley_state_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+
+    try dec.skipValue(); // tip
+    try parseNewEpochState(allocator, ledger, network, active_era, dec);
+    try dec.skipValue(); // shelleyTransition
+    if (shelley_state_len == 4) {
+        try dec.skipValue(); // latestPerasCertRound
+    }
+}
+
+fn parseNewEpochState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const new_epoch_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (new_epoch_len != 7) {
+        std.debug.print("Snapshot state: unexpected NewEpochState len {} for era {}\n", .{ new_epoch_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+
+    try dec.skipValue(); // nesEL
+    try dec.skipValue(); // nesBprev
+    try dec.skipValue(); // nesBcur
+    try parseEpochState(allocator, ledger, network, active_era, dec);
+    try dec.skipValue(); // nesRu
+    try dec.skipValue(); // nesPd
+    try dec.skipValue(); // stashedAVVMAddresses
+}
+
+fn parseEpochState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const epoch_state_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (epoch_state_len != 4) {
+        std.debug.print("Snapshot state: unexpected EpochState len {} for era {}\n", .{ epoch_state_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+
+    try parseChainAccountState(ledger, dec);
+    try parseEraLedgerState(allocator, ledger, network, active_era, dec);
+    try parseSnapShots(ledger, dec);
+    try dec.skipValue(); // nonMyopic
+}
+
+fn parseEraLedgerState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const ledger_state_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (ledger_state_len != 2) {
+        std.debug.print("Snapshot state: unexpected LedgerState len {} for era {}\n", .{ ledger_state_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+
+    try parseCertState(allocator, ledger, network, active_era, dec);
+    try parseUtxoState(ledger, active_era, dec);
+}
+
+fn parseChainAccountState(
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const account_state_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (account_state_len != 2) {
+        std.debug.print("Snapshot state: unexpected ChainAccountState len {}\n", .{account_state_len});
+        return error.InvalidSnapshotState;
+    }
+
+    ledger.importTreasuryBalance(try dec.decodeUint());
+    ledger.importReservesBalance(try dec.decodeUint());
+}
+
+fn parseUtxoState(
+    ledger: *LedgerDB,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const utxo_state_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (utxo_state_len != 6) {
+        std.debug.print("Snapshot state: unexpected UTxOState len {} for era {}\n", .{ utxo_state_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+
+    try dec.skipValue(); // utxosUtxo
+    try dec.skipValue(); // utxosDeposited
+    ledger.importFeesBalance(try dec.decodeUint());
+
+    var i: u64 = 3;
+    while (i < 6) : (i += 1) {
+        try dec.skipValue();
+    }
+}
+
+fn parseSnapShots(
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const snapshots_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (snapshots_len != 4) {
+        std.debug.print("Snapshot state: unexpected SnapShots len {}\n", .{snapshots_len});
+        return error.InvalidSnapshotState;
+    }
+
+    var snapshots = stake_mod.StakeSnapshots.init(ledger.allocator);
+    errdefer snapshots.deinit();
+
+    snapshots.mark = try parseStakeSnapshot(ledger.allocator, dec, 0);
+    snapshots.set = try parseStakeSnapshot(ledger.allocator, dec, 0);
+    snapshots.go = try parseStakeSnapshot(ledger.allocator, dec, 0);
+    ledger.importSnapshotFees(try dec.decodeUint());
+    ledger.replaceStakeSnapshots(snapshots);
+
+    parse_import_result.stake_snapshot_mark_pools_loaded = if (ledger.getStakeSnapshots().mark) |dist| dist.poolCount() else 0;
+    parse_import_result.stake_snapshot_set_pools_loaded = if (ledger.getStakeSnapshots().set) |dist| dist.poolCount() else 0;
+    parse_import_result.stake_snapshot_go_pools_loaded = if (ledger.getStakeSnapshots().go) |dist| dist.poolCount() else 0;
+}
+
+fn parseStakeSnapshot(
+    allocator: Allocator,
+    dec: *Decoder,
+    epoch: types.EpochNo,
+) !?stake_mod.StakeDistribution {
+    const snapshot_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (snapshot_len != 2 and snapshot_len != 3) {
+        std.debug.print("Snapshot state: unexpected SnapShot len {}\n", .{snapshot_len});
+        return error.InvalidSnapshotState;
+    }
+
+    var distribution = stake_mod.StakeDistribution.init(allocator, epoch);
+    errdefer distribution.deinit();
+
+    var active_stake_by_pool = std.AutoHashMap(types.KeyHash, Coin).init(allocator);
+    defer active_stake_by_pool.deinit();
+
+    if (snapshot_len == 2) {
+        try parseActiveStakeByPool(&distribution, &active_stake_by_pool, dec);
+    } else {
+        try parseLegacyActiveStakeByPool(allocator, &distribution, &active_stake_by_pool, dec);
+    }
+
+    try parseStakePoolSnapshotMap(&distribution, &active_stake_by_pool, dec);
+    distribution.finalize();
+    return distribution;
+}
+
+fn parseStakePoolSnapshotMap(
+    distribution: *stake_mod.StakeDistribution,
+    active_stake_by_pool: *const std.AutoHashMap(types.KeyHash, Coin),
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importStakePoolSnapshotEntry(distribution, active_stake_by_pool, dec);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importStakePoolSnapshotEntry(distribution, active_stake_by_pool, dec);
+        }
+        try dec.decodeBreak();
+    }
+}
+
+fn importStakePoolSnapshotEntry(
+    distribution: *stake_mod.StakeDistribution,
+    active_stake_by_pool: *const std.AutoHashMap(types.KeyHash, Coin),
+    dec: *Decoder,
+) !void {
+    const pool_bytes = try dec.decodeBytes();
+    if (pool_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected stake-snapshot pool hash len {}\n", .{pool_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var pool: types.KeyHash = undefined;
+    @memcpy(&pool, pool_bytes);
+
+    const pool_snapshot_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+
+    var active_stake: Coin = 0;
+    var pledge: Coin = 0;
+    var cost: Coin = 0;
+    var margin = zero_margin;
+    var reward_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0} ** 28 },
+    };
+
+    if (pool_snapshot_len == 9) {
+        // Legacy StakePoolParams-shaped snapshot entries:
+        // [poolId, vrf, pledge, cost, margin, rewardAcct, owners, relays, metadata]
+        try dec.skipValue(); // poolId (redundant with map key)
+        try dec.skipValue(); // vrf
+        pledge = try dec.decodeUint();
+        cost = try dec.decodeUint();
+        margin = try parseUnitInterval(dec);
+        const reward_bytes = try dec.decodeBytes();
+        if (reward_bytes.len != 29) return error.InvalidSnapshotState;
+        var reward_raw: [29]u8 = undefined;
+        @memcpy(&reward_raw, reward_bytes);
+        reward_account = try RewardAccount.fromBytes(reward_raw);
+        try dec.skipValue(); // owners
+        try dec.skipValue(); // relays
+        try dec.skipValue(); // metadata
+        active_stake = active_stake_by_pool.get(pool) orelse 0;
+    } else if (pool_snapshot_len == 10) {
+        // New StakePoolSnapShot format:
+        // [stake, stakeRatio, selfDelegOwners, selfDelegOwnerStake, vrf, pledge, cost, margin, numDelegators, accountId]
+        active_stake = try dec.decodeUint(); // spssStake
+        try dec.skipValue(); // spssStakeRatio
+        try dec.skipValue(); // spssSelfDelegatedOwners
+        try dec.skipValue(); // spssSelfDelegatedOwnersStake
+        try dec.skipValue(); // spssVrf
+        pledge = try dec.decodeUint(); // spssPledge
+        cost = try dec.decodeUint(); // spssCost
+        margin = try parseUnitInterval(dec); // spssMargin
+        try dec.skipValue(); // spssNumDelegators
+        const reward_bytes = try dec.decodeBytes(); // spssAccountId
+        if (reward_bytes.len != 29) return error.InvalidSnapshotState;
+        var reward_raw: [29]u8 = undefined;
+        @memcpy(&reward_raw, reward_bytes);
+        reward_account = try RewardAccount.fromBytes(reward_raw);
+    } else {
+        std.debug.print("Snapshot state: unexpected StakePoolSnapShot len {}\n", .{pool_snapshot_len});
+        return error.InvalidSnapshotState;
+    }
+
+    try distribution.setPoolStake(pool, active_stake, pledge, cost, margin, reward_account);
+}
+
+fn parseUnitInterval(dec: *Decoder) !types.UnitInterval {
+    const raw = try dec.sliceOfNextValue();
+    var inner = Decoder.init(raw);
+
+    if (raw.len > 0 and (raw[0] & 0xe0) == 0xc0) {
+        const tag = try inner.decodeTag();
+        if (tag != 30) return error.InvalidSnapshotState;
+    }
+
+    const len = (try inner.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (len != 2) return error.InvalidSnapshotState;
+
+    const numerator = try inner.decodeUint();
+    const denominator = try inner.decodeUint();
+    const interval = types.UnitInterval{
+        .numerator = numerator,
+        .denominator = denominator,
+    };
+    if (!interval.isValid()) return error.InvalidSnapshotState;
+    return interval;
+}
+
+fn parseActiveStakeByPool(
+    distribution: *stake_mod.StakeDistribution,
+    active_stake_by_pool: *std.AutoHashMap(types.KeyHash, Coin),
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            const credential = try parseCredential(dec);
+            try importActiveStakeEntry(distribution, active_stake_by_pool, credential, dec);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            const credential = try parseCredential(dec);
+            try importActiveStakeEntry(distribution, active_stake_by_pool, credential, dec);
+        }
+        try dec.decodeBreak();
+    }
+}
+
+fn importActiveStakeEntry(
+    distribution: *stake_mod.StakeDistribution,
+    active_stake_by_pool: *std.AutoHashMap(types.KeyHash, Coin),
+    credential: Credential,
+    dec: *Decoder,
+) !void {
+    const swd_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (swd_len != 2) {
+        std.debug.print("Snapshot state: unexpected StakeWithDelegation len {}\n", .{swd_len});
+        return error.InvalidSnapshotState;
+    }
+
+    const stake = try dec.decodeUint();
+    const pool_bytes = try dec.decodeBytes();
+    if (pool_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected active-stake pool hash len {}\n", .{pool_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var pool: types.KeyHash = undefined;
+    @memcpy(&pool, pool_bytes);
+
+    try distribution.setDelegatedStake(credential, pool, stake);
+    try appendPoolStake(active_stake_by_pool, pool, stake);
+}
+
+fn parseLegacyActiveStakeByPool(
+    allocator: Allocator,
+    distribution: *stake_mod.StakeDistribution,
+    active_stake_by_pool: *std.AutoHashMap(types.KeyHash, Coin),
+    dec: *Decoder,
+) !void {
+    var legacy_stake = std.AutoHashMap(Credential, Coin).init(allocator);
+    defer legacy_stake.deinit();
+
+    try parseLegacyStakeMap(&legacy_stake, dec);
+    try parseLegacyDelegations(&legacy_stake, distribution, active_stake_by_pool, dec);
+}
+
+fn parseLegacyStakeMap(
+    legacy_stake: *std.AutoHashMap(Credential, Coin),
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            const credential = try parseCredential(dec);
+            const stake = try dec.decodeUint();
+            try legacy_stake.put(credential, stake);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            const credential = try parseCredential(dec);
+            const stake = try dec.decodeUint();
+            try legacy_stake.put(credential, stake);
+        }
+        try dec.decodeBreak();
+    }
+}
+
+fn parseLegacyDelegations(
+    legacy_stake: *const std.AutoHashMap(Credential, Coin),
+    distribution: *stake_mod.StakeDistribution,
+    active_stake_by_pool: *std.AutoHashMap(types.KeyHash, Coin),
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importLegacyDelegationEntry(legacy_stake, distribution, active_stake_by_pool, dec);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importLegacyDelegationEntry(legacy_stake, distribution, active_stake_by_pool, dec);
+        }
+        try dec.decodeBreak();
+    }
+}
+
+fn importLegacyDelegationEntry(
+    legacy_stake: *const std.AutoHashMap(Credential, Coin),
+    distribution: *stake_mod.StakeDistribution,
+    active_stake_by_pool: *std.AutoHashMap(types.KeyHash, Coin),
+    dec: *Decoder,
+) !void {
+    const credential = try parseCredential(dec);
+    const pool_bytes = try dec.decodeBytes();
+    if (pool_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected legacy delegation pool hash len {}\n", .{pool_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var pool: types.KeyHash = undefined;
+    @memcpy(&pool, pool_bytes);
+
+    const stake = legacy_stake.get(credential) orelse return;
+    try distribution.setDelegatedStake(credential, pool, stake);
+    try appendPoolStake(active_stake_by_pool, pool, stake);
+}
+
+fn appendPoolStake(
+    active_stake_by_pool: *std.AutoHashMap(types.KeyHash, Coin),
+    pool: types.KeyHash,
+    added: Coin,
+) !void {
+    const gop = try active_stake_by_pool.getOrPut(pool);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = 0;
+    }
+    gop.value_ptr.* += added;
+}
+
+fn parseCertState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const cert_state_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (active_era >= 6) {
+        if (cert_state_len != 3) {
+            std.debug.print("Snapshot state: unexpected Conway CertState len {}\n", .{cert_state_len});
+            return error.InvalidSnapshotState;
+        }
+        try dec.skipValue(); // vstate
+        try parsePState(allocator, ledger, dec);
+        try parseDState(allocator, ledger, network, active_era, dec);
+    } else {
+        if (cert_state_len != 2) {
+            std.debug.print("Snapshot state: unexpected Shelley CertState len {} for era {}\n", .{ cert_state_len, active_era });
+            return error.InvalidSnapshotState;
+        }
+        try parsePState(allocator, ledger, dec);
+        try parseDState(allocator, ledger, network, active_era, dec);
+    }
+}
+
+fn parsePState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const pstate_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (pstate_len != 4) {
+        std.debug.print("Snapshot state: unexpected PState len {}\n", .{pstate_len});
+        return error.InvalidSnapshotState;
+    }
+
+    try dec.skipValue(); // psVRFKeyHashes
+    try parseStakePools(allocator, ledger, dec);
+    try parseFutureStakePoolParams(allocator, ledger, dec);
+    try parsePoolRetirements(allocator, ledger, dec);
+}
+
+fn parseStakePools(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+    var imported_pools: u64 = 0;
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importStakePoolEntry(ledger, dec);
+            imported_pools += 1;
+            if (!builtin.is_test and imported_pools % 10_000 == 0) {
+                std.debug.print("  Loaded {} snapshot stake pools...\n", .{imported_pools});
+            }
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importStakePoolEntry(ledger, dec);
+            imported_pools += 1;
+            if (!builtin.is_test and imported_pools % 10_000 == 0) {
+                std.debug.print("  Loaded {} snapshot stake pools...\n", .{imported_pools});
+            }
+        }
+        try dec.decodeBreak();
+    }
+
+    _ = allocator;
+}
+
+fn parseFutureStakePoolParams(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importFutureStakePoolParamEntry(ledger, dec);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importFutureStakePoolParamEntry(ledger, dec);
+        }
+        try dec.decodeBreak();
+    }
+
+    _ = allocator;
+}
+
+fn importStakePoolEntry(ledger: *LedgerDB, dec: *Decoder) !void {
+    const pool_bytes = try dec.decodeBytes();
+    if (pool_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected pool hash len {}\n", .{pool_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var pool: types.KeyHash = undefined;
+    @memcpy(&pool, pool_bytes);
+
+    const state_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (state_len != 9 and state_len != 10) {
+        std.debug.print("Snapshot state: unexpected stake-pool state len {}\n", .{state_len});
+        return error.InvalidSnapshotState;
+    }
+
+    try dec.skipValue(); // vrf
+    const pledge = try dec.decodeUint();
+    const cost = try dec.decodeUint();
+    const margin = try parseUnitInterval(dec);
+
+    const reward_bytes = try dec.decodeBytes();
+    if (reward_bytes.len != 29) {
+        std.debug.print("Snapshot state: unexpected pool reward-account len {}\n", .{reward_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var reward_raw: [29]u8 = undefined;
+    @memcpy(&reward_raw, reward_bytes);
+    const reward_account = try RewardAccount.fromBytes(reward_raw);
+
+    try dec.skipValue(); // owners
+    try dec.skipValue(); // relays
+    try dec.skipValue(); // metadata
+
+    const deposit = try dec.decodeUint();
+
+    if (state_len == 10) {
+        try dec.skipValue(); // delegators
+    }
+
+    try ledger.importPoolRewardAccount(pool, reward_account);
+    try ledger.importPoolDeposit(pool, deposit);
+    try ledger.importPoolConfig(pool, .{
+        .pledge = pledge,
+        .cost = cost,
+        .margin = margin,
+    });
+}
+
+fn importFutureStakePoolParamEntry(ledger: *LedgerDB, dec: *Decoder) !void {
+    const pool_bytes = try dec.decodeBytes();
+    if (pool_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected future pool hash len {}\n", .{pool_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var pool: types.KeyHash = undefined;
+    @memcpy(&pool, pool_bytes);
+
+    const params_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (params_len < 8 or params_len > 10) {
+        std.debug.print("Snapshot state: unexpected future pool params len {}\n", .{params_len});
+        return error.InvalidSnapshotState;
+    }
+
+    var remaining = params_len;
+    var probe = dec.*;
+    const first_value = try probe.sliceOfNextValue();
+    var first_dec = Decoder.init(first_value);
+    const has_embedded_pool_id = blk: {
+        if (first_dec.peekMajorType() catch null != 2) break :blk false;
+        const embedded = first_dec.decodeBytes() catch break :blk false;
+        break :blk embedded.len == 28 and std.mem.eql(u8, embedded, &pool);
+    };
+    if (has_embedded_pool_id) {
+        try dec.skipValue();
+        remaining -= 1;
+    }
+
+    if (remaining < 5) return error.InvalidSnapshotState;
+
+    try dec.skipValue(); // vrf
+    remaining -= 1;
+    const pledge = try dec.decodeUint();
+    remaining -= 1;
+    const cost = try dec.decodeUint();
+    remaining -= 1;
+    const margin = try parseUnitInterval(dec);
+    remaining -= 1;
+    const reward_bytes = try dec.decodeBytes();
+    remaining -= 1;
+    if (reward_bytes.len != 29) {
+        std.debug.print("Snapshot state: unexpected future pool reward-account len {}\n", .{reward_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var reward_raw: [29]u8 = undefined;
+    @memcpy(&reward_raw, reward_bytes);
+    const reward_account = try RewardAccount.fromBytes(reward_raw);
+
+    while (remaining > 0) : (remaining -= 1) {
+        try dec.skipValue();
+    }
+
+    try ledger.importFuturePoolParams(pool, .{
+        .config = .{
+            .pledge = pledge,
+            .cost = cost,
+            .margin = margin,
+        },
+        .reward_account = reward_account,
+    });
+}
+
+fn parsePoolRetirements(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importPoolRetirementEntry(ledger, dec);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importPoolRetirementEntry(ledger, dec);
+        }
+        try dec.decodeBreak();
+    }
+
+    _ = allocator;
+}
+
+fn importPoolRetirementEntry(ledger: *LedgerDB, dec: *Decoder) !void {
+    const pool_bytes = try dec.decodeBytes();
+    if (pool_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected retiring pool hash len {}\n", .{pool_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var pool: types.KeyHash = undefined;
+    @memcpy(&pool, pool_bytes);
+
+    const epoch = try dec.decodeUint();
+    try ledger.importPoolRetirement(pool, epoch);
+}
+
+fn parseDState(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const dstate_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (dstate_len != 4) {
+        std.debug.print("Snapshot state: unexpected DState len {} for era {}\n", .{ dstate_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+
+    try parseAccounts(allocator, ledger, network, active_era, dec);
+    try dec.skipValue(); // futureGenDelegs
+    try dec.skipValue(); // genDelegs
+    try dec.skipValue(); // instantaneous rewards
+}
+
+fn parseAccounts(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    if (active_era >= 6) {
+        try parseAccountMap(allocator, ledger, network, active_era, dec);
+        return;
+    }
+
+    const major = try dec.peekMajorType();
+    if (major == 5) {
+        try parseAccountMap(allocator, ledger, network, active_era, dec);
+        return;
+    }
+
+    const accounts_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (accounts_len != 2) {
+        std.debug.print("Snapshot state: unexpected legacy Accounts len {} for era {}\n", .{ accounts_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+    try parseAccountMap(allocator, ledger, network, active_era, dec);
+    try dec.skipValue(); // ptr map
+}
+
+fn parseAccountMap(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+    var imported_accounts: u64 = 0;
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importAccountEntry(ledger, network, active_era, dec);
+            imported_accounts += 1;
+            if (!builtin.is_test and imported_accounts % 100_000 == 0) {
+                std.debug.print("  Loaded {} snapshot accounts...\n", .{imported_accounts});
+            }
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            try importAccountEntry(ledger, network, active_era, dec);
+            imported_accounts += 1;
+            if (!builtin.is_test and imported_accounts % 100_000 == 0) {
+                std.debug.print("  Loaded {} snapshot accounts...\n", .{imported_accounts});
+            }
+        }
+        try dec.decodeBreak();
+    }
+
+    _ = allocator;
+}
+
+fn importAccountEntry(
+    ledger: *LedgerDB,
+    network: Network,
+    active_era: u8,
+    dec: *Decoder,
+) !void {
+    const credential = try parseCredential(dec);
+    const account = try parseAccountState(dec, active_era);
+
+    if (account.balance > 0) {
+        try ledger.importRewardBalance(.{
+            .network = network,
+            .credential = credential,
+        }, account.balance);
+        parse_import_result.reward_accounts_loaded += 1;
+    }
+
+    if (account.deposit > 0) {
+        try ledger.importStakeDeposit(credential, account.deposit);
+        parse_import_result.stake_deposits_loaded += 1;
+    }
+
+    if (account.stake_pool) |pool| {
+        try ledger.importStakePoolDelegation(credential, pool);
+    }
+
+    if (account.drep) |drep| {
+        try ledger.importDRepDelegation(credential, drep);
+    }
+}
+
+const ParsedAccountState = struct {
+    balance: Coin,
+    deposit: Coin,
+    stake_pool: ?types.KeyHash,
+    drep: ?DRep,
+};
+
+fn parseAccountState(dec: *Decoder, active_era: u8) !ParsedAccountState {
+    const account_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (account_len != 4) {
+        std.debug.print("Snapshot state: unexpected account-state len {} for era {}\n", .{ account_len, active_era });
+        return error.InvalidSnapshotState;
+    }
+
+    if (active_era >= 6) {
+        const balance = try dec.decodeUint();
+        const deposit = try dec.decodeUint();
+        const stake_pool = try parseMaybeKeyHash(dec);
+        const drep = try parseMaybeDRep(dec);
+        return .{
+            .balance = balance,
+            .deposit = deposit,
+            .stake_pool = stake_pool,
+            .drep = drep,
+        };
+    }
+
+    try dec.skipValue(); // ptr
+    const balance = try dec.decodeUint();
+    const deposit = try dec.decodeUint();
+    const stake_pool = try parseMaybeKeyHash(dec);
+    return .{
+        .balance = balance,
+        .deposit = deposit,
+        .stake_pool = stake_pool,
+        .drep = null,
+    };
+}
+
+fn parseMaybeKeyHash(dec: *Decoder) !?types.KeyHash {
+    const major = try dec.peekMajorType();
+    if (major == 7) {
+        try dec.decodeNull();
+        return null;
+    }
+
+    const key_bytes = try dec.decodeBytes();
+    if (key_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected stake-pool hash len {}\n", .{key_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var key_hash: types.KeyHash = undefined;
+    @memcpy(&key_hash, key_bytes);
+    return key_hash;
+}
+
+fn parseMaybeDRep(dec: *Decoder) !?DRep {
+    const major = try dec.peekMajorType();
+    if (major == 7) {
+        try dec.decodeNull();
+        return null;
+    }
+
+    const drep_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (drep_len == 0 or drep_len > 2) {
+        std.debug.print("Snapshot state: unexpected DRep len {}\n", .{drep_len});
+        return error.InvalidSnapshotState;
+    }
+
+    const tag = try dec.decodeUint();
+    return switch (tag) {
+        0 => blk: {
+            const hash_bytes = try dec.decodeBytes();
+            if (hash_bytes.len != 28) return error.InvalidSnapshotState;
+            var hash: types.Hash28 = undefined;
+            @memcpy(&hash, hash_bytes);
+            break :blk DRep{ .key_hash = hash };
+        },
+        1 => blk: {
+            const hash_bytes = try dec.decodeBytes();
+            if (hash_bytes.len != 28) return error.InvalidSnapshotState;
+            var hash: types.Hash28 = undefined;
+            @memcpy(&hash, hash_bytes);
+            break :blk DRep{ .script_hash = hash };
+        },
+        2 => DRep{ .always_abstain = {} },
+        3 => DRep{ .always_no_confidence = {} },
+        else => {
+            std.debug.print("Snapshot state: unexpected DRep tag {}\n", .{tag});
+            return error.InvalidSnapshotState;
+        },
+    };
+}
+
+fn parseCredential(dec: *Decoder) !Credential {
+    const cred_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (cred_len != 2) {
+        std.debug.print("Snapshot state: unexpected credential len {}\n", .{cred_len});
+        return error.InvalidSnapshotState;
+    }
+
+    const tag = try dec.decodeUint();
+    if (tag > 1) {
+        std.debug.print("Snapshot state: unexpected credential tag {}\n", .{tag});
+        return error.InvalidSnapshotState;
+    }
+
+    const hash_bytes = try dec.decodeBytes();
+    if (hash_bytes.len != 28) {
+        std.debug.print("Snapshot state: unexpected credential hash len {}\n", .{hash_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+
+    var hash: [28]u8 = undefined;
+    @memcpy(&hash, hash_bytes);
+    return .{
+        .cred_type = if (tag == 0) CredentialType.key_hash else CredentialType.script_hash,
+        .hash = hash,
+    };
 }
 
 fn countChunks(immutable_path: []const u8) !u32 {
@@ -451,6 +1558,48 @@ test "ledger_snapshot: parse packed txin and txout coin from real ancillary samp
     };
     const coin = try parsePackedTxOutCoin(&value);
     try std.testing.expectEqual(@as(Coin, 1_710_000), coin);
+}
+
+test "ledger_snapshot: import local preprod snapshot account state" {
+    const allocator = std.testing.allocator;
+
+    const ledger_root = "db/preprod/ledger";
+    const maybe_snapshot = findLatestSnapshotAtOrBefore(allocator, ledger_root, std.math.maxInt(SlotNo)) catch return;
+    if (maybe_snapshot == null) return;
+
+    var snapshot = maybe_snapshot.?;
+    defer snapshot.deinit(allocator);
+
+    const state_path = try std.fmt.allocPrint(allocator, "{s}/state", .{snapshot.path});
+    defer allocator.free(state_path);
+    if (!fileExists(state_path)) return;
+
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-ledger-snapshot-state") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-ledger-snapshot-state") catch {};
+
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-snapshot-state");
+    defer ledger.deinit();
+
+    const result = try importSnapshotAccountState(allocator, &ledger, state_path, .testnet);
+    try std.testing.expect(result.reward_accounts_loaded > 0 or result.stake_deposits_loaded > 0);
+    try std.testing.expect(
+        result.stake_snapshot_mark_pools_loaded > 0 or
+            result.stake_snapshot_set_pools_loaded > 0 or
+            result.stake_snapshot_go_pools_loaded > 0,
+    );
+    try std.testing.expect(ledger.getStakeSnapshots().mark != null);
+    try std.testing.expect(ledger.getStakeSnapshots().set != null);
+    try std.testing.expect(ledger.getStakeSnapshots().go != null);
+    try std.testing.expect(
+        ledger.getStakeSnapshots().mark.?.total_stake > 0 or
+            ledger.getStakeSnapshots().set.?.total_stake > 0 or
+            ledger.getStakeSnapshots().go.?.total_stake > 0,
+    );
+    try std.testing.expect(
+        ledger.getStakeSnapshots().mark.?.delegatorCount() > 0 or
+            ledger.getStakeSnapshots().set.?.delegatorCount() > 0 or
+            ledger.getStakeSnapshots().go.?.delegatorCount() > 0,
+    );
 }
 
 test "ledger_snapshot: parse packed txin uses little-endian tx index in ancillary tables" {

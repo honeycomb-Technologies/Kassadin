@@ -71,6 +71,11 @@ pub const RunResult = struct {
     snapshot_tip_slot: u64,
     snapshot_tip_block: u64,
     base_utxos_primed: u64,
+    snapshot_reward_accounts_primed: u64,
+    snapshot_stake_deposits_primed: u64,
+    snapshot_stake_mark_pools_primed: u64,
+    snapshot_stake_set_pools_primed: u64,
+    snapshot_stake_go_pools_primed: u64,
     local_ledger_snapshot_slot: u64,
     immutable_blocks_replayed: u64,
     stopped_by_signal: bool,
@@ -213,6 +218,7 @@ fn initializeSnapshotState(
     allocator: Allocator,
     chain_db: *ChainDB,
     snapshot: *const RuntimeSnapshot,
+    network: types.Network,
     result: *RunResult,
 ) !void {
     result.snapshot_anchor_used = true;
@@ -240,8 +246,14 @@ fn initializeSnapshotState(
                 allocator,
                 &chain_db.ledger,
                 local_snapshot,
+                network,
             );
             result.base_utxos_primed = load_result.utxos_loaded;
+            result.snapshot_reward_accounts_primed = load_result.reward_accounts_loaded;
+            result.snapshot_stake_deposits_primed = load_result.stake_deposits_loaded;
+            result.snapshot_stake_mark_pools_primed = load_result.stake_snapshot_mark_pools_loaded;
+            result.snapshot_stake_set_pools_primed = load_result.stake_snapshot_set_pools_loaded;
+            result.snapshot_stake_go_pools_primed = load_result.stake_snapshot_go_pools_loaded;
             result.local_ledger_snapshot_slot = load_result.slot;
 
             const replay = try ledger_snapshot.replayImmutableFromSlot(
@@ -250,13 +262,30 @@ fn initializeSnapshotState(
                 snapshot.layout.immutable_path,
                 load_result.slot,
                 chain_db.getProtocolParams(),
+                if (chain_db.shelley_governance_config) |config| config.epoch_length else null,
             );
             result.immutable_blocks_replayed = replay.blocks_replayed;
 
             try chain_db.enableLedgerValidation();
             result.validation_enabled = true;
+            std.debug.print(
+                "Local ledger snapshot ready: {} UTxOs, {} reward accounts, {} stake deposits, stake snapshots mark/set/go = {}/{}/{}, {} immutable blocks replayed.\n",
+                .{
+                    result.base_utxos_primed,
+                    result.snapshot_reward_accounts_primed,
+                    result.snapshot_stake_deposits_primed,
+                    result.snapshot_stake_mark_pools_primed,
+                    result.snapshot_stake_set_pools_primed,
+                    result.snapshot_stake_go_pools_primed,
+                    result.immutable_blocks_replayed,
+                },
+            );
         }
     }
+}
+
+fn networkFromMagic(network_magic: u32) types.Network {
+    return if (network_magic == types.mainnet.network_magic) .mainnet else .testnet;
 }
 
 fn initializeByronGenesisState(
@@ -295,6 +324,11 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
         .snapshot_tip_slot = 0,
         .snapshot_tip_block = 0,
         .base_utxos_primed = 0,
+        .snapshot_reward_accounts_primed = 0,
+        .snapshot_stake_deposits_primed = 0,
+        .snapshot_stake_mark_pools_primed = 0,
+        .snapshot_stake_set_pools_primed = 0,
+        .snapshot_stake_go_pools_primed = 0,
         .local_ledger_snapshot_slot = 0,
         .immutable_blocks_replayed = 0,
         .stopped_by_signal = false,
@@ -355,6 +389,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     // Open chain database
     var chain_db = try ChainDB.open(allocator, config.db_path, 2160);
     defer chain_db.close();
+    chain_db.ledger.setRewardAccountNetwork(networkFromMagic(config.network_magic));
 
     if (loaded_protocol_params) |protocol_params| {
         chain_db.setProtocolParams(protocol_params);
@@ -365,7 +400,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     }
 
     if (runtime_snapshot) |*snapshot| {
-        initializeSnapshotState(allocator, &chain_db, snapshot, &result) catch |err| switch (err) {
+        initializeSnapshotState(allocator, &chain_db, snapshot, networkFromMagic(config.network_magic), &result) catch |err| switch (err) {
             error.Interrupted => {
                 const interrupted_tip = chain_db.getTip();
                 result.tip_slot = interrupted_tip.slot;
@@ -456,10 +491,19 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     // Sync loop
     const max = if (config.max_headers == 0) std.math.maxInt(u64) else config.max_headers;
 
+    var last_keepalive = std.time.timestamp();
+
     while (result.headers_synced < max) {
         if (runtime_control.stopRequested()) {
             result.stopped_by_signal = true;
             break;
+        }
+
+        // Send keep-alive every ~30s to prevent relay timeout (Haskell StServer = 60s)
+        const now = std.time.timestamp();
+        if (now - last_keepalive >= 30) {
+            client.keepAlive() catch {};
+            last_keepalive = now;
         }
 
         const msg = client.requestNext() catch {
@@ -593,6 +637,11 @@ test "runner: initialize Byron genesis state on empty chain" {
         .snapshot_tip_slot = 0,
         .snapshot_tip_block = 0,
         .base_utxos_primed = 0,
+        .snapshot_reward_accounts_primed = 0,
+        .snapshot_stake_deposits_primed = 0,
+        .snapshot_stake_mark_pools_primed = 0,
+        .snapshot_stake_set_pools_primed = 0,
+        .snapshot_stake_go_pools_primed = 0,
         .local_ledger_snapshot_slot = 0,
         .immutable_blocks_replayed = 0,
         .stopped_by_signal = false,
@@ -607,6 +656,11 @@ test "runner: initialize Byron genesis state on empty chain" {
     try std.testing.expect(result.validation_enabled);
     try std.testing.expect(result.base_utxos_primed > 0);
     try std.testing.expectEqual(result.base_utxos_primed, @as(u64, @intCast(chain_db.ledger.utxoCount())));
+    try std.testing.expectEqual(@as(u64, 0), result.snapshot_reward_accounts_primed);
+    try std.testing.expectEqual(@as(u64, 0), result.snapshot_stake_deposits_primed);
+    try std.testing.expectEqual(@as(u64, 0), result.snapshot_stake_mark_pools_primed);
+    try std.testing.expectEqual(@as(u64, 0), result.snapshot_stake_set_pools_primed);
+    try std.testing.expectEqual(@as(u64, 0), result.snapshot_stake_go_pools_primed);
     try std.testing.expectEqual(@as(?types.SlotNo, null), chain_db.ledger.getTipSlot());
 }
 
