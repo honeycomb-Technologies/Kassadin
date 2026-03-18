@@ -8,6 +8,7 @@ const stake_mod = @import("../ledger/stake.zig");
 pub const SlotNo = types.SlotNo;
 pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
+pub const DeltaCoin = types.DeltaCoin;
 pub const HeaderHash = types.HeaderHash;
 pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
@@ -16,6 +17,7 @@ pub const RewardAccount = types.RewardAccount;
 pub const UnitInterval = types.UnitInterval;
 pub const PoolOwnerMembership = types.PoolOwnerMembership;
 pub const DRep = certificates.DRep;
+pub const MIRPot = certificates.MIRPot;
 pub const StakeSnapshots = stake_mod.StakeSnapshots;
 pub const StakeDistribution = stake_mod.StakeDistribution;
 
@@ -36,7 +38,11 @@ pub const LedgerDiff = struct {
     reserves_balance_change: ?CoinStateChange = null,
     fees_balance_change: ?CoinStateChange = null,
     snapshot_fees_change: ?CoinStateChange = null,
+    mir_delta_reserves_change: ?DeltaCoinStateChange = null,
+    mir_delta_treasury_change: ?DeltaCoinStateChange = null,
     reward_balance_changes: []const RewardBalanceChange = &.{},
+    mir_reserves_changes: []const MIRRewardChange = &.{},
+    mir_treasury_changes: []const MIRRewardChange = &.{},
     stake_deposit_changes: []const StakeDepositChange = &.{},
     pool_deposit_changes: []const PoolDepositChange = &.{},
     pool_config_changes: []const PoolConfigChange = &.{},
@@ -140,6 +146,17 @@ pub const BlocksMadeChange = struct {
     next: ?u64,
 };
 
+pub const DeltaCoinStateChange = struct {
+    previous: DeltaCoin,
+    next: DeltaCoin,
+};
+
+pub const MIRRewardChange = struct {
+    credential: Credential,
+    previous: ?Coin,
+    next: ?Coin,
+};
+
 /// Manages the ledger state: UTxO set, stake distribution, protocol parameters.
 /// For Phase 2, this is a simplified in-memory UTxO set with diff-based rollback.
 /// Full LMDB-backed storage comes when we need mainnet-scale UTxO sets.
@@ -155,6 +172,10 @@ pub const LedgerDB = struct {
     reserves_balance: Coin,
     fees_balance: Coin,
     snapshot_fees: Coin,
+    mir_reserves: std.AutoHashMap(Credential, Coin),
+    mir_treasury: std.AutoHashMap(Credential, Coin),
+    mir_delta_reserves: DeltaCoin,
+    mir_delta_treasury: DeltaCoin,
     stake_snapshots: StakeSnapshots,
     stake_deposits: std.AutoHashMap(Credential, Coin),
     pool_deposits: std.AutoHashMap(KeyHash, Coin),
@@ -195,6 +216,10 @@ pub const LedgerDB = struct {
             .reserves_balance = 0,
             .fees_balance = 0,
             .snapshot_fees = 0,
+            .mir_reserves = std.AutoHashMap(Credential, Coin).init(allocator),
+            .mir_treasury = std.AutoHashMap(Credential, Coin).init(allocator),
+            .mir_delta_reserves = 0,
+            .mir_delta_treasury = 0,
             .stake_snapshots = StakeSnapshots.init(allocator),
             .stake_deposits = std.AutoHashMap(Credential, Coin).init(allocator),
             .pool_deposits = std.AutoHashMap(KeyHash, Coin).init(allocator),
@@ -223,6 +248,8 @@ pub const LedgerDB = struct {
         }
         self.utxo_set.deinit();
         self.reward_balances.deinit();
+        self.mir_reserves.deinit();
+        self.mir_treasury.deinit();
         self.stake_snapshots.deinit();
         self.stake_deposits.deinit();
         self.pool_deposits.deinit();
@@ -243,6 +270,8 @@ pub const LedgerDB = struct {
             freeEntries(self.allocator, diff.consumed);
             freeEntries(self.allocator, diff.produced);
             freeRewardChanges(self.allocator, diff.reward_balance_changes);
+            freeMIRRewardChanges(self.allocator, diff.mir_reserves_changes);
+            freeMIRRewardChanges(self.allocator, diff.mir_treasury_changes);
             freeStakeChanges(self.allocator, diff.stake_deposit_changes);
             freePoolChanges(self.allocator, diff.pool_deposit_changes);
             freePoolConfigChanges(self.allocator, diff.pool_config_changes);
@@ -284,7 +313,11 @@ pub const LedgerDB = struct {
         applyCoinStateChange(&self.reserves_balance, diff.reserves_balance_change);
         applyCoinStateChange(&self.fees_balance, diff.fees_balance_change);
         applyCoinStateChange(&self.snapshot_fees, diff.snapshot_fees_change);
+        applyDeltaCoinStateChange(&self.mir_delta_reserves, diff.mir_delta_reserves_change);
+        applyDeltaCoinStateChange(&self.mir_delta_treasury, diff.mir_delta_treasury_change);
         applyRewardBalanceChanges(&self.reward_balances, diff.reward_balance_changes);
+        applyMIRRewardChanges(&self.mir_reserves, diff.mir_reserves_changes);
+        applyMIRRewardChanges(&self.mir_treasury, diff.mir_treasury_changes);
         applyStakeDepositChanges(&self.stake_deposits, diff.stake_deposit_changes);
         applyPoolDepositChanges(&self.pool_deposits, diff.pool_deposit_changes);
         applyPoolConfigChanges(&self.pool_configs, diff.pool_config_changes);
@@ -309,6 +342,8 @@ pub const LedgerDB = struct {
             freeEntries(self.allocator, old.consumed);
             freeEntries(self.allocator, old.produced);
             freeRewardChanges(self.allocator, old.reward_balance_changes);
+            freeMIRRewardChanges(self.allocator, old.mir_reserves_changes);
+            freeMIRRewardChanges(self.allocator, old.mir_treasury_changes);
             freeStakeChanges(self.allocator, old.stake_deposit_changes);
             freePoolChanges(self.allocator, old.pool_deposit_changes);
             freePoolConfigChanges(self.allocator, old.pool_config_changes);
@@ -357,8 +392,14 @@ pub const LedgerDB = struct {
             rollbackCoinStateChange(&self.reserves_balance, diff.reserves_balance_change);
             rollbackCoinStateChange(&self.fees_balance, diff.fees_balance_change);
             rollbackCoinStateChange(&self.snapshot_fees, diff.snapshot_fees_change);
+            rollbackDeltaCoinStateChange(&self.mir_delta_reserves, diff.mir_delta_reserves_change);
+            rollbackDeltaCoinStateChange(&self.mir_delta_treasury, diff.mir_delta_treasury_change);
             rollbackRewardBalanceChanges(&self.reward_balances, diff.reward_balance_changes);
+            rollbackMIRRewardChanges(&self.mir_reserves, diff.mir_reserves_changes);
+            rollbackMIRRewardChanges(&self.mir_treasury, diff.mir_treasury_changes);
             freeRewardChanges(self.allocator, diff.reward_balance_changes);
+            freeMIRRewardChanges(self.allocator, diff.mir_reserves_changes);
+            freeMIRRewardChanges(self.allocator, diff.mir_treasury_changes);
             rollbackStakeDepositChanges(&self.stake_deposits, diff.stake_deposit_changes);
             rollbackPoolDepositChanges(&self.pool_deposits, diff.pool_deposit_changes);
             rollbackPoolConfigChanges(&self.pool_configs, diff.pool_config_changes);
@@ -458,6 +499,24 @@ pub const LedgerDB = struct {
         self.snapshot_fees = amount;
     }
 
+    pub fn importMirReward(self: *LedgerDB, pot: MIRPot, credential: Credential, amount: Coin) !void {
+        if (amount == 0) return;
+
+        const map = switch (pot) {
+            .reserves => &self.mir_reserves,
+            .treasury => &self.mir_treasury,
+        };
+        try map.put(credential, amount);
+    }
+
+    pub fn importMirDeltaReserves(self: *LedgerDB, amount: DeltaCoin) void {
+        self.mir_delta_reserves = amount;
+    }
+
+    pub fn importMirDeltaTreasury(self: *LedgerDB, amount: DeltaCoin) void {
+        self.mir_delta_treasury = amount;
+    }
+
     pub fn replaceStakeSnapshots(self: *LedgerDB, snapshots: StakeSnapshots) void {
         self.stake_snapshots.deinit();
         self.stake_snapshots = snapshots;
@@ -528,6 +587,17 @@ pub const LedgerDB = struct {
         return self.reward_balances.get(account);
     }
 
+    pub fn lookupMirReward(
+        self: *const LedgerDB,
+        pot: MIRPot,
+        credential: Credential,
+    ) ?Coin {
+        return switch (pot) {
+            .reserves => self.mir_reserves.get(credential),
+            .treasury => self.mir_treasury.get(credential),
+        };
+    }
+
     pub fn getTreasuryBalance(self: *const LedgerDB) Coin {
         return self.treasury_balance;
     }
@@ -542,6 +612,14 @@ pub const LedgerDB = struct {
 
     pub fn getSnapshotFees(self: *const LedgerDB) Coin {
         return self.snapshot_fees;
+    }
+
+    pub fn getMirDeltaReserves(self: *const LedgerDB) DeltaCoin {
+        return self.mir_delta_reserves;
+    }
+
+    pub fn getMirDeltaTreasury(self: *const LedgerDB) DeltaCoin {
+        return self.mir_delta_treasury;
     }
 
     pub fn getStakeSnapshots(self: *const LedgerDB) *const StakeSnapshots {
@@ -1109,6 +1187,105 @@ pub const LedgerDB = struct {
         };
     }
 
+    pub fn buildEpochMirDiff(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+    ) !?LedgerDiff {
+        if (self.mir_reserves.count() == 0 and
+            self.mir_treasury.count() == 0 and
+            self.mir_delta_reserves == 0 and
+            self.mir_delta_treasury == 0)
+        {
+            return null;
+        }
+
+        var reward_changes: std.ArrayList(RewardBalanceChange) = .empty;
+        defer reward_changes.deinit(allocator);
+        var mir_reserves_changes: std.ArrayList(MIRRewardChange) = .empty;
+        defer mir_reserves_changes.deinit(allocator);
+        var mir_treasury_changes: std.ArrayList(MIRRewardChange) = .empty;
+        defer mir_treasury_changes.deinit(allocator);
+
+        var total_reserves_payout: Coin = 0;
+        var reserve_it = self.mir_reserves.iterator();
+        while (reserve_it.next()) |entry| {
+            try mir_reserves_changes.append(allocator, .{
+                .credential = entry.key_ptr.*,
+                .previous = entry.value_ptr.*,
+                .next = null,
+            });
+            if (!self.isRegisteredRewardCredential(entry.key_ptr.*)) continue;
+            total_reserves_payout += entry.value_ptr.*;
+            try appendPoolReapRewardChange(
+                allocator,
+                &reward_changes,
+                self,
+                .{ .network = self.reward_account_network, .credential = entry.key_ptr.* },
+                entry.value_ptr.*,
+            );
+        }
+
+        var total_treasury_payout: Coin = 0;
+        var treasury_it = self.mir_treasury.iterator();
+        while (treasury_it.next()) |entry| {
+            try mir_treasury_changes.append(allocator, .{
+                .credential = entry.key_ptr.*,
+                .previous = entry.value_ptr.*,
+                .next = null,
+            });
+            if (!self.isRegisteredRewardCredential(entry.key_ptr.*)) continue;
+            total_treasury_payout += entry.value_ptr.*;
+            try appendPoolReapRewardChange(
+                allocator,
+                &reward_changes,
+                self,
+                .{ .network = self.reward_account_network, .credential = entry.key_ptr.* },
+                entry.value_ptr.*,
+            );
+        }
+
+        const available_reserves = addDeltaCoinChecked(self.reserves_balance, self.mir_delta_reserves);
+        const available_treasury = addDeltaCoinChecked(self.treasury_balance, self.mir_delta_treasury);
+        const success = if (available_reserves) |reserves_after_delta|
+            if (available_treasury) |treasury_after_delta|
+                total_reserves_payout <= reserves_after_delta and total_treasury_payout <= treasury_after_delta
+            else
+                false
+        else
+            false;
+
+        return .{
+            .slot = slot,
+            .block_hash = block_hash,
+            .consumed = try allocator.alloc(UtxoEntry, 0),
+            .produced = try allocator.alloc(UtxoEntry, 0),
+            .treasury_balance_change = if (success) .{
+                .previous = self.treasury_balance,
+                .next = available_treasury.? - total_treasury_payout,
+            } else null,
+            .reserves_balance_change = if (success) .{
+                .previous = self.reserves_balance,
+                .next = available_reserves.? - total_reserves_payout,
+            } else null,
+            .mir_delta_reserves_change = .{
+                .previous = self.mir_delta_reserves,
+                .next = 0,
+            },
+            .mir_delta_treasury_change = .{
+                .previous = self.mir_delta_treasury,
+                .next = 0,
+            },
+            .reward_balance_changes = if (success)
+                try reward_changes.toOwnedSlice(allocator)
+            else
+                try allocator.alloc(RewardBalanceChange, 0),
+            .mir_reserves_changes = try mir_reserves_changes.toOwnedSlice(allocator),
+            .mir_treasury_changes = try mir_treasury_changes.toOwnedSlice(allocator),
+        };
+    }
+
     fn lookupSnapshotPoolStake(self: *const LedgerDB, pool: KeyHash) ?stake_mod.PoolStake {
         if (self.stake_snapshots.mark) |*mark| {
             if (mark.getPool(pool)) |entry| return entry.*;
@@ -1132,7 +1309,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 5, .big);
+        std.mem.writeInt(u32, buf[0..4], 6, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1304,6 +1481,34 @@ pub const LedgerDB = struct {
             std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
             try file.writeAll(&buf);
         }
+
+        // Section 17: MIR delta reserves
+        writeDeltaCoinToFile(file, self.mir_delta_reserves);
+
+        // Section 18: MIR delta treasury
+        writeDeltaCoinToFile(file, self.mir_delta_treasury);
+
+        // Section 19: MIR reserves
+        std.mem.writeInt(u64, &buf, @intCast(self.mir_reserves.count()), .big);
+        try file.writeAll(&buf);
+        var mir_reserves_it = self.mir_reserves.iterator();
+        while (mir_reserves_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
+
+        // Section 20: MIR treasury
+        std.mem.writeInt(u64, &buf, @intCast(self.mir_treasury.count()), .big);
+        try file.writeAll(&buf);
+        var mir_treasury_it = self.mir_treasury.iterator();
+        while (mir_treasury_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
+            try file.writeAll(&buf);
+        }
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -1327,7 +1532,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -1582,6 +1787,37 @@ pub const LedgerDB = struct {
             }
         }
 
+        if (version >= 6) {
+            self.mir_delta_reserves = try readDeltaCoinFromFile(file);
+            self.mir_delta_treasury = try readDeltaCoinFromFile(file);
+
+            _ = try file.readAll(&buf);
+            const mir_reserves_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < mir_reserves_count) : (i += 1) {
+                var entry_buf: [1 + 28 + 8]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+                var hash: types.Hash28 = undefined;
+                @memcpy(&hash, entry_buf[1..29]);
+                const amount = std.mem.readInt(u64, entry_buf[29..37], .big);
+                try self.mir_reserves.put(.{ .cred_type = cred_type, .hash = hash }, amount);
+            }
+
+            _ = try file.readAll(&buf);
+            const mir_treasury_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < mir_treasury_count) : (i += 1) {
+                var entry_buf: [1 + 28 + 8]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+                var hash: types.Hash28 = undefined;
+                @memcpy(&hash, entry_buf[1..29]);
+                const amount = std.mem.readInt(u64, entry_buf[29..37], .big);
+                try self.mir_treasury.put(.{ .cred_type = cred_type, .hash = hash }, amount);
+            }
+        }
+
         return true;
     }
 
@@ -1591,8 +1827,12 @@ pub const LedgerDB = struct {
         self.reserves_balance = 0;
         self.fees_balance = 0;
         self.snapshot_fees = 0;
+        self.mir_delta_reserves = 0;
+        self.mir_delta_treasury = 0;
         self.reward_balances_tracked = false;
         self.reward_balances.clearRetainingCapacity();
+        self.mir_reserves.clearRetainingCapacity();
+        self.mir_treasury.clearRetainingCapacity();
         self.stake_deposits.clearRetainingCapacity();
         self.pool_deposits.clearRetainingCapacity();
         self.pool_configs.clearRetainingCapacity();
@@ -1608,6 +1848,14 @@ pub const LedgerDB = struct {
         self.blocks_made_current_epoch.clearRetainingCapacity();
         self.stake_snapshots.deinit();
         self.stake_snapshots = StakeSnapshots.init(self.allocator);
+    }
+
+    fn isRegisteredRewardCredential(self: *const LedgerDB, credential: Credential) bool {
+        if (self.stake_deposits.contains(credential)) return true;
+        return self.reward_balances.contains(.{
+            .network = self.reward_account_network,
+            .credential = credential,
+        });
     }
 
     /// Total number of UTxOs in the set.
@@ -1644,6 +1892,12 @@ fn writeUnitIntervalToFile(file: std.fs.File, interval: UnitInterval) !void {
     try file.writeAll(&buf);
 }
 
+fn writeDeltaCoinToFile(file: std.fs.File, delta: DeltaCoin) void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &buf, delta, .big);
+    file.writeAll(&buf) catch unreachable;
+}
+
 fn readDRepFromFile(file: std.fs.File) !DRep {
     var tag_buf: [1]u8 = undefined;
     _ = try file.readAll(&tag_buf);
@@ -1676,6 +1930,12 @@ fn readUnitIntervalFromFile(file: std.fs.File) !UnitInterval {
     };
     if (!interval.isValid()) return error.InvalidCheckpoint;
     return interval;
+}
+
+fn readDeltaCoinFromFile(file: std.fs.File) !DeltaCoin {
+    var buf: [8]u8 = undefined;
+    _ = try file.readAll(&buf);
+    return std.mem.readInt(i64, &buf, .big);
 }
 
 fn freeEntries(allocator: Allocator, entries: []const UtxoEntry) void {
@@ -1711,6 +1971,10 @@ fn appendPoolReapRewardChange(
 }
 
 fn freeRewardChanges(allocator: Allocator, changes: []const RewardBalanceChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freeMIRRewardChanges(allocator: Allocator, changes: []const MIRRewardChange) void {
     if (changes.len > 0) allocator.free(changes);
 }
 
@@ -1764,7 +2028,19 @@ fn applyCoinStateChange(state: *Coin, change: ?CoinStateChange) void {
     }
 }
 
+fn applyDeltaCoinStateChange(state: *DeltaCoin, change: ?DeltaCoinStateChange) void {
+    if (change) |updated| {
+        state.* = updated.next;
+    }
+}
+
 fn rollbackCoinStateChange(state: *Coin, change: ?CoinStateChange) void {
+    if (change) |updated| {
+        state.* = updated.previous;
+    }
+}
+
+fn rollbackDeltaCoinStateChange(state: *DeltaCoin, change: ?DeltaCoinStateChange) void {
     if (change) |updated| {
         state.* = updated.previous;
     }
@@ -1797,6 +2073,45 @@ fn rollbackRewardBalanceChanges(
             _ = map.remove(change.account);
         }
     }
+}
+
+fn applyMIRRewardChanges(
+    map: *std.AutoHashMap(Credential, Coin),
+    changes: []const MIRRewardChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |amount| {
+            map.put(change.credential, amount) catch unreachable;
+        } else {
+            _ = map.remove(change.credential);
+        }
+    }
+}
+
+fn rollbackMIRRewardChanges(
+    map: *std.AutoHashMap(Credential, Coin),
+    changes: []const MIRRewardChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |amount| {
+            map.put(change.credential, amount) catch unreachable;
+        } else {
+            _ = map.remove(change.credential);
+        }
+    }
+}
+
+fn addDeltaCoinChecked(base: Coin, delta: DeltaCoin) ?Coin {
+    if (delta >= 0) {
+        return base + @as(Coin, @intCast(delta));
+    }
+
+    const abs_delta: Coin = @intCast(-delta);
+    if (abs_delta > base) return null;
+    return base - abs_delta;
 }
 
 fn applyStakeDepositChanges(
@@ -2679,6 +2994,10 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try db.importCurrentEpochBlocksMade(pool, 3);
 
         const drep_cred = Credential{ .cred_type = .script_hash, .hash = [_]u8{0xcc} ** 28 };
+        try db.importMirReward(.reserves, account.credential, 9);
+        try db.importMirReward(.treasury, drep_cred, 11);
+        db.importMirDeltaReserves(-4);
+        db.importMirDeltaTreasury(4);
         try db.importDRepDelegation(drep_cred, .{ .always_abstain = {} });
         try db.drep_deposits.put(drep_cred, 500_000_000);
 
@@ -2734,8 +3053,11 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try std.testing.expectEqual(@as(?KeyHash, pool), db2.lookupStakePoolDelegation(account.credential));
         try std.testing.expectEqual(@as(?u64, 7), db2.lookupPreviousEpochBlocksMade(pool));
         try std.testing.expectEqual(@as(?u64, 3), db2.lookupCurrentEpochBlocksMade(pool));
-
         const drep_cred = Credential{ .cred_type = .script_hash, .hash = [_]u8{0xcc} ** 28 };
+        try std.testing.expectEqual(@as(?Coin, 9), db2.lookupMirReward(.reserves, account.credential));
+        try std.testing.expectEqual(@as(?Coin, 11), db2.lookupMirReward(.treasury, drep_cred));
+        try std.testing.expectEqual(@as(DeltaCoin, -4), db2.getMirDeltaReserves());
+        try std.testing.expectEqual(@as(DeltaCoin, 4), db2.getMirDeltaTreasury());
         try std.testing.expect(db2.lookupDRepDelegation(drep_cred) != null);
         try std.testing.expectEqual(@as(?Coin, 500_000_000), db2.lookupDRepDeposit(drep_cred));
     }
@@ -2871,6 +3193,53 @@ test "ledgerdb: epoch reward diff requires owner pledge stake" {
         432_000,
     );
     try std.testing.expect(diff == null);
+}
+
+test "ledgerdb: epoch MIR diff credits registered accounts and clears pending state" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-epoch-mir");
+    defer db.deinit();
+
+    const registered_cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0x98} ** 28 };
+    const unregistered_cred = Credential{ .cred_type = .script_hash, .hash = [_]u8{0x99} ** 28 };
+    const registered_account = RewardAccount{
+        .network = .testnet,
+        .credential = registered_cred,
+    };
+
+    db.setRewardAccountNetwork(.testnet);
+    db.importReservesBalance(1_000);
+    db.importTreasuryBalance(200);
+    try db.importStakeDeposit(registered_cred, 2_000_000);
+    try db.importRewardBalance(registered_account, 50);
+    try db.importMirReward(.reserves, registered_cred, 100);
+    try db.importMirReward(.treasury, unregistered_cred, 25);
+    db.importMirDeltaReserves(-20);
+    db.importMirDeltaTreasury(20);
+
+    const diff = (try db.buildEpochMirDiff(
+        allocator,
+        100,
+        [_]u8{0x9a} ** 32,
+    )).?;
+    try db.applyDiff(diff);
+
+    try std.testing.expectEqual(@as(Coin, 880), db.getReservesBalance());
+    try std.testing.expectEqual(@as(Coin, 220), db.getTreasuryBalance());
+    try std.testing.expectEqual(@as(?Coin, 150), db.lookupRewardBalance(registered_account));
+    try std.testing.expectEqual(@as(?Coin, null), db.lookupMirReward(.reserves, registered_cred));
+    try std.testing.expectEqual(@as(?Coin, null), db.lookupMirReward(.treasury, unregistered_cred));
+    try std.testing.expectEqual(@as(DeltaCoin, 0), db.getMirDeltaReserves());
+    try std.testing.expectEqual(@as(DeltaCoin, 0), db.getMirDeltaTreasury());
+
+    try db.rollback(1);
+    try std.testing.expectEqual(@as(Coin, 1_000), db.getReservesBalance());
+    try std.testing.expectEqual(@as(Coin, 200), db.getTreasuryBalance());
+    try std.testing.expectEqual(@as(?Coin, 50), db.lookupRewardBalance(registered_account));
+    try std.testing.expectEqual(@as(?Coin, 100), db.lookupMirReward(.reserves, registered_cred));
+    try std.testing.expectEqual(@as(?Coin, 25), db.lookupMirReward(.treasury, unregistered_cred));
+    try std.testing.expectEqual(@as(DeltaCoin, -20), db.getMirDeltaReserves());
+    try std.testing.expectEqual(@as(DeltaCoin, 20), db.getMirDeltaTreasury());
 }
 
 test "ledgerdb: current epoch blocks made diff is rollback-safe" {

@@ -169,7 +169,7 @@ Certificates are processed in order within a transaction.
 | 3 | PoolRegistration(params) | Register/update pool with params |
 | 4 | PoolRetirement(pool, epoch) | Schedule retirement at epoch |
 | 5 | GenesisKeyDelegation | Only during bootstrap |
-| 6 | MIR(pot, rewards) | Move instantaneous rewards |
+| 6 | MIR(pot, rewards) | Stage instantaneous rewards / pot transfers for epoch-boundary realization |
 
 ### Conway Certificates (Additional)
 | Tag | Certificate | Effect |
@@ -211,6 +211,22 @@ At each epoch boundary:
       distributed proportionally to delegators
 
 5. rewards_map = {reward_account → reward_amount}
+```
+
+### MIR Processing
+```
+Within a transaction:
+  - MIR certs stage pending instantaneous rewards in reserves/treasury maps
+  - post-Alonzo pot transfers update signed deltaReserves / deltaTreasury
+  - pre-Alonzo MIR rejects negative updates and pot transfers
+  - MIR certs are rejected in the last stability-window portion of an epoch
+
+At epoch boundary:
+  1. apply normal reward update
+  2. intersect pending MIR maps with currently registered reward credentials
+  3. realize MIR if reserves + deltaReserves and treasury + deltaTreasury still cover the pending payouts
+  4. otherwise drop the pending MIR state without moving balances
+  5. clear pending MIR state in both cases
 ```
 
 ### Stake Snapshot Pipeline

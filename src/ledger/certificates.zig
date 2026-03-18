@@ -7,10 +7,31 @@ pub const KeyHash = types.KeyHash;
 pub const Hash28 = types.Hash28;
 pub const Hash32 = types.Hash32;
 pub const Coin = types.Coin;
+pub const DeltaCoin = types.DeltaCoin;
 pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
 pub const CredentialType = types.CredentialType;
 pub const RewardAccount = types.RewardAccount;
+
+pub const MIRPot = enum(u8) {
+    reserves = 0,
+    treasury = 1,
+};
+
+pub const MIRReward = struct {
+    credential: Credential,
+    delta: DeltaCoin,
+};
+
+pub const MIRTarget = union(enum) {
+    stake_addresses: []const MIRReward,
+    send_to_other_pot: Coin,
+};
+
+pub const MIRCert = struct {
+    pot: MIRPot,
+    target: MIRTarget,
+};
 
 /// Parsed certificate (Shelley through Conway).
 pub const Certificate = union(enum) {
@@ -21,7 +42,7 @@ pub const Certificate = union(enum) {
     pool_registration: PoolParams, // tag 3
     pool_retirement: struct { pool: KeyHash, epoch: EpochNo }, // tag 4
     genesis_delegation: struct { genesis: Hash28, delegate: Hash28, vrf: Hash32 }, // tag 5
-    mir: void, // tag 6 (MIR, simplified)
+    mir: MIRCert, // tag 6
 
     // Conway (tags 7-18)
     reg_deposit: struct { cred: Credential, deposit: Coin }, // tag 7
@@ -110,6 +131,48 @@ fn parseUnitInterval(dec: *Decoder) !types.UnitInterval {
     return interval;
 }
 
+fn parseMIRPot(dec: *Decoder) !MIRPot {
+    return switch (try dec.decodeUint()) {
+        0 => .reserves,
+        1 => .treasury,
+        else => error.InvalidCbor,
+    };
+}
+
+fn parseMIRTarget(
+    allocator: Allocator,
+    dec: *Decoder,
+) !MIRTarget {
+    switch (try dec.peekMajorType()) {
+        5 => {
+            const map_len = try dec.decodeMapLen();
+            var rewards: std.ArrayList(MIRReward) = .empty;
+            defer rewards.deinit(allocator);
+
+            if (map_len) |count| {
+                var i: u64 = 0;
+                while (i < count) : (i += 1) {
+                    try rewards.append(allocator, .{
+                        .credential = try parseCredential(dec),
+                        .delta = @intCast(try dec.decodeInt()),
+                    });
+                }
+            } else {
+                while (!dec.isBreak()) {
+                    try rewards.append(allocator, .{
+                        .credential = try parseCredential(dec),
+                        .delta = @intCast(try dec.decodeInt()),
+                    });
+                }
+                try dec.decodeBreak();
+            }
+
+            return .{ .stake_addresses = try rewards.toOwnedSlice(allocator) };
+        },
+        else => return .{ .send_to_other_pot = try dec.decodeUint() },
+    }
+}
+
 fn parsePoolOwners(
     allocator: Allocator,
     dec: *Decoder,
@@ -141,6 +204,12 @@ pub fn freeCertificate(allocator: Allocator, cert: *const Certificate) void {
     switch (cert.*) {
         .pool_registration => |pool| {
             if (pool.owners.len > 0) allocator.free(pool.owners);
+        },
+        .mir => |mir| switch (mir.target) {
+            .stake_addresses => |rewards| {
+                if (rewards.len > 0) allocator.free(rewards);
+            },
+            else => {},
         },
         else => {},
     }
@@ -205,8 +274,12 @@ pub fn parseCertificate(allocator: Allocator, dec: *Decoder) !Certificate {
             } };
         },
         6 => {
-            try dec.skipValue(); // MIR details
-            return .mir;
+            const mir_len = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+            if (mir_len != 2) return error.InvalidCbor;
+            return .{ .mir = .{
+                .pot = try parseMIRPot(dec),
+                .target = try parseMIRTarget(allocator, dec),
+            } };
         },
         7 => {
             const cred = try parseCredential(dec);

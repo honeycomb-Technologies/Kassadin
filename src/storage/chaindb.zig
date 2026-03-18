@@ -248,6 +248,7 @@ pub const ChainDB = struct {
                 &self.ledger,
                 &(parsed_block orelse unreachable),
                 self.protocol_params,
+                if (self.shelley_governance_config) |*config| config else null,
             ) catch |err| {
                 if (!builtin.is_test) {
                     std.debug.print("ChainDB validation apply failed for block {}: {}\n", .{ block_no, err });
@@ -481,7 +482,13 @@ pub const ChainDB = struct {
                 applied += 1;
             }
 
-            // 2. Rotate stake snapshots: go ← set ← mark ← new
+            // 2. Realize or drop pending MIR updates before epoch state rotation.
+            if (try self.ledger.buildEpochMirDiff(self.allocator, slot, block_hash)) |diff| {
+                try self.ledger.applyDiff(diff);
+                applied += 1;
+            }
+
+            // 3. Rotate stake snapshots: go ← set ← mark ← new
             self.ledger.rotateStakeSnapshots(epoch);
 
             if (try self.ledger.buildEpochBlocksMadeShiftDiff(self.allocator, slot, block_hash)) |diff| {
@@ -489,13 +496,13 @@ pub const ChainDB = struct {
                 applied += 1;
             }
 
-            // 3. Roll the fee pot into the next snapshot epoch
+            // 4. Roll the fee pot into the next snapshot epoch
             if (try self.ledger.buildEpochFeeRolloverDiff(self.allocator, slot, block_hash)) |diff| {
                 try self.ledger.applyDiff(diff);
                 applied += 1;
             }
 
-            // 4. Reap retiring pools
+            // 5. Reap retiring pools
             if (try self.ledger.buildPoolReapDiff(self.allocator, slot, block_hash, epoch)) |diff| {
                 try self.ledger.applyDiff(diff);
                 applied += 1;

@@ -43,6 +43,7 @@ fn buildDiff(
     block: *const block_mod.Block,
     tx: *const tx_mod.TxBody,
     pp: rules.ProtocolParams,
+    validation_context: rules.ValidationContext,
 ) !LedgerDiff {
     var consumed_list: std.ArrayList(UtxoEntry) = .empty;
     defer consumed_list.deinit(allocator);
@@ -76,7 +77,7 @@ fn buildDiff(
     var withdrawal_effect = try rules.evaluateWithdrawalEffect(allocator, tx, ledger);
     errdefer withdrawal_effect.deinit(allocator);
 
-    var cert_effect = try rules.evaluateCertificateEffect(allocator, tx, ledger, pp);
+    var cert_effect = try rules.evaluateCertificateEffectWithContext(allocator, tx, ledger, pp, validation_context);
     errdefer cert_effect.deinit(allocator);
 
     return .{
@@ -84,7 +85,11 @@ fn buildDiff(
         .block_hash = block.hash(),
         .consumed = consumed,
         .produced = produced,
+        .mir_delta_reserves_change = cert_effect.mir_delta_reserves_change,
+        .mir_delta_treasury_change = cert_effect.mir_delta_treasury_change,
         .reward_balance_changes = withdrawal_effect.reward_balance_changes,
+        .mir_reserves_changes = cert_effect.mir_reserves_changes,
+        .mir_treasury_changes = cert_effect.mir_treasury_changes,
         .stake_deposit_changes = cert_effect.stake_deposit_changes,
         .pool_deposit_changes = cert_effect.pool_deposit_changes,
         .pool_config_changes = cert_effect.pool_config_changes,
@@ -104,6 +109,7 @@ fn applyShelleyLikeBlock(
     ledger: *LedgerDB,
     block: *const block_mod.Block,
     pp: rules.ProtocolParams,
+    governance_config: ?*const protocol_update.GovernanceConfig,
 ) !ApplyResult {
     var result = ApplyResult{
         .txs_applied = 0,
@@ -124,6 +130,12 @@ fn applyShelleyLikeBlock(
 
     var tx_dec = Decoder.init(block.tx_bodies_raw);
     const num_txs = (try tx_dec.decodeArrayLen()) orelse return result;
+    const validation_context = rules.ValidationContext{
+        .current_slot = block.header.slot,
+        .protocol_version_major = block.header.protocol_version_major,
+        .epoch_length = if (governance_config) |config| config.epoch_length else null,
+        .stability_window = if (governance_config) |config| config.stability_window else null,
+    };
 
     var tx_idx: u64 = 0;
     while (tx_idx < num_txs) : (tx_idx += 1) {
@@ -139,11 +151,11 @@ fn applyShelleyLikeBlock(
         };
         defer tx_mod.freeTxBody(allocator, &tx);
 
-        _ = rules.validateTx(
+        _ = rules.validateTxWithContext(
             &tx,
             ledger,
             pp,
-            block.header.slot,
+            validation_context,
             switch (block.era) {
                 .shelley, .allegra, .mary => true,
                 else => false,
@@ -156,7 +168,7 @@ fn applyShelleyLikeBlock(
             continue;
         };
 
-        try ledger.applyDiff(try buildDiff(allocator, ledger, block, &tx, pp));
+        try ledger.applyDiff(try buildDiff(allocator, ledger, block, &tx, pp, validation_context));
         result.txs_applied += 1;
         result.total_fees += tx.fee;
         if (tx.update) |*update| {
@@ -263,7 +275,14 @@ fn applyByronBlock(
             continue;
         };
 
-        try ledger.applyDiff(try buildDiff(allocator, ledger, block, &tx, pp));
+        try ledger.applyDiff(try buildDiff(
+            allocator,
+            ledger,
+            block,
+            &tx,
+            pp,
+            .{ .current_slot = block.header.slot, .protocol_version_major = block.header.protocol_version_major },
+        ));
         result.txs_applied += 1;
         result.total_fees += tx.fee;
     }
@@ -286,10 +305,11 @@ pub fn applyBlock(
     ledger: *LedgerDB,
     block: *const block_mod.Block,
     pp: rules.ProtocolParams,
+    governance_config: ?*const protocol_update.GovernanceConfig,
 ) !ApplyResult {
     return switch (block.era) {
         .byron => applyByronBlock(allocator, ledger, block, pp),
-        else => applyShelleyLikeBlock(allocator, ledger, block, pp),
+        else => applyShelleyLikeBlock(allocator, ledger, block, pp, governance_config),
     };
 }
 
@@ -358,7 +378,7 @@ test "apply: golden Alonzo block transactions update ledger" {
         .max_block_body_size = 100000,
     };
 
-    var result = try applyBlock(allocator, &ledger, &block, pp);
+    var result = try applyBlock(allocator, &ledger, &block, pp, null);
     defer result.deinit(allocator);
 
     // The golden block has 1 transaction
@@ -424,7 +444,7 @@ test "apply: golden Byron block transaction updates ledger" {
         .produced = seed_produced,
     });
 
-    var result = try applyBlock(allocator, &ledger, &block, pp);
+    var result = try applyBlock(allocator, &ledger, &block, pp, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), result.txs_applied);

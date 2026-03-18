@@ -16,11 +16,13 @@ const LedgerDB = @import("../storage/ledger.zig").LedgerDB;
 pub const SlotNo = types.SlotNo;
 pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
+pub const DeltaCoin = types.DeltaCoin;
 pub const Network = types.Network;
 pub const Credential = types.Credential;
 pub const CredentialType = types.CredentialType;
 pub const RewardAccount = types.RewardAccount;
 pub const DRep = certificates.DRep;
+pub const MIRPot = certificates.MIRPot;
 
 const zero_margin = types.UnitInterval{ .numerator = 0, .denominator = 1 };
 
@@ -256,6 +258,7 @@ pub fn replayImmutableFromSlot(
                 ledger,
                 &block,
                 pp,
+                null,
             );
             defer apply_result.deinit(allocator);
 
@@ -317,6 +320,11 @@ fn applyReplayEpochBoundaryEffects(
         reward_params,
         slots_per_epoch,
     )) |diff| {
+        try ledger.applyDiff(diff);
+        applied += 1;
+    }
+
+    if (try ledger.buildEpochMirDiff(allocator, slot, block_hash)) |diff| {
         try ledger.applyDiff(diff);
         applied += 1;
     }
@@ -1245,7 +1253,58 @@ fn parseDState(
     try parseAccounts(allocator, ledger, network, active_era, dec);
     try dec.skipValue(); // futureGenDelegs
     try dec.skipValue(); // genDelegs
-    try dec.skipValue(); // instantaneous rewards
+    try parseInstantaneousRewards(allocator, ledger, dec);
+}
+
+fn parseInstantaneousRewards(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const rewards_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (rewards_len != 4) {
+        std.debug.print("Snapshot state: unexpected InstantaneousRewards len {}\n", .{rewards_len});
+        return error.InvalidSnapshotState;
+    }
+
+    try parseInstantaneousRewardMap(allocator, ledger, .reserves, dec);
+    try parseInstantaneousRewardMap(allocator, ledger, .treasury, dec);
+    ledger.importMirDeltaReserves(try parseDeltaCoin(dec));
+    ledger.importMirDeltaTreasury(try parseDeltaCoin(dec));
+}
+
+fn parseInstantaneousRewardMap(
+    allocator: Allocator,
+    ledger: *LedgerDB,
+    pot: MIRPot,
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            const credential = try parseCredential(dec);
+            const amount = try dec.decodeUint();
+            try ledger.importMirReward(pot, credential, amount);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            if (runtime_control.stopRequested()) return error.Interrupted;
+            const credential = try parseCredential(dec);
+            const amount = try dec.decodeUint();
+            try ledger.importMirReward(pot, credential, amount);
+        }
+        try dec.decodeBreak();
+    }
+
+    _ = allocator;
+}
+
+fn parseDeltaCoin(dec: *Decoder) !DeltaCoin {
+    const value = try dec.decodeInt();
+    return std.math.cast(DeltaCoin, value) orelse error.InvalidSnapshotState;
 }
 
 fn parseAccounts(

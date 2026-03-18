@@ -1,10 +1,13 @@
 const std = @import("std");
 const types = @import("../types.zig");
+const block_mod = @import("block.zig");
 const transaction = @import("transaction.zig");
 const cert_mod = @import("certificates.zig");
 const LedgerDB = @import("../storage/ledger.zig").LedgerDB;
 const UtxoEntry = @import("../storage/ledger.zig").UtxoEntry;
 const RewardBalanceChange = @import("../storage/ledger.zig").RewardBalanceChange;
+const DeltaCoinStateChange = @import("../storage/ledger.zig").DeltaCoinStateChange;
+const MIRRewardChange = @import("../storage/ledger.zig").MIRRewardChange;
 const StakeDepositChange = @import("../storage/ledger.zig").StakeDepositChange;
 const PoolDepositChange = @import("../storage/ledger.zig").PoolDepositChange;
 const PoolConfig = @import("../storage/ledger.zig").PoolConfig;
@@ -20,9 +23,11 @@ const DRepDelegationChange = @import("../storage/ledger.zig").DRepDelegationChan
 
 pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
+pub const DeltaCoin = types.DeltaCoin;
 pub const TxBody = transaction.TxBody;
 pub const Withdrawal = transaction.Withdrawal;
 pub const DRep = cert_mod.DRep;
+pub const MIRPot = cert_mod.MIRPot;
 
 /// Validation errors that can occur when applying a transaction.
 pub const ValidationError = error{
@@ -77,10 +82,33 @@ pub const ProtocolParams = struct {
     };
 };
 
+pub const ValidationContext = struct {
+    current_slot: u64,
+    protocol_version_major: u64 = 0,
+    epoch_length: ?u64 = null,
+    stability_window: ?u64 = null,
+
+    fn mirTransferAllowed(self: ValidationContext) bool {
+        return self.protocol_version_major > 4;
+    }
+
+    fn mirTooLateInEpoch(self: ValidationContext) bool {
+        const epoch_length = self.epoch_length orelse return false;
+        const stability_window = self.stability_window orelse return false;
+        const next_epoch = types.slotToEpoch(self.current_slot, epoch_length) + 1;
+        const too_late_slot = types.epochFirstSlot(next_epoch, epoch_length) -| stability_window;
+        return self.current_slot >= too_late_slot;
+    }
+};
+
 pub const CertificateEffect = struct {
     deposits: Coin,
     refunds: Coin,
+    mir_delta_reserves_change: ?DeltaCoinStateChange,
+    mir_delta_treasury_change: ?DeltaCoinStateChange,
     stake_deposit_changes: []const StakeDepositChange,
+    mir_reserves_changes: []const MIRRewardChange,
+    mir_treasury_changes: []const MIRRewardChange,
     pool_deposit_changes: []const PoolDepositChange,
     pool_config_changes: []const PoolConfigChange,
     future_pool_param_changes: []const FuturePoolParamsChange,
@@ -96,7 +124,11 @@ pub const CertificateEffect = struct {
         return .{
             .deposits = 0,
             .refunds = 0,
+            .mir_delta_reserves_change = null,
+            .mir_delta_treasury_change = null,
             .stake_deposit_changes = &.{},
+            .mir_reserves_changes = &.{},
+            .mir_treasury_changes = &.{},
             .pool_deposit_changes = &.{},
             .pool_config_changes = &.{},
             .future_pool_param_changes = &.{},
@@ -112,6 +144,8 @@ pub const CertificateEffect = struct {
 
     pub fn deinit(self: *CertificateEffect, allocator: std.mem.Allocator) void {
         if (self.stake_deposit_changes.len > 0) allocator.free(self.stake_deposit_changes);
+        if (self.mir_reserves_changes.len > 0) allocator.free(self.mir_reserves_changes);
+        if (self.mir_treasury_changes.len > 0) allocator.free(self.mir_treasury_changes);
         if (self.pool_deposit_changes.len > 0) allocator.free(self.pool_deposit_changes);
         if (self.pool_config_changes.len > 0) allocator.free(self.pool_config_changes);
         if (self.future_pool_param_changes.len > 0) allocator.free(self.future_pool_param_changes);
@@ -156,6 +190,16 @@ pub fn validateTx(
     current_slot: u64,
     enforce_legacy_min_utxo: bool,
 ) ValidationError!Coin {
+    return validateTxWithContext(tx, utxo, pp, .{ .current_slot = current_slot }, enforce_legacy_min_utxo);
+}
+
+pub fn validateTxWithContext(
+    tx: *const TxBody,
+    utxo: *const LedgerDB,
+    pp: ProtocolParams,
+    context: ValidationContext,
+    enforce_legacy_min_utxo: bool,
+) ValidationError!Coin {
     // 1. Must have at least one input
     if (tx.inputs.len == 0) return error.NoInputs;
 
@@ -171,7 +215,7 @@ pub fn validateTx(
     };
     defer withdrawal_effect.deinit(std.heap.page_allocator);
 
-    var cert_effect = evaluateCertificateEffect(std.heap.page_allocator, tx, utxo, pp) catch {
+    var cert_effect = evaluateCertificateEffectWithContext(std.heap.page_allocator, tx, utxo, pp, context) catch {
         return error.InvalidCertificate;
     };
     defer cert_effect.deinit(std.heap.page_allocator);
@@ -183,10 +227,10 @@ pub fn validateTx(
 
     // 4. Validity interval
     if (tx.ttl) |ttl| {
-        if (current_slot >= ttl) return error.Expired;
+        if (context.current_slot >= ttl) return error.Expired;
     }
     if (tx.validity_start) |vs| {
-        if (current_slot < vs) return error.NotYetValid;
+        if (context.current_slot < vs) return error.NotYetValid;
     }
 
     // 5. Transaction size limit
@@ -259,10 +303,24 @@ pub fn evaluateCertificateEffect(
     ledger: *const LedgerDB,
     pp: ProtocolParams,
 ) !CertificateEffect {
+    return evaluateCertificateEffectWithContext(allocator, tx, ledger, pp, .{ .current_slot = 0 });
+}
+
+pub fn evaluateCertificateEffectWithContext(
+    allocator: std.mem.Allocator,
+    tx: *const TxBody,
+    ledger: *const LedgerDB,
+    pp: ProtocolParams,
+    context: ValidationContext,
+) !CertificateEffect {
     if (tx.certificates.len == 0) return CertificateEffect.empty();
 
     var stake_changes: std.ArrayList(StakeDepositChange) = .empty;
     defer stake_changes.deinit(allocator);
+    var mir_reserves_changes: std.ArrayList(MIRRewardChange) = .empty;
+    defer mir_reserves_changes.deinit(allocator);
+    var mir_treasury_changes: std.ArrayList(MIRRewardChange) = .empty;
+    defer mir_treasury_changes.deinit(allocator);
     var pool_changes: std.ArrayList(PoolDepositChange) = .empty;
     defer pool_changes.deinit(allocator);
     var pool_config_changes: std.ArrayList(PoolConfigChange) = .empty;
@@ -286,6 +344,8 @@ pub fn evaluateCertificateEffect(
 
     var deposits: Coin = 0;
     var refunds: Coin = 0;
+    var mir_delta_reserves_change: ?DeltaCoinStateChange = null;
+    var mir_delta_treasury_change: ?DeltaCoinStateChange = null;
 
     for (tx.certificates) |cert| {
         switch (cert) {
@@ -407,6 +467,47 @@ pub fn evaluateCertificateEffect(
                     retirement.pool,
                     retirement.epoch,
                 );
+            },
+            .mir => |mir| {
+                if (context.mirTooLateInEpoch()) return error.InvalidCertificate;
+
+                switch (mir.target) {
+                    .stake_addresses => |rewards| {
+                        if (context.mirTransferAllowed()) {
+                            try applyPostAlonzoMirRewards(
+                                allocator,
+                                ledger,
+                                mir.pot,
+                                rewards,
+                                &mir_reserves_changes,
+                                &mir_treasury_changes,
+                                mir_delta_reserves_change,
+                                mir_delta_treasury_change,
+                            );
+                        } else {
+                            try applyPreAlonzoMirRewards(
+                                allocator,
+                                ledger,
+                                mir.pot,
+                                rewards,
+                                &mir_reserves_changes,
+                                &mir_treasury_changes,
+                            );
+                        }
+                    },
+                    .send_to_other_pot => |coin| {
+                        if (!context.mirTransferAllowed()) return error.InvalidCertificate;
+                        try applyMirPotTransfer(
+                            ledger,
+                            mir.pot,
+                            coin,
+                            &mir_reserves_changes,
+                            &mir_treasury_changes,
+                            &mir_delta_reserves_change,
+                            &mir_delta_treasury_change,
+                        );
+                    },
+                }
             },
             .reg_deposit => |reg| {
                 if (findPendingStakeNext(stake_changes.items, reg.cred) != null or ledger.lookupStakeDeposit(reg.cred) != null) {
@@ -582,7 +683,11 @@ pub fn evaluateCertificateEffect(
     return .{
         .deposits = deposits,
         .refunds = refunds,
+        .mir_delta_reserves_change = mir_delta_reserves_change,
+        .mir_delta_treasury_change = mir_delta_treasury_change,
         .stake_deposit_changes = try stake_changes.toOwnedSlice(allocator),
+        .mir_reserves_changes = try mir_reserves_changes.toOwnedSlice(allocator),
+        .mir_treasury_changes = try mir_treasury_changes.toOwnedSlice(allocator),
         .pool_deposit_changes = try pool_changes.toOwnedSlice(allocator),
         .pool_config_changes = try pool_config_changes.toOwnedSlice(allocator),
         .future_pool_param_changes = try future_pool_param_changes.toOwnedSlice(allocator),
@@ -594,6 +699,110 @@ pub fn evaluateCertificateEffect(
         .stake_pool_delegation_changes = try stake_pool_delegation_changes.toOwnedSlice(allocator),
         .drep_delegation_changes = try drep_delegation_changes.toOwnedSlice(allocator),
     };
+}
+
+fn applyPreAlonzoMirRewards(
+    allocator: std.mem.Allocator,
+    ledger: *const LedgerDB,
+    pot: MIRPot,
+    rewards: []const cert_mod.MIRReward,
+    mir_reserves_changes: *std.ArrayList(MIRRewardChange),
+    mir_treasury_changes: *std.ArrayList(MIRRewardChange),
+) !void {
+    const target_changes = switch (pot) {
+        .reserves => mir_reserves_changes,
+        .treasury => mir_treasury_changes,
+    };
+
+    for (rewards) |reward| {
+        if (reward.delta < 0) return error.InvalidCertificate;
+        try setPendingMirRewardNext(
+            allocator,
+            target_changes,
+            ledger,
+            pot,
+            reward.credential,
+            if (reward.delta == 0) null else @as(Coin, @intCast(reward.delta)),
+        );
+    }
+
+    const available = switch (pot) {
+        .reserves => ledger.getReservesBalance(),
+        .treasury => ledger.getTreasuryBalance(),
+    };
+    if (sumPendingMirRewards(ledger, pot, target_changes.items) > available) return error.InvalidCertificate;
+}
+
+fn applyPostAlonzoMirRewards(
+    allocator: std.mem.Allocator,
+    ledger: *const LedgerDB,
+    pot: MIRPot,
+    rewards: []const cert_mod.MIRReward,
+    mir_reserves_changes: *std.ArrayList(MIRRewardChange),
+    mir_treasury_changes: *std.ArrayList(MIRRewardChange),
+    mir_delta_reserves_change: ?DeltaCoinStateChange,
+    mir_delta_treasury_change: ?DeltaCoinStateChange,
+) !void {
+    const target_changes = switch (pot) {
+        .reserves => mir_reserves_changes,
+        .treasury => mir_treasury_changes,
+    };
+
+    for (rewards) |reward| {
+        const previous = effectiveMirReward(target_changes.items, ledger, pot, reward.credential) orelse 0;
+        const next_amount = @as(i128, @intCast(previous)) + reward.delta;
+        if (next_amount < 0 or next_amount > std.math.maxInt(Coin)) return error.InvalidCertificate;
+        try setPendingMirRewardNext(
+            allocator,
+            target_changes,
+            ledger,
+            pot,
+            reward.credential,
+            if (next_amount == 0) null else @as(Coin, @intCast(next_amount)),
+        );
+    }
+
+    const available = effectiveMirPotBalance(ledger, pot, mir_delta_reserves_change, mir_delta_treasury_change) orelse {
+        return error.InvalidCertificate;
+    };
+    if (sumPendingMirRewards(ledger, pot, target_changes.items) > available) return error.InvalidCertificate;
+}
+
+fn applyMirPotTransfer(
+    ledger: *const LedgerDB,
+    pot: MIRPot,
+    coin: Coin,
+    mir_reserves_changes: *const std.ArrayList(MIRRewardChange),
+    mir_treasury_changes: *const std.ArrayList(MIRRewardChange),
+    mir_delta_reserves_change: *?DeltaCoinStateChange,
+    mir_delta_treasury_change: *?DeltaCoinStateChange,
+) !void {
+    const available = switch (pot) {
+        .reserves => blk: {
+            const pot_total = effectiveMirPotBalance(ledger, .reserves, mir_delta_reserves_change.*, mir_delta_treasury_change.*) orelse break :blk 0;
+            break :blk pot_total -| sumPendingMirRewards(ledger, .reserves, mir_reserves_changes.items);
+        },
+        .treasury => blk: {
+            const pot_total = effectiveMirPotBalance(ledger, .treasury, mir_delta_reserves_change.*, mir_delta_treasury_change.*) orelse break :blk 0;
+            break :blk pot_total -| sumPendingMirRewards(ledger, .treasury, mir_treasury_changes.items);
+        },
+    };
+    if (coin > available) return error.InvalidCertificate;
+
+    const transfer_delta = std.math.cast(DeltaCoin, coin) orelse return error.InvalidCertificate;
+    const current_reserves_delta = effectiveMirDelta(ledger.getMirDeltaReserves(), mir_delta_reserves_change.*);
+    const current_treasury_delta = effectiveMirDelta(ledger.getMirDeltaTreasury(), mir_delta_treasury_change.*);
+
+    switch (pot) {
+        .reserves => {
+            setPendingDeltaCoinChange(mir_delta_reserves_change, ledger.getMirDeltaReserves(), current_reserves_delta - transfer_delta);
+            setPendingDeltaCoinChange(mir_delta_treasury_change, ledger.getMirDeltaTreasury(), current_treasury_delta + transfer_delta);
+        },
+        .treasury => {
+            setPendingDeltaCoinChange(mir_delta_reserves_change, ledger.getMirDeltaReserves(), current_reserves_delta + transfer_delta);
+            setPendingDeltaCoinChange(mir_delta_treasury_change, ledger.getMirDeltaTreasury(), current_treasury_delta - transfer_delta);
+        },
+    }
 }
 
 fn isStakeRegistered(
@@ -709,6 +918,125 @@ fn findPendingRewardNext(changes: []const RewardBalanceChange, account: types.Re
         }
     }
     return null;
+}
+
+fn findPendingMirRewardNext(
+    changes: []const MIRRewardChange,
+    credential: types.Credential,
+) ??Coin {
+    for (changes) |change| {
+        if (types.Credential.eql(change.credential, credential)) return change.next;
+    }
+    return null;
+}
+
+fn setPendingMirRewardNext(
+    allocator: std.mem.Allocator,
+    changes: *std.ArrayList(MIRRewardChange),
+    ledger: *const LedgerDB,
+    pot: MIRPot,
+    credential: types.Credential,
+    next: ?Coin,
+) !void {
+    for (changes.items) |*change| {
+        if (types.Credential.eql(change.credential, credential)) {
+            change.next = next;
+            return;
+        }
+    }
+
+    try changes.append(allocator, .{
+        .credential = credential,
+        .previous = ledger.lookupMirReward(pot, credential),
+        .next = next,
+    });
+}
+
+fn effectiveMirReward(
+    changes: []const MIRRewardChange,
+    ledger: *const LedgerDB,
+    pot: MIRPot,
+    credential: types.Credential,
+) ?Coin {
+    if (findPendingMirRewardNext(changes, credential)) |pending| {
+        return pending;
+    }
+    return ledger.lookupMirReward(pot, credential);
+}
+
+fn sumPendingMirRewards(
+    ledger: *const LedgerDB,
+    pot: MIRPot,
+    changes: []const MIRRewardChange,
+) Coin {
+    const map = switch (pot) {
+        .reserves => &ledger.mir_reserves,
+        .treasury => &ledger.mir_treasury,
+    };
+
+    var total: Coin = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (findPendingMirRewardNext(changes, entry.key_ptr.*)) |pending| {
+            if (pending) |amount| total += amount;
+        } else {
+            total += entry.value_ptr.*;
+        }
+    }
+
+    for (changes) |change| {
+        if (ledger.lookupMirReward(pot, change.credential) != null) continue;
+        if (change.next) |amount| total += amount;
+    }
+
+    return total;
+}
+
+fn effectiveMirDelta(current: DeltaCoin, change: ?DeltaCoinStateChange) DeltaCoin {
+    if (change) |pending| return pending.next;
+    return current;
+}
+
+fn effectiveMirPotBalance(
+    ledger: *const LedgerDB,
+    pot: MIRPot,
+    mir_delta_reserves_change: ?DeltaCoinStateChange,
+    mir_delta_treasury_change: ?DeltaCoinStateChange,
+) ?Coin {
+    return switch (pot) {
+        .reserves => addDeltaCoinChecked(
+            ledger.getReservesBalance(),
+            effectiveMirDelta(ledger.getMirDeltaReserves(), mir_delta_reserves_change),
+        ),
+        .treasury => addDeltaCoinChecked(
+            ledger.getTreasuryBalance(),
+            effectiveMirDelta(ledger.getMirDeltaTreasury(), mir_delta_treasury_change),
+        ),
+    };
+}
+
+fn setPendingDeltaCoinChange(
+    change: *?DeltaCoinStateChange,
+    previous: DeltaCoin,
+    next: DeltaCoin,
+) void {
+    if (change.*) |*pending| {
+        pending.next = next;
+    } else {
+        change.* = .{
+            .previous = previous,
+            .next = next,
+        };
+    }
+}
+
+fn addDeltaCoinChecked(base: Coin, delta: DeltaCoin) ?Coin {
+    if (delta >= 0) {
+        return base + @as(Coin, @intCast(delta));
+    }
+    const abs_delta: Coin = @intCast(-delta);
+    if (abs_delta > base) return null;
+    return base - abs_delta;
 }
 
 fn findPendingStakeNext(changes: []const StakeDepositChange, credential: types.Credential) ??Coin {
@@ -1234,6 +1562,112 @@ test "rules: explicit stake deposit cert must match current pp" {
     try std.testing.expectError(
         error.InvalidCertificate,
         evaluateCertificateEffect(allocator, &tx, &ledger, ProtocolParams.mainnet_defaults),
+    );
+}
+
+test "rules: post-Alonzo MIR cert stages rewards and pot transfer" {
+    const allocator = std.testing.allocator;
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-rules-mir-post-alonzo");
+    defer ledger.deinit();
+
+    const cred = types.Credential{
+        .cred_type = .key_hash,
+        .hash = [_]u8{0xca} ** 28,
+    };
+    ledger.importReservesBalance(200);
+    ledger.importTreasuryBalance(50);
+
+    const tx = TxBody{
+        .tx_id = [_]u8{0x70} ** 32,
+        .inputs = &[_]TxIn{},
+        .outputs = &[_]transaction.TxOut{},
+        .certificates = &[_]transaction.Certificate{
+            .{ .mir = .{
+                .pot = .reserves,
+                .target = .{ .stake_addresses = &[_]cert_mod.MIRReward{
+                    .{ .credential = cred, .delta = 40 },
+                } },
+            } },
+            .{ .mir = .{
+                .pot = .reserves,
+                .target = .{ .send_to_other_pot = 25 },
+            } },
+        },
+        .fee = 0,
+        .withdrawals = &[_]transaction.Withdrawal{},
+        .withdrawal_total = 0,
+        .ttl = null,
+        .validity_start = null,
+        .update = null,
+        .raw_cbor = &[_]u8{},
+    };
+
+    var effect = try evaluateCertificateEffectWithContext(
+        allocator,
+        &tx,
+        &ledger,
+        ProtocolParams.mainnet_defaults,
+        .{
+            .current_slot = 10,
+            .protocol_version_major = 5,
+            .epoch_length = 100,
+            .stability_window = 10,
+        },
+    );
+    defer effect.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), effect.mir_reserves_changes.len);
+    try std.testing.expectEqual(@as(?Coin, 40), effect.mir_reserves_changes[0].next);
+    try std.testing.expectEqual(@as(?DeltaCoinStateChange, .{ .previous = 0, .next = -25 }), effect.mir_delta_reserves_change);
+    try std.testing.expectEqual(@as(?DeltaCoinStateChange, .{ .previous = 0, .next = 25 }), effect.mir_delta_treasury_change);
+}
+
+test "rules: pre-Alonzo MIR rejects negative updates" {
+    const allocator = std.testing.allocator;
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-rules-mir-pre-alonzo");
+    defer ledger.deinit();
+
+    const tx = TxBody{
+        .tx_id = [_]u8{0x71} ** 32,
+        .inputs = &[_]TxIn{},
+        .outputs = &[_]transaction.TxOut{},
+        .certificates = &[_]transaction.Certificate{
+            .{ .mir = .{
+                .pot = .reserves,
+                .target = .{ .stake_addresses = &[_]cert_mod.MIRReward{
+                    .{
+                        .credential = .{
+                            .cred_type = .key_hash,
+                            .hash = [_]u8{0xcb} ** 28,
+                        },
+                        .delta = -1,
+                    },
+                } },
+            } },
+        },
+        .fee = 0,
+        .withdrawals = &[_]transaction.Withdrawal{},
+        .withdrawal_total = 0,
+        .ttl = null,
+        .validity_start = null,
+        .update = null,
+        .raw_cbor = &[_]u8{},
+    };
+
+    try std.testing.expectError(
+        error.InvalidCertificate,
+        evaluateCertificateEffectWithContext(
+            allocator,
+            &tx,
+            &ledger,
+            ProtocolParams.mainnet_defaults,
+            .{
+                .current_slot = 10,
+                .protocol_version_major = 4,
+                .epoch_length = 100,
+                .stability_window = 10,
+            },
+        ),
     );
 }
 
