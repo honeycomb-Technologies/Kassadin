@@ -372,6 +372,7 @@ pub fn evaluateCertificateEffectWithContext(
                 );
             },
             .stake_deregistration => |cred| {
+                if (rewardBalanceAfterWithdrawals(tx, ledger, cred) != 0) return error.InvalidCertificate;
                 if (findPendingStakeNext(stake_changes.items, cred)) |pending| {
                     const deposit = pending orelse return error.InvalidCertificate;
                     refunds += deposit;
@@ -522,6 +523,7 @@ pub fn evaluateCertificateEffectWithContext(
                 });
             },
             .unreg_deposit => |unreg| {
+                if (rewardBalanceAfterWithdrawals(tx, ledger, unreg.cred) != 0) return error.InvalidCertificate;
                 if (findPendingStakeNext(stake_changes.items, unreg.cred)) |pending| {
                     const deposit = pending orelse return error.InvalidCertificate;
                     if (deposit != unreg.refund) return error.InvalidCertificate;
@@ -1037,6 +1039,31 @@ fn addDeltaCoinChecked(base: Coin, delta: DeltaCoin) ?Coin {
     const abs_delta: Coin = @intCast(-delta);
     if (abs_delta > base) return null;
     return base - abs_delta;
+}
+
+fn rewardBalanceAfterWithdrawals(
+    tx: *const TxBody,
+    ledger: *const LedgerDB,
+    credential: types.Credential,
+) Coin {
+    if (!ledger.areRewardBalancesTracked()) return 0;
+
+    const account = types.RewardAccount{
+        .network = ledger.reward_account_network,
+        .credential = credential,
+    };
+    const current = ledger.lookupRewardBalance(account) orelse 0;
+    if (current == 0) return 0;
+
+    for (tx.withdrawals) |withdrawal| {
+        if (withdrawal.account.network == account.network and
+            types.Credential.eql(withdrawal.account.credential, account.credential))
+        {
+            return 0;
+        }
+    }
+
+    return current;
 }
 
 fn findPendingStakeNext(changes: []const StakeDepositChange, credential: types.Credential) ??Coin {
@@ -2097,6 +2124,93 @@ test "rules: untracked reward withdrawal still accepts amount on faith" {
     }
     try std.testing.expectEqual(@as(Coin, 4_000_000), effect.withdrawn);
     try std.testing.expectEqual(@as(usize, 0), effect.reward_balance_changes.len);
+}
+
+test "rules: stake deregistration rejects non-empty tracked reward account" {
+    const allocator = std.testing.allocator;
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-rules-stake-dereg-reward");
+    defer ledger.deinit();
+
+    const cred = types.Credential{
+        .cred_type = .key_hash,
+        .hash = [_]u8{0x8a} ** 28,
+    };
+    const account = types.RewardAccount{
+        .network = .testnet,
+        .credential = cred,
+    };
+    ledger.setRewardAccountNetwork(.testnet);
+    ledger.setRewardBalancesTracked(true);
+    try ledger.importStakeDeposit(cred, ProtocolParams.mainnet_defaults.key_deposit);
+    try ledger.setRewardBalance(account, 3_000_000);
+
+    const tx = TxBody{
+        .tx_id = [_]u8{0x74} ** 32,
+        .inputs = &[_]TxIn{},
+        .outputs = &[_]transaction.TxOut{},
+        .certificates = &[_]transaction.Certificate{
+            .{ .stake_deregistration = cred },
+        },
+        .fee = 0,
+        .withdrawals = &[_]transaction.Withdrawal{},
+        .withdrawal_total = 0,
+        .ttl = null,
+        .validity_start = null,
+        .update = null,
+        .raw_cbor = &[_]u8{},
+    };
+
+    try std.testing.expectError(
+        error.InvalidCertificate,
+        evaluateCertificateEffect(allocator, &tx, &ledger, ProtocolParams.mainnet_defaults),
+    );
+}
+
+test "rules: stake deregistration accepts same-tx reward drain" {
+    const allocator = std.testing.allocator;
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-rules-stake-dereg-withdraw");
+    defer ledger.deinit();
+
+    const cred = types.Credential{
+        .cred_type = .key_hash,
+        .hash = [_]u8{0x8b} ** 28,
+    };
+    const account = types.RewardAccount{
+        .network = .testnet,
+        .credential = cred,
+    };
+    ledger.setRewardAccountNetwork(.testnet);
+    ledger.setRewardBalancesTracked(true);
+    try ledger.importStakeDeposit(cred, ProtocolParams.mainnet_defaults.key_deposit);
+    try ledger.setRewardBalance(account, 3_000_000);
+
+    const tx = TxBody{
+        .tx_id = [_]u8{0x75} ** 32,
+        .inputs = &[_]TxIn{},
+        .outputs = &[_]transaction.TxOut{},
+        .certificates = &[_]transaction.Certificate{
+            .{ .stake_deregistration = cred },
+        },
+        .fee = 0,
+        .withdrawals = &[_]transaction.Withdrawal{
+            .{
+                .account = account,
+                .amount = 3_000_000,
+            },
+        },
+        .withdrawal_total = 3_000_000,
+        .ttl = null,
+        .validity_start = null,
+        .update = null,
+        .raw_cbor = &[_]u8{},
+    };
+
+    var effect = try evaluateCertificateEffect(allocator, &tx, &ledger, ProtocolParams.mainnet_defaults);
+    defer effect.deinit(allocator);
+
+    try std.testing.expectEqual(@as(Coin, ProtocolParams.mainnet_defaults.key_deposit), effect.refunds);
+    try std.testing.expectEqual(@as(usize, 1), effect.stake_deposit_changes.len);
+    try std.testing.expect(effect.stake_deposit_changes[0].next == null);
 }
 
 test "rules: validateTx rejects invalid certificate instead of falling back" {
