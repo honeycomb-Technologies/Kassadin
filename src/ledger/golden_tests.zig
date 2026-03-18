@@ -143,7 +143,8 @@ test "golden: parse 3 real certificates" {
     // Cert 0: StakeRegistration (tag 0)
     const cert0_raw = try cert_dec.sliceOfNextValue();
     var c0_dec = Decoder.init(cert0_raw);
-    const cert0 = try cert_mod.parseCertificate(&c0_dec);
+    var cert0 = try cert_mod.parseCertificate(allocator, &c0_dec);
+    defer cert_mod.freeCertificate(allocator, &cert0);
     switch (cert0) {
         .stake_registration => |cred| {
             try std.testing.expectEqual(cert_mod.CredentialType.key_hash, cred.cred_type);
@@ -162,7 +163,8 @@ test "golden: parse 3 real certificates" {
     // Cert 1: PoolRegistration (tag 3) — skip detailed check, just verify tag
     const cert1_raw = try cert_dec.sliceOfNextValue();
     var c1_dec = Decoder.init(cert1_raw);
-    const cert1 = try cert_mod.parseCertificate(&c1_dec);
+    var cert1 = try cert_mod.parseCertificate(allocator, &c1_dec);
+    defer cert_mod.freeCertificate(allocator, &cert1);
     switch (cert1) {
         .pool_registration => |pp| {
             // Python: pledge=1, cost=5
@@ -175,7 +177,8 @@ test "golden: parse 3 real certificates" {
     // Cert 2: MIR (tag 6)
     const cert2_raw = try cert_dec.sliceOfNextValue();
     var c2_dec = Decoder.init(cert2_raw);
-    const cert2 = try cert_mod.parseCertificate(&c2_dec);
+    var cert2 = try cert_mod.parseCertificate(allocator, &c2_dec);
+    defer cert_mod.freeCertificate(allocator, &cert2);
     try std.testing.expect(cert2 == .mir);
 }
 

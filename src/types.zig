@@ -232,6 +232,11 @@ pub const RewardAccount = struct {
     }
 };
 
+pub const PoolOwnerMembership = struct {
+    pool: KeyHash,
+    owner: KeyHash,
+};
+
 // ── 6. Protocol Version and Nonce ──
 
 pub const ProtVer = struct {

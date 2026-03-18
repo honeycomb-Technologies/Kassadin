@@ -14,6 +14,7 @@ pub const Credential = types.Credential;
 pub const KeyHash = types.KeyHash;
 pub const RewardAccount = types.RewardAccount;
 pub const UnitInterval = types.UnitInterval;
+pub const PoolOwnerMembership = types.PoolOwnerMembership;
 pub const DRep = certificates.DRep;
 pub const StakeSnapshots = stake_mod.StakeSnapshots;
 pub const StakeDistribution = stake_mod.StakeDistribution;
@@ -41,6 +42,8 @@ pub const LedgerDiff = struct {
     pool_config_changes: []const PoolConfigChange = &.{},
     future_pool_param_changes: []const FuturePoolParamsChange = &.{},
     pool_reward_account_changes: []const PoolRewardAccountChange = &.{},
+    pool_owner_changes: []const PoolOwnerMembershipChange = &.{},
+    future_pool_owner_changes: []const PoolOwnerMembershipChange = &.{},
     pool_retirement_changes: []const PoolRetirementChange = &.{},
     drep_deposit_changes: []const DRepDepositChange = &.{},
     stake_pool_delegation_changes: []const StakePoolDelegationChange = &.{},
@@ -99,6 +102,12 @@ pub const PoolRewardAccountChange = struct {
     next: ?RewardAccount,
 };
 
+pub const PoolOwnerMembershipChange = struct {
+    membership: PoolOwnerMembership,
+    previous: bool,
+    next: bool,
+};
+
 pub const PoolRetirementChange = struct {
     pool: KeyHash,
     previous: ?EpochNo,
@@ -144,6 +153,8 @@ pub const LedgerDB = struct {
     pool_configs: std.AutoHashMap(KeyHash, PoolConfig),
     future_pool_params: std.AutoHashMap(KeyHash, FuturePoolParams),
     pool_reward_accounts: std.AutoHashMap(KeyHash, RewardAccount),
+    pool_owners: std.AutoHashMap(PoolOwnerMembership, void),
+    future_pool_owners: std.AutoHashMap(PoolOwnerMembership, void),
     pool_retirements: std.AutoHashMap(KeyHash, EpochNo),
     drep_deposits: std.AutoHashMap(Credential, Coin),
     stake_pool_delegations: std.AutoHashMap(Credential, KeyHash),
@@ -180,6 +191,8 @@ pub const LedgerDB = struct {
             .pool_configs = std.AutoHashMap(KeyHash, PoolConfig).init(allocator),
             .future_pool_params = std.AutoHashMap(KeyHash, FuturePoolParams).init(allocator),
             .pool_reward_accounts = std.AutoHashMap(KeyHash, RewardAccount).init(allocator),
+            .pool_owners = std.AutoHashMap(PoolOwnerMembership, void).init(allocator),
+            .future_pool_owners = std.AutoHashMap(PoolOwnerMembership, void).init(allocator),
             .pool_retirements = std.AutoHashMap(KeyHash, EpochNo).init(allocator),
             .drep_deposits = std.AutoHashMap(Credential, Coin).init(allocator),
             .stake_pool_delegations = std.AutoHashMap(Credential, KeyHash).init(allocator),
@@ -204,6 +217,8 @@ pub const LedgerDB = struct {
         self.pool_configs.deinit();
         self.future_pool_params.deinit();
         self.pool_reward_accounts.deinit();
+        self.pool_owners.deinit();
+        self.future_pool_owners.deinit();
         self.pool_retirements.deinit();
         self.drep_deposits.deinit();
         self.stake_pool_delegations.deinit();
@@ -219,6 +234,8 @@ pub const LedgerDB = struct {
             freePoolConfigChanges(self.allocator, diff.pool_config_changes);
             freeFuturePoolParamChanges(self.allocator, diff.future_pool_param_changes);
             freePoolRewardAccountChanges(self.allocator, diff.pool_reward_account_changes);
+            freePoolOwnerMembershipChanges(self.allocator, diff.pool_owner_changes);
+            freePoolOwnerMembershipChanges(self.allocator, diff.future_pool_owner_changes);
             freePoolRetirementChanges(self.allocator, diff.pool_retirement_changes);
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
@@ -257,6 +274,8 @@ pub const LedgerDB = struct {
         applyPoolConfigChanges(&self.pool_configs, diff.pool_config_changes);
         applyFuturePoolParamChanges(&self.future_pool_params, diff.future_pool_param_changes);
         applyPoolRewardAccountChanges(&self.pool_reward_accounts, diff.pool_reward_account_changes);
+        applyPoolOwnerMembershipChanges(&self.pool_owners, diff.pool_owner_changes);
+        applyPoolOwnerMembershipChanges(&self.future_pool_owners, diff.future_pool_owner_changes);
         applyPoolRetirementChanges(&self.pool_retirements, diff.pool_retirement_changes);
         applyDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
         applyStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
@@ -277,6 +296,8 @@ pub const LedgerDB = struct {
             freePoolConfigChanges(self.allocator, old.pool_config_changes);
             freeFuturePoolParamChanges(self.allocator, old.future_pool_param_changes);
             freePoolRewardAccountChanges(self.allocator, old.pool_reward_account_changes);
+            freePoolOwnerMembershipChanges(self.allocator, old.pool_owner_changes);
+            freePoolOwnerMembershipChanges(self.allocator, old.future_pool_owner_changes);
             freePoolRetirementChanges(self.allocator, old.pool_retirement_changes);
             freeDRepChanges(self.allocator, old.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, old.stake_pool_delegation_changes);
@@ -323,6 +344,8 @@ pub const LedgerDB = struct {
             rollbackPoolConfigChanges(&self.pool_configs, diff.pool_config_changes);
             rollbackFuturePoolParamChanges(&self.future_pool_params, diff.future_pool_param_changes);
             rollbackPoolRewardAccountChanges(&self.pool_reward_accounts, diff.pool_reward_account_changes);
+            rollbackPoolOwnerMembershipChanges(&self.pool_owners, diff.pool_owner_changes);
+            rollbackPoolOwnerMembershipChanges(&self.future_pool_owners, diff.future_pool_owner_changes);
             rollbackPoolRetirementChanges(&self.pool_retirements, diff.pool_retirement_changes);
             rollbackDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
             rollbackStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
@@ -332,6 +355,8 @@ pub const LedgerDB = struct {
             freePoolConfigChanges(self.allocator, diff.pool_config_changes);
             freeFuturePoolParamChanges(self.allocator, diff.future_pool_param_changes);
             freePoolRewardAccountChanges(self.allocator, diff.pool_reward_account_changes);
+            freePoolOwnerMembershipChanges(self.allocator, diff.pool_owner_changes);
+            freePoolOwnerMembershipChanges(self.allocator, diff.future_pool_owner_changes);
             freePoolRetirementChanges(self.allocator, diff.pool_retirement_changes);
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
@@ -418,6 +443,20 @@ pub const LedgerDB = struct {
         try self.pool_reward_accounts.put(pool, account);
     }
 
+    pub fn importPoolOwnerMembership(self: *LedgerDB, pool: KeyHash, owner: KeyHash) !void {
+        try self.pool_owners.put(.{
+            .pool = pool,
+            .owner = owner,
+        }, {});
+    }
+
+    pub fn importFuturePoolOwnerMembership(self: *LedgerDB, pool: KeyHash, owner: KeyHash) !void {
+        try self.future_pool_owners.put(.{
+            .pool = pool,
+            .owner = owner,
+        }, {});
+    }
+
     pub fn importPoolConfig(self: *LedgerDB, pool: KeyHash, config: PoolConfig) !void {
         try self.pool_configs.put(pool, config);
     }
@@ -489,6 +528,38 @@ pub const LedgerDB = struct {
 
     pub fn lookupPoolRewardAccount(self: *const LedgerDB, pool: KeyHash) ?RewardAccount {
         return self.pool_reward_accounts.get(pool);
+    }
+
+    pub fn isPoolOwner(self: *const LedgerDB, pool: KeyHash, owner: KeyHash) bool {
+        return self.pool_owners.contains(.{
+            .pool = pool,
+            .owner = owner,
+        });
+    }
+
+    pub fn isFuturePoolOwner(self: *const LedgerDB, pool: KeyHash, owner: KeyHash) bool {
+        return self.future_pool_owners.contains(.{
+            .pool = pool,
+            .owner = owner,
+        });
+    }
+
+    pub fn listPoolOwners(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        pool: KeyHash,
+        future: bool,
+    ) ![]KeyHash {
+        var owners: std.ArrayList(KeyHash) = .empty;
+        defer owners.deinit(allocator);
+
+        var it = if (future) self.future_pool_owners.iterator() else self.pool_owners.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, &entry.key_ptr.pool, &pool)) continue;
+            try owners.append(allocator, entry.key_ptr.owner);
+        }
+
+        return owners.toOwnedSlice(allocator);
     }
 
     pub fn lookupPoolRetirement(self: *const LedgerDB, pool: KeyHash) ?EpochNo {
@@ -595,6 +666,10 @@ pub const LedgerDB = struct {
         defer future_pool_param_changes.deinit(allocator);
         var pool_reward_account_changes: std.ArrayList(PoolRewardAccountChange) = .empty;
         defer pool_reward_account_changes.deinit(allocator);
+        var pool_owner_changes: std.ArrayList(PoolOwnerMembershipChange) = .empty;
+        defer pool_owner_changes.deinit(allocator);
+        var future_pool_owner_changes: std.ArrayList(PoolOwnerMembershipChange) = .empty;
+        defer future_pool_owner_changes.deinit(allocator);
         var pool_retirement_changes: std.ArrayList(PoolRetirementChange) = .empty;
         defer pool_retirement_changes.deinit(allocator);
         var stake_pool_delegation_changes: std.ArrayList(StakePoolDelegationChange) = .empty;
@@ -618,6 +693,35 @@ pub const LedgerDB = struct {
                 .previous = entry.value_ptr.*,
                 .next = null,
             });
+
+            var existing_owner_it = self.pool_owners.iterator();
+            while (existing_owner_it.next()) |owner_entry| {
+                if (!std.mem.eql(u8, &owner_entry.key_ptr.pool, entry.key_ptr)) continue;
+                if (!self.future_pool_owners.contains(owner_entry.key_ptr.*)) {
+                    try pool_owner_changes.append(allocator, .{
+                        .membership = owner_entry.key_ptr.*,
+                        .previous = true,
+                        .next = false,
+                    });
+                }
+            }
+
+            var staged_owner_it = self.future_pool_owners.iterator();
+            while (staged_owner_it.next()) |owner_entry| {
+                if (!std.mem.eql(u8, &owner_entry.key_ptr.pool, entry.key_ptr)) continue;
+                try future_pool_owner_changes.append(allocator, .{
+                    .membership = owner_entry.key_ptr.*,
+                    .previous = true,
+                    .next = false,
+                });
+                if (!self.pool_owners.contains(owner_entry.key_ptr.*)) {
+                    try pool_owner_changes.append(allocator, .{
+                        .membership = owner_entry.key_ptr.*,
+                        .previous = false,
+                        .next = true,
+                    });
+                }
+            }
         }
 
         if (retired_pools.items.len == 0 and future_pool_param_changes.items.len == 0) return null;
@@ -659,6 +763,26 @@ pub const LedgerDB = struct {
                 });
             }
 
+            var owner_it = self.pool_owners.iterator();
+            while (owner_it.next()) |owner_entry| {
+                if (!std.mem.eql(u8, &owner_entry.key_ptr.pool, &pool)) continue;
+                try pool_owner_changes.append(allocator, .{
+                    .membership = owner_entry.key_ptr.*,
+                    .previous = true,
+                    .next = false,
+                });
+            }
+
+            var future_owner_it = self.future_pool_owners.iterator();
+            while (future_owner_it.next()) |owner_entry| {
+                if (!std.mem.eql(u8, &owner_entry.key_ptr.pool, &pool)) continue;
+                try future_pool_owner_changes.append(allocator, .{
+                    .membership = owner_entry.key_ptr.*,
+                    .previous = true,
+                    .next = false,
+                });
+            }
+
             try pool_retirement_changes.append(allocator, .{
                 .pool = pool,
                 .previous = epoch,
@@ -691,6 +815,8 @@ pub const LedgerDB = struct {
             .pool_config_changes = try pool_config_changes.toOwnedSlice(allocator),
             .future_pool_param_changes = try future_pool_param_changes.toOwnedSlice(allocator),
             .pool_reward_account_changes = try pool_reward_account_changes.toOwnedSlice(allocator),
+            .pool_owner_changes = try pool_owner_changes.toOwnedSlice(allocator),
+            .future_pool_owner_changes = try future_pool_owner_changes.toOwnedSlice(allocator),
             .pool_retirement_changes = try pool_retirement_changes.toOwnedSlice(allocator),
             .stake_pool_delegation_changes = try stake_pool_delegation_changes.toOwnedSlice(allocator),
         };
@@ -713,9 +839,14 @@ pub const LedgerDB = struct {
                 const delegated = balance + deposit;
                 if (delegated == 0) continue;
 
+                const is_owner = cred.cred_type == .key_hash and self.isPoolOwner(pool, cred.hash);
                 mark.setDelegatedStake(cred, pool, delegated) catch {};
                 if (mark.pools.getPtr(pool)) |existing| {
                     existing.active_stake += delegated;
+                    if (is_owner) {
+                        existing.self_delegated_owner_stake += delegated;
+                        mark.setPoolOwnerMembership(pool, cred.hash) catch {};
+                    }
                 } else {
                     const current_config = self.lookupPoolConfig(pool);
                     const current_reward_account = self.lookupPoolRewardAccount(pool);
@@ -724,7 +855,18 @@ pub const LedgerDB = struct {
                     const cost = if (current_config) |config| config.cost else if (pool_template) |template| template.cost else 0;
                     const margin = if (current_config) |config| config.margin else if (pool_template) |template| template.margin else types.UnitInterval{ .numerator = 0, .denominator = 1 };
                     const reward_account = if (current_reward_account) |account| account else if (pool_template) |template| template.reward_account else continue;
-                    mark.setPoolStake(pool, delegated, pledge, cost, margin, reward_account) catch {};
+                    mark.setPoolStake(
+                        pool,
+                        delegated,
+                        if (is_owner) delegated else 0,
+                        pledge,
+                        cost,
+                        margin,
+                        reward_account,
+                    ) catch {};
+                    if (is_owner) {
+                        mark.setPoolOwnerMembership(pool, cred.hash) catch {};
+                    }
                 }
             }
             mark.finalize();
@@ -758,6 +900,7 @@ pub const LedgerDB = struct {
         while (pool_it.next()) |entry| {
             const pool_stake = entry.value_ptr;
             if (pool_stake.active_stake == 0) continue;
+            if (pool_stake.self_delegated_owner_stake < pool_stake.pledge) continue;
 
             const pool_reward = rewards_mod.calculatePoolReward(
                 pool_stake.active_stake,
@@ -770,47 +913,54 @@ pub const LedgerDB = struct {
             );
             if (pool_reward == 0) continue;
 
-            const split = rewards_mod.splitPoolReward(
+            const leader_reward = rewards_mod.calculatePoolLeaderReward(
                 pool_reward,
                 pool_stake.cost,
                 pool_stake.margin,
+                pool_stake.self_delegated_owner_stake,
+                pool_stake.active_stake,
             );
 
-            if (split.leader_reward > 0) {
+            if (leader_reward > 0) {
                 try appendPoolReapRewardChange(
                     allocator,
                     &reward_changes,
                     self,
                     pool_stake.reward_account,
-                    split.leader_reward,
+                    leader_reward,
                 );
-                total_distributed += split.leader_reward;
+                total_distributed += leader_reward;
             }
 
-            if (split.member_rewards > 0) {
-                var member_distributed: Coin = 0;
-                var deleg_it = go_dist.delegators.iterator();
-                while (deleg_it.next()) |deleg_entry| {
-                    const delegated = deleg_entry.value_ptr.*;
-                    if (!std.mem.eql(u8, &delegated.pool_id, entry.key_ptr)) continue;
-                    if (delegated.active_stake == 0) continue;
-
-                    const reward = @as(Coin, @intCast(
-                        (@as(u128, split.member_rewards) * delegated.active_stake) / pool_stake.active_stake,
-                    ));
-                    if (reward == 0) continue;
-
-                    try appendPoolReapRewardChange(
-                        allocator,
-                        &reward_changes,
-                        self,
-                        .{ .network = self.reward_account_network, .credential = delegated.credential },
-                        reward,
-                    );
-                    member_distributed += reward;
+            var member_distributed: Coin = 0;
+            var deleg_it = go_dist.delegators.iterator();
+            while (deleg_it.next()) |deleg_entry| {
+                const delegated = deleg_entry.value_ptr.*;
+                if (!std.mem.eql(u8, &delegated.pool_id, entry.key_ptr)) continue;
+                if (delegated.active_stake == 0) continue;
+                if (delegated.credential.cred_type == .key_hash and go_dist.isPoolOwner(entry.key_ptr.*, delegated.credential.hash)) {
+                    continue;
                 }
-                total_distributed += member_distributed;
+
+                const reward = rewards_mod.calculatePoolMemberReward(
+                    pool_reward,
+                    pool_stake.cost,
+                    pool_stake.margin,
+                    delegated.active_stake,
+                    pool_stake.active_stake,
+                );
+                if (reward == 0) continue;
+
+                try appendPoolReapRewardChange(
+                    allocator,
+                    &reward_changes,
+                    self,
+                    .{ .network = self.reward_account_network, .credential = delegated.credential },
+                    reward,
+                );
+                member_distributed += reward;
             }
+            total_distributed += member_distributed;
         }
 
         if (total_distributed == 0) return null;
@@ -859,7 +1009,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 3, .big);
+        std.mem.writeInt(u32, buf[0..4], 4, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -993,6 +1143,24 @@ pub const LedgerDB = struct {
             try file.writeAll(&[_]u8{@intFromEnum(entry.value_ptr.reward_account.credential.cred_type)});
             try file.writeAll(&entry.value_ptr.reward_account.credential.hash);
         }
+
+        // Section 13: Current pool owners
+        std.mem.writeInt(u64, &buf, @intCast(self.pool_owners.count()), .big);
+        try file.writeAll(&buf);
+        var pool_owner_it = self.pool_owners.iterator();
+        while (pool_owner_it.next()) |entry| {
+            try file.writeAll(&entry.key_ptr.pool);
+            try file.writeAll(&entry.key_ptr.owner);
+        }
+
+        // Section 14: Future pool owners
+        std.mem.writeInt(u64, &buf, @intCast(self.future_pool_owners.count()), .big);
+        try file.writeAll(&buf);
+        var future_owner_it = self.future_pool_owners.iterator();
+        while (future_owner_it.next()) |entry| {
+            try file.writeAll(&entry.key_ptr.pool);
+            try file.writeAll(&entry.key_ptr.owner);
+        }
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -1016,7 +1184,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -1211,6 +1379,40 @@ pub const LedgerDB = struct {
             }
         }
 
+        if (version >= 4) {
+            _ = try file.readAll(&buf);
+            const pool_owner_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < pool_owner_count) : (i += 1) {
+                var entry_buf: [56]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                var pool: KeyHash = undefined;
+                @memcpy(&pool, entry_buf[0..28]);
+                var owner: KeyHash = undefined;
+                @memcpy(&owner, entry_buf[28..56]);
+                try self.pool_owners.put(.{
+                    .pool = pool,
+                    .owner = owner,
+                }, {});
+            }
+
+            _ = try file.readAll(&buf);
+            const future_pool_owner_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < future_pool_owner_count) : (i += 1) {
+                var entry_buf: [56]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                var pool: KeyHash = undefined;
+                @memcpy(&pool, entry_buf[0..28]);
+                var owner: KeyHash = undefined;
+                @memcpy(&owner, entry_buf[28..56]);
+                try self.future_pool_owners.put(.{
+                    .pool = pool,
+                    .owner = owner,
+                }, {});
+            }
+        }
+
         return true;
     }
 
@@ -1227,6 +1429,8 @@ pub const LedgerDB = struct {
         self.pool_configs.clearRetainingCapacity();
         self.future_pool_params.clearRetainingCapacity();
         self.pool_reward_accounts.clearRetainingCapacity();
+        self.pool_owners.clearRetainingCapacity();
+        self.future_pool_owners.clearRetainingCapacity();
         self.pool_retirements.clearRetainingCapacity();
         self.drep_deposits.clearRetainingCapacity();
         self.stake_pool_delegations.clearRetainingCapacity();
@@ -1356,6 +1560,10 @@ fn freeFuturePoolParamChanges(allocator: Allocator, changes: []const FuturePoolP
 }
 
 fn freePoolRewardAccountChanges(allocator: Allocator, changes: []const PoolRewardAccountChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freePoolOwnerMembershipChanges(allocator: Allocator, changes: []const PoolOwnerMembershipChange) void {
     if (changes.len > 0) allocator.free(changes);
 }
 
@@ -1557,6 +1765,35 @@ fn rollbackPoolRewardAccountChanges(
             map.put(change.pool, account) catch unreachable;
         } else {
             _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn applyPoolOwnerMembershipChanges(
+    map: *std.AutoHashMap(PoolOwnerMembership, void),
+    changes: []const PoolOwnerMembershipChange,
+) void {
+    for (changes) |change| {
+        if (change.next) {
+            map.put(change.membership, {}) catch unreachable;
+        } else {
+            _ = map.remove(change.membership);
+        }
+    }
+}
+
+fn rollbackPoolOwnerMembershipChanges(
+    map: *std.AutoHashMap(PoolOwnerMembership, void),
+    changes: []const PoolOwnerMembershipChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) {
+            map.put(change.membership, {}) catch unreachable;
+        } else {
+            _ = map.remove(change.membership);
         }
     }
 }
@@ -1874,6 +2111,8 @@ test "ledgerdb: apply diff tracks and rolls back pool state" {
             .hash = [_]u8{0x53} ** 28,
         },
     };
+    const owner = [_]u8{0x54} ** 28;
+    const future_owner = [_]u8{0x55} ** 28;
 
     try db.applyDiff(.{
         .slot = 10,
@@ -1919,6 +2158,20 @@ test "ledgerdb: apply diff tracks and rolls back pool state" {
                 .next = account,
             },
         }),
+        .pool_owner_changes = try allocator.dupe(PoolOwnerMembershipChange, &[_]PoolOwnerMembershipChange{
+            .{
+                .membership = .{ .pool = pool, .owner = owner },
+                .previous = false,
+                .next = true,
+            },
+        }),
+        .future_pool_owner_changes = try allocator.dupe(PoolOwnerMembershipChange, &[_]PoolOwnerMembershipChange{
+            .{
+                .membership = .{ .pool = pool, .owner = future_owner },
+                .previous = false,
+                .next = true,
+            },
+        }),
         .pool_retirement_changes = try allocator.dupe(PoolRetirementChange, &[_]PoolRetirementChange{
             .{
                 .pool = pool,
@@ -1943,6 +2196,8 @@ test "ledgerdb: apply diff tracks and rolls back pool state" {
         .reward_account = future_account,
     }, db.lookupFuturePoolParams(pool).?);
     try std.testing.expectEqual(account, db.lookupPoolRewardAccount(pool).?);
+    try std.testing.expect(db.isPoolOwner(pool, owner));
+    try std.testing.expect(db.isFuturePoolOwner(pool, future_owner));
     try std.testing.expectEqual(@as(?EpochNo, 9), db.lookupPoolRetirement(pool));
 
     try db.rollback(1);
@@ -1950,6 +2205,8 @@ test "ledgerdb: apply diff tracks and rolls back pool state" {
     try std.testing.expect(db.lookupPoolConfig(pool) == null);
     try std.testing.expect(db.lookupFuturePoolParams(pool) == null);
     try std.testing.expect(db.lookupPoolRewardAccount(pool) == null);
+    try std.testing.expect(!db.isPoolOwner(pool, owner));
+    try std.testing.expect(!db.isFuturePoolOwner(pool, future_owner));
     try std.testing.expect(db.lookupPoolRetirement(pool) == null);
 }
 
@@ -2026,6 +2283,7 @@ test "ledgerdb: pool epoch transition activates future params" {
         .margin = .{ .numerator = 1, .denominator = 20 },
     });
     try db.importPoolRewardAccount(pool, current_account);
+    try db.importPoolOwnerMembership(pool, [_]u8{0x67} ** 28);
     try db.importFuturePoolParams(pool, .{
         .config = .{
             .pledge = 300_000_000,
@@ -2034,6 +2292,7 @@ test "ledgerdb: pool epoch transition activates future params" {
         },
         .reward_account = future_account,
     });
+    try db.importFuturePoolOwnerMembership(pool, [_]u8{0x68} ** 28);
 
     const diff = (try db.buildPoolReapDiff(allocator, 90, [_]u8{0x67} ** 32, 9)).?;
     try db.applyDiff(diff);
@@ -2045,6 +2304,9 @@ test "ledgerdb: pool epoch transition activates future params" {
     }, db.lookupPoolConfig(pool).?);
     try std.testing.expectEqual(future_account, db.lookupPoolRewardAccount(pool).?);
     try std.testing.expect(db.lookupFuturePoolParams(pool) == null);
+    try std.testing.expect(!db.isPoolOwner(pool, [_]u8{0x67} ** 28));
+    try std.testing.expect(db.isPoolOwner(pool, [_]u8{0x68} ** 28));
+    try std.testing.expect(!db.isFuturePoolOwner(pool, [_]u8{0x68} ** 28));
 
     try db.rollback(1);
     try std.testing.expectEqual(PoolConfig{
@@ -2061,6 +2323,8 @@ test "ledgerdb: pool epoch transition activates future params" {
         },
         .reward_account = future_account,
     }, db.lookupFuturePoolParams(pool).?);
+    try std.testing.expect(db.isPoolOwner(pool, [_]u8{0x67} ** 28));
+    try std.testing.expect(db.isFuturePoolOwner(pool, [_]u8{0x68} ** 28));
 }
 
 test "ledgerdb: apply diff consumes utxos" {
@@ -2203,6 +2467,8 @@ test "ledgerdb: checkpoint save and load round-trip" {
             },
         });
         try db.importPoolRewardAccount(pool, account);
+        try db.importPoolOwnerMembership(pool, [_]u8{0xbd} ** 28);
+        try db.importFuturePoolOwnerMembership(pool, [_]u8{0xbe} ** 28);
         try db.importPoolRetirement(pool, 10);
         try db.importStakePoolDelegation(account.credential, pool);
 
@@ -2256,6 +2522,8 @@ test "ledgerdb: checkpoint save and load round-trip" {
             },
         }, db2.lookupFuturePoolParams(pool).?);
         try std.testing.expectEqual(account, db2.lookupPoolRewardAccount(pool).?);
+        try std.testing.expect(db2.isPoolOwner(pool, [_]u8{0xbd} ** 28));
+        try std.testing.expect(db2.isFuturePoolOwner(pool, [_]u8{0xbe} ** 28));
         try std.testing.expectEqual(@as(?EpochNo, 10), db2.lookupPoolRetirement(pool));
         try std.testing.expectEqual(@as(?KeyHash, pool), db2.lookupStakePoolDelegation(account.credential));
 
@@ -2274,7 +2542,7 @@ test "ledgerdb: checkpoint not found returns false" {
     try std.testing.expect(!loaded);
 }
 
-test "ledgerdb: epoch reward diff distributes to pool reward accounts and delegators" {
+test "ledgerdb: epoch reward diff excludes owners from member rewards" {
     const allocator = std.testing.allocator;
     var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-epoch-reward");
     defer db.deinit();
@@ -2283,6 +2551,11 @@ test "ledgerdb: epoch reward diff distributes to pool reward accounts and delega
     const reward_account = RewardAccount{
         .network = .testnet,
         .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x92} ** 28 },
+    };
+    const owner_cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0x93} ** 28 };
+    const owner_account = RewardAccount{
+        .network = .testnet,
+        .credential = owner_cred,
     };
     const delegator_cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0x94} ** 28 };
     const delegator_account = RewardAccount{
@@ -2301,12 +2574,15 @@ test "ledgerdb: epoch reward diff distributes to pool reward accounts and delega
     try go.setPoolStake(
         pool,
         1_000_000_000_000,
+        600_000_000_000,
         500_000_000_000,
         340_000_000,
         .{ .numerator = 0, .denominator = 1 },
         reward_account,
     );
-    try go.setDelegatedStake(delegator_cred, pool, 1_000_000_000_000);
+    try go.setDelegatedStake(owner_cred, pool, 600_000_000_000);
+    try go.setDelegatedStake(delegator_cred, pool, 400_000_000_000);
+    try go.setPoolOwnerMembership(pool, owner_cred.hash);
     go.finalize();
 
     var snapshots = StakeSnapshots.init(allocator);
@@ -2326,6 +2602,7 @@ test "ledgerdb: epoch reward diff distributes to pool reward accounts and delega
     // Reward account should have increased
     const new_balance = db.lookupRewardBalance(reward_account).?;
     try std.testing.expect(new_balance > 1_000);
+    try std.testing.expect(db.lookupRewardBalance(owner_account) == null);
     try std.testing.expect(db.lookupRewardBalance(delegator_account) != null);
     try std.testing.expect(db.lookupRewardBalance(delegator_account).? > 0);
     // Treasury should have increased
@@ -2336,8 +2613,52 @@ test "ledgerdb: epoch reward diff distributes to pool reward accounts and delega
     // Rollback restores original state
     try db.rollback(1);
     try std.testing.expectEqual(@as(?Coin, 1_000), db.lookupRewardBalance(reward_account));
+    try std.testing.expect(db.lookupRewardBalance(owner_account) == null);
     try std.testing.expect(db.lookupRewardBalance(delegator_account) == null);
     try std.testing.expectEqual(@as(Coin, 50_000_000_000), db.getSnapshotFees());
+}
+
+test "ledgerdb: epoch reward diff requires owner pledge stake" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-epoch-reward-pledge");
+    defer db.deinit();
+
+    const pool = [_]u8{0x95} ** 28;
+    const reward_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x96} ** 28 },
+    };
+    const owner_cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0x97} ** 28 };
+
+    try db.importPoolRewardAccount(pool, reward_account);
+    db.importReservesBalance(14_000_000_000_000_000);
+    db.importSnapshotFees(50_000_000_000);
+
+    var go = stake_mod.StakeDistribution.init(allocator, 0);
+    try go.setPoolStake(
+        pool,
+        1_000_000_000_000,
+        100_000_000_000,
+        500_000_000_000,
+        340_000_000,
+        .{ .numerator = 0, .denominator = 1 },
+        reward_account,
+    );
+    try go.setDelegatedStake(owner_cred, pool, 100_000_000_000);
+    try go.setPoolOwnerMembership(pool, owner_cred.hash);
+    go.finalize();
+
+    var snapshots = StakeSnapshots.init(allocator);
+    snapshots.go = go;
+    db.replaceStakeSnapshots(snapshots);
+
+    const diff = try db.buildEpochRewardDiff(
+        allocator,
+        100,
+        [_]u8{0x98} ** 32,
+        rewards_mod.RewardParams.mainnet_defaults,
+    );
+    try std.testing.expect(diff == null);
 }
 
 test "ledgerdb: epoch fee rollover moves accumulated fees into snapshot pot" {
@@ -2376,6 +2697,7 @@ test "ledgerdb: rotate stake snapshots builds mark from delegations" {
     try db.importStakeDeposit(cred, 2_000_000);
     try db.importPoolDeposit(pool, 500_000_000);
     try db.importPoolRewardAccount(pool, account);
+    try db.importPoolOwnerMembership(pool, cred.hash);
     try db.importStakePoolDelegation(cred, pool);
 
     db.rotateStakeSnapshots(1);
@@ -2387,6 +2709,8 @@ test "ledgerdb: rotate stake snapshots builds mark from delegations" {
     try std.testing.expectEqual(@as(usize, 1), mark.delegatorCount());
     const ps = mark.getPool(pool).?;
     try std.testing.expectEqual(@as(Coin, 7_000_000), ps.active_stake); // reward + deposit
+    try std.testing.expectEqual(@as(Coin, 7_000_000), ps.self_delegated_owner_stake);
+    try std.testing.expect(mark.isPoolOwner(pool, cred.hash));
     const delegated = mark.getDelegatedStake(cred).?;
     try std.testing.expectEqual(pool, delegated.pool_id);
     try std.testing.expectEqual(@as(Coin, 7_000_000), delegated.active_stake);

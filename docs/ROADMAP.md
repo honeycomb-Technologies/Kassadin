@@ -428,7 +428,7 @@ accounts, and the ledger diff path can roll back tracked reward-balance
 withdrawals locally; once reward state is loaded, tracked withdrawals now follow
 the Haskell exact-drain rule instead of accepting stale/missing balances on
 faith. Snapshot/runtime validation now hydrates reward balances, stake
-deposits, current/future pool params, pool reward accounts, pool retirement schedules, chain-account pots,
+deposits, current/future pool params, current/future pool owner memberships, pool reward accounts, pool retirement schedules, chain-account pots,
 fee pots, and Haskell-shaped mark/set/go stake snapshots from the local
 ancillary `state` payload before replaying the immutable tail, so live
 withdrawal, deposit, fee, and pool-retirement checks can use real
@@ -439,16 +439,19 @@ outer active-stake map instead of zeroing it, and immutable replay now applies
 the same reward/snapshot/fee/pool epoch-boundary effects as live `ChainDB`.
 Epoch reward distribution is also no longer pool-account-only: the current
 simplified reward model now credits both pool reward accounts and delegator
-reward accounts from the `go` snapshot's credential-level stake data, and the
+reward accounts from the `go` snapshot's credential-level stake data, the
 pool leader reward path now uses the snapshot-era pool reward account instead
-of the live pool map.
+of the live pool map, self-delegated owners are excluded from member rewards,
+rewards are gated on snapshot-era pledge coverage, and immutable replay/live
+epoch-boundary processing now use Shelley genesis reward parameters instead of
+hardcoded mainnet defaults.
 Epoch-boundary pool processing is now rollback-safe in both immutable-tail replay and
-forward sync: pool re-registration stages future params locally instead of
-mutating live pool state immediately, those staged params activate at epoch
-processing, retiring pools are removed at the scheduled epoch, their deposits
-are refunded to tracked reward accounts when the stake credential is
-registered, unclaimed refunds are routed to treasury, and stake delegations to
-those pools are cleared. Full epoch reward/stake maintenance, modern
+forward sync: pool re-registration stages future params and future owner sets
+locally instead of mutating live pool state immediately, those staged values
+activate at epoch processing, retiring pools are removed at the scheduled
+epoch, their deposits are refunded to tracked reward accounts when the stake
+credential is registered, unclaimed refunds are routed to treasury, and stake
+delegations to those pools are cleared. Full epoch reward/stake maintenance, modern
 min-ADA/cost-model handling, Conway-era governance parameter changes, and final
 ledger snapshot/checkpoint persistence on shutdown are still pending. The current
 local validation path now loads Shelley genesis

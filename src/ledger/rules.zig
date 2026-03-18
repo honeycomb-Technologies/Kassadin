@@ -12,6 +12,7 @@ const PoolConfigChange = @import("../storage/ledger.zig").PoolConfigChange;
 const FuturePoolParams = @import("../storage/ledger.zig").FuturePoolParams;
 const FuturePoolParamsChange = @import("../storage/ledger.zig").FuturePoolParamsChange;
 const PoolRewardAccountChange = @import("../storage/ledger.zig").PoolRewardAccountChange;
+const PoolOwnerMembershipChange = @import("../storage/ledger.zig").PoolOwnerMembershipChange;
 const PoolRetirementChange = @import("../storage/ledger.zig").PoolRetirementChange;
 const DRepDepositChange = @import("../storage/ledger.zig").DRepDepositChange;
 const StakePoolDelegationChange = @import("../storage/ledger.zig").StakePoolDelegationChange;
@@ -84,6 +85,8 @@ pub const CertificateEffect = struct {
     pool_config_changes: []const PoolConfigChange,
     future_pool_param_changes: []const FuturePoolParamsChange,
     pool_reward_account_changes: []const PoolRewardAccountChange,
+    pool_owner_changes: []const PoolOwnerMembershipChange,
+    future_pool_owner_changes: []const PoolOwnerMembershipChange,
     pool_retirement_changes: []const PoolRetirementChange,
     drep_deposit_changes: []const DRepDepositChange,
     stake_pool_delegation_changes: []const StakePoolDelegationChange,
@@ -98,6 +101,8 @@ pub const CertificateEffect = struct {
             .pool_config_changes = &.{},
             .future_pool_param_changes = &.{},
             .pool_reward_account_changes = &.{},
+            .pool_owner_changes = &.{},
+            .future_pool_owner_changes = &.{},
             .pool_retirement_changes = &.{},
             .drep_deposit_changes = &.{},
             .stake_pool_delegation_changes = &.{},
@@ -111,6 +116,8 @@ pub const CertificateEffect = struct {
         if (self.pool_config_changes.len > 0) allocator.free(self.pool_config_changes);
         if (self.future_pool_param_changes.len > 0) allocator.free(self.future_pool_param_changes);
         if (self.pool_reward_account_changes.len > 0) allocator.free(self.pool_reward_account_changes);
+        if (self.pool_owner_changes.len > 0) allocator.free(self.pool_owner_changes);
+        if (self.future_pool_owner_changes.len > 0) allocator.free(self.future_pool_owner_changes);
         if (self.pool_retirement_changes.len > 0) allocator.free(self.pool_retirement_changes);
         if (self.drep_deposit_changes.len > 0) allocator.free(self.drep_deposit_changes);
         if (self.stake_pool_delegation_changes.len > 0) allocator.free(self.stake_pool_delegation_changes);
@@ -264,6 +271,10 @@ pub fn evaluateCertificateEffect(
     defer future_pool_param_changes.deinit(allocator);
     var pool_reward_account_changes: std.ArrayList(PoolRewardAccountChange) = .empty;
     defer pool_reward_account_changes.deinit(allocator);
+    var pool_owner_changes: std.ArrayList(PoolOwnerMembershipChange) = .empty;
+    defer pool_owner_changes.deinit(allocator);
+    var future_pool_owner_changes: std.ArrayList(PoolOwnerMembershipChange) = .empty;
+    defer future_pool_owner_changes.deinit(allocator);
     var pool_retirement_changes: std.ArrayList(PoolRetirementChange) = .empty;
     defer pool_retirement_changes.deinit(allocator);
     var drep_changes: std.ArrayList(DRepDepositChange) = .empty;
@@ -344,6 +355,14 @@ pub fn evaluateCertificateEffect(
                         pool.operator,
                         pool.reward_account,
                     );
+                    try setPendingPoolOwnerSetNext(
+                        allocator,
+                        &pool_owner_changes,
+                        ledger,
+                        pool.operator,
+                        pool.owners,
+                        false,
+                    );
                 } else {
                     try setPendingFuturePoolParamsNext(
                         allocator,
@@ -358,6 +377,14 @@ pub fn evaluateCertificateEffect(
                             },
                             .reward_account = pool.reward_account,
                         },
+                    );
+                    try setPendingPoolOwnerSetNext(
+                        allocator,
+                        &future_pool_owner_changes,
+                        ledger,
+                        pool.operator,
+                        pool.owners,
+                        true,
                     );
                 }
                 try setPendingPoolDepositNext(allocator, &pool_changes, ledger, pool.operator, if (current_pool_deposit == null) pp.pool_deposit else current_pool_deposit);
@@ -560,6 +587,8 @@ pub fn evaluateCertificateEffect(
         .pool_config_changes = try pool_config_changes.toOwnedSlice(allocator),
         .future_pool_param_changes = try future_pool_param_changes.toOwnedSlice(allocator),
         .pool_reward_account_changes = try pool_reward_account_changes.toOwnedSlice(allocator),
+        .pool_owner_changes = try pool_owner_changes.toOwnedSlice(allocator),
+        .future_pool_owner_changes = try future_pool_owner_changes.toOwnedSlice(allocator),
         .pool_retirement_changes = try pool_retirement_changes.toOwnedSlice(allocator),
         .drep_deposit_changes = try drep_changes.toOwnedSlice(allocator),
         .stake_pool_delegation_changes = try stake_pool_delegation_changes.toOwnedSlice(allocator),
@@ -830,6 +859,68 @@ fn setPendingPoolRewardAccountNext(
         .previous = ledger.lookupPoolRewardAccount(pool),
         .next = next,
     });
+}
+
+fn keyHashSliceContains(owners: []const types.KeyHash, owner: types.KeyHash) bool {
+    for (owners) |candidate| {
+        if (std.mem.eql(u8, &candidate, &owner)) return true;
+    }
+    return false;
+}
+
+fn setPendingPoolOwnerMembershipNext(
+    allocator: std.mem.Allocator,
+    changes: *std.ArrayList(PoolOwnerMembershipChange),
+    ledger: *const LedgerDB,
+    membership: types.PoolOwnerMembership,
+    next: bool,
+    future: bool,
+) !void {
+    for (changes.items) |*change| {
+        if (std.mem.eql(u8, &change.membership.pool, &membership.pool) and
+            std.mem.eql(u8, &change.membership.owner, &membership.owner))
+        {
+            change.next = next;
+            return;
+        }
+    }
+
+    try changes.append(allocator, .{
+        .membership = membership,
+        .previous = if (future)
+            ledger.isFuturePoolOwner(membership.pool, membership.owner)
+        else
+            ledger.isPoolOwner(membership.pool, membership.owner),
+        .next = next,
+    });
+}
+
+fn setPendingPoolOwnerSetNext(
+    allocator: std.mem.Allocator,
+    changes: *std.ArrayList(PoolOwnerMembershipChange),
+    ledger: *const LedgerDB,
+    pool: types.KeyHash,
+    owners: []const types.KeyHash,
+    future: bool,
+) !void {
+    const existing = try ledger.listPoolOwners(allocator, pool, future);
+    defer if (existing.len > 0) allocator.free(existing);
+
+    for (existing) |owner| {
+        if (!keyHashSliceContains(owners, owner)) {
+            try setPendingPoolOwnerMembershipNext(allocator, changes, ledger, .{
+                .pool = pool,
+                .owner = owner,
+            }, false, future);
+        }
+    }
+
+    for (owners) |owner| {
+        try setPendingPoolOwnerMembershipNext(allocator, changes, ledger, .{
+            .pool = pool,
+            .owner = owner,
+        }, true, future);
+    }
 }
 
 fn findPendingPoolRetirementNext(
@@ -1176,6 +1267,7 @@ test "rules: stake delegation requires registered stake key" {
                     .cost = 0,
                     .margin = .{ .numerator = 0, .denominator = 1 },
                     .reward_account = reward_account,
+                    .owners = &.{},
                 },
             },
             .{ .stake_delegation = .{ .cred = cred, .pool = pool } },
@@ -1227,6 +1319,7 @@ test "rules: stake delegation accepts pending pool registration" {
                     .cost = 0,
                     .margin = .{ .numerator = 0, .denominator = 1 },
                     .reward_account = reward_account,
+                    .owners = &.{},
                 },
             },
             .{ .stake_delegation = .{ .cred = cred, .pool = pool } },
@@ -1293,6 +1386,7 @@ test "rules: pool re-registration stages future params and clears retirement" {
                     .cost = 0,
                     .margin = .{ .numerator = 1, .denominator = 10 },
                     .reward_account = next_reward_account,
+                    .owners = &.{},
                 },
             },
         },

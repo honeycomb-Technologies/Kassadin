@@ -195,6 +195,7 @@ pub fn replayImmutableFromSlot(
     from_slot: SlotNo,
     pp: rules.ProtocolParams,
     epoch_length: ?u64,
+    reward_params: rewards_mod.RewardParams,
 ) !ReplayResult {
     var result = ReplayResult{
         .blocks_replayed = 0,
@@ -242,6 +243,7 @@ pub fn replayImmutableFromSlot(
                             block.header.slot,
                             block.hash(),
                             epoch,
+                            reward_params,
                         );
                     }
                 }
@@ -290,6 +292,7 @@ fn applyReplayEpochBoundaryEffects(
     slot: SlotNo,
     block_hash: types.HeaderHash,
     epoch: types.EpochNo,
+    reward_params: rewards_mod.RewardParams,
 ) !u32 {
     var applied: u32 = 0;
 
@@ -297,7 +300,7 @@ fn applyReplayEpochBoundaryEffects(
         allocator,
         slot,
         block_hash,
-        rewards_mod.RewardParams.mainnet_defaults,
+        reward_params,
     )) |diff| {
         try ledger.applyDiff(diff);
         applied += 1;
@@ -642,6 +645,7 @@ fn importStakePoolSnapshotEntry(
     const pool_snapshot_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
 
     var active_stake: Coin = 0;
+    var self_delegated_owner_stake: Coin = 0;
     var pledge: Coin = 0;
     var cost: Coin = 0;
     var margin = zero_margin;
@@ -649,6 +653,8 @@ fn importStakePoolSnapshotEntry(
         .network = .testnet,
         .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0} ** 28 },
     };
+    var self_delegated_owners: []const types.KeyHash = try distribution.allocator.alloc(types.KeyHash, 0);
+    defer if (self_delegated_owners.len > 0) distribution.allocator.free(self_delegated_owners);
 
     if (pool_snapshot_len == 9) {
         // Legacy StakePoolParams-shaped snapshot entries:
@@ -672,8 +678,9 @@ fn importStakePoolSnapshotEntry(
         // [stake, stakeRatio, selfDelegOwners, selfDelegOwnerStake, vrf, pledge, cost, margin, numDelegators, accountId]
         active_stake = try dec.decodeUint(); // spssStake
         try dec.skipValue(); // spssStakeRatio
-        try dec.skipValue(); // spssSelfDelegatedOwners
-        try dec.skipValue(); // spssSelfDelegatedOwnersStake
+        distribution.allocator.free(self_delegated_owners);
+        self_delegated_owners = try parseKeyHashSet(distribution.allocator, dec);
+        self_delegated_owner_stake = try dec.decodeUint(); // spssSelfDelegatedOwnersStake
         try dec.skipValue(); // spssVrf
         pledge = try dec.decodeUint(); // spssPledge
         cost = try dec.decodeUint(); // spssCost
@@ -689,7 +696,45 @@ fn importStakePoolSnapshotEntry(
         return error.InvalidSnapshotState;
     }
 
-    try distribution.setPoolStake(pool, active_stake, pledge, cost, margin, reward_account);
+    try distribution.setPoolStake(
+        pool,
+        active_stake,
+        self_delegated_owner_stake,
+        pledge,
+        cost,
+        margin,
+        reward_account,
+    );
+    for (self_delegated_owners) |owner| {
+        try distribution.setPoolOwnerMembership(pool, owner);
+    }
+}
+
+fn parseKeyHashSet(
+    allocator: Allocator,
+    dec: *Decoder,
+) ![]const types.KeyHash {
+    var item_count: u64 = 0;
+    const major = try dec.peekMajorType();
+    if (major == 6) {
+        const tag = try dec.decodeTag();
+        if (tag != 258) return error.InvalidSnapshotState;
+        item_count = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    } else {
+        item_count = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    }
+
+    const items = try allocator.alloc(types.KeyHash, item_count);
+    errdefer allocator.free(items);
+
+    var i: u64 = 0;
+    while (i < item_count) : (i += 1) {
+        const item_bytes = try dec.decodeBytes();
+        if (item_bytes.len != 28) return error.InvalidSnapshotState;
+        @memcpy(&items[i], item_bytes);
+    }
+
+    return items;
 }
 
 fn parseUnitInterval(dec: *Decoder) !types.UnitInterval {
@@ -985,7 +1030,8 @@ fn importStakePoolEntry(ledger: *LedgerDB, dec: *Decoder) !void {
     @memcpy(&reward_raw, reward_bytes);
     const reward_account = try RewardAccount.fromBytes(reward_raw);
 
-    try dec.skipValue(); // owners
+    const owners = try parseKeyHashSet(ledger.allocator, dec);
+    defer if (owners.len > 0) ledger.allocator.free(owners);
     try dec.skipValue(); // relays
     try dec.skipValue(); // metadata
 
@@ -1002,6 +1048,9 @@ fn importStakePoolEntry(ledger: *LedgerDB, dec: *Decoder) !void {
         .cost = cost,
         .margin = margin,
     });
+    for (owners) |owner| {
+        try ledger.importPoolOwnerMembership(pool, owner);
+    }
 }
 
 fn importFutureStakePoolParamEntry(ledger: *LedgerDB, dec: *Decoder) !void {
@@ -1053,6 +1102,14 @@ fn importFutureStakePoolParamEntry(ledger: *LedgerDB, dec: *Decoder) !void {
     @memcpy(&reward_raw, reward_bytes);
     const reward_account = try RewardAccount.fromBytes(reward_raw);
 
+    var owners: []const types.KeyHash = try ledger.allocator.alloc(types.KeyHash, 0);
+    defer if (owners.len > 0) ledger.allocator.free(owners);
+    if (remaining > 0) {
+        ledger.allocator.free(owners);
+        owners = try parseKeyHashSet(ledger.allocator, dec);
+        remaining -= 1;
+    }
+
     while (remaining > 0) : (remaining -= 1) {
         try dec.skipValue();
     }
@@ -1065,6 +1122,9 @@ fn importFutureStakePoolParamEntry(ledger: *LedgerDB, dec: *Decoder) !void {
         },
         .reward_account = reward_account,
     });
+    for (owners) |owner| {
+        try ledger.importFuturePoolOwnerMembership(pool, owner);
+    }
 }
 
 fn parsePoolRetirements(

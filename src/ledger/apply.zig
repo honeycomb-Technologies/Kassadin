@@ -90,6 +90,8 @@ fn buildDiff(
         .pool_config_changes = cert_effect.pool_config_changes,
         .future_pool_param_changes = cert_effect.future_pool_param_changes,
         .pool_reward_account_changes = cert_effect.pool_reward_account_changes,
+        .pool_owner_changes = cert_effect.pool_owner_changes,
+        .future_pool_owner_changes = cert_effect.future_pool_owner_changes,
         .pool_retirement_changes = cert_effect.pool_retirement_changes,
         .drep_deposit_changes = cert_effect.drep_deposit_changes,
         .stake_pool_delegation_changes = cert_effect.stake_pool_delegation_changes,

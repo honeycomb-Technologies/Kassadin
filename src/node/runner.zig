@@ -9,6 +9,7 @@ const runtime_control = @import("runtime_control.zig");
 const snapshot_restore = @import("snapshot_restore.zig");
 const block_mod = @import("../ledger/block.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
+const rewards_mod = @import("../ledger/rewards.zig");
 const ledger_rules = @import("../ledger/rules.zig");
 const ChainDB = @import("../storage/chaindb.zig").ChainDB;
 const protocol = @import("../network/protocol.zig");
@@ -263,6 +264,7 @@ fn initializeSnapshotState(
                 load_result.slot,
                 chain_db.getProtocolParams(),
                 if (chain_db.shelley_governance_config) |config| config.epoch_length else null,
+                if (chain_db.shelley_governance_config) |config| config.reward_params else rewards_mod.RewardParams.mainnet_defaults,
             );
             result.immutable_blocks_replayed = replay.blocks_replayed;
 

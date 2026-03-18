@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Decoder = @import("../cbor/decoder.zig").Decoder;
+const rewards_mod = @import("rewards.zig");
 const rules = @import("rules.zig");
 const types = @import("../types.zig");
 
@@ -42,6 +43,7 @@ pub const GovernanceConfig = struct {
     epoch_length: u64,
     stability_window: u64,
     update_quorum: u64,
+    reward_params: rewards_mod.RewardParams,
     genesis_delegate_hashes: []Hash28,
 
     pub fn deinit(self: *GovernanceConfig, allocator: Allocator) void {
@@ -472,6 +474,7 @@ test "protocol update: stage and adopt updates across epoch boundary" {
         .epoch_length = 100,
         .stability_window = 10,
         .update_quorum = 2,
+        .reward_params = rewards_mod.RewardParams.mainnet_defaults,
         .genesis_delegate_hashes = delegates,
     };
 
@@ -517,6 +520,7 @@ test "protocol update: reject non-genesis proposer" {
         .epoch_length = 100,
         .stability_window = 10,
         .update_quorum = 1,
+        .reward_params = rewards_mod.RewardParams.mainnet_defaults,
         .genesis_delegate_hashes = delegates,
     };
 

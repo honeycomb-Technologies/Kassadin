@@ -39,6 +39,15 @@ pub const PoolRewardSplit = struct {
     member_rewards: Coin,
 };
 
+fn floorRationalProduct(
+    amount: Coin,
+    numerator: u128,
+    denominator: u128,
+) Coin {
+    if (amount == 0 or numerator == 0 or denominator == 0) return 0;
+    return @as(Coin, @intCast((@as(u128, amount) * numerator) / denominator));
+}
+
 /// Calculate the epoch reward pot.
 /// rewards = rho * reserve + fees
 /// treasury = tau * rewards
@@ -134,6 +143,40 @@ pub fn splitPoolReward(
     };
 }
 
+pub fn calculatePoolLeaderReward(
+    raw_reward: Coin,
+    pool_cost: Coin,
+    pool_margin: UnitInterval,
+    owner_stake: Coin,
+    pool_stake: Coin,
+) Coin {
+    if (raw_reward == 0) return 0;
+    if (raw_reward <= pool_cost or pool_stake == 0) return raw_reward;
+
+    const net_reward = raw_reward - pool_cost;
+    const margin_den = @as(u128, pool_margin.denominator);
+    const factor_num = (@as(u128, pool_margin.numerator) * @as(u128, pool_stake)) +
+        ((margin_den - @as(u128, pool_margin.numerator)) * @as(u128, owner_stake));
+    const factor_den = margin_den * @as(u128, pool_stake);
+
+    return pool_cost + floorRationalProduct(net_reward, factor_num, factor_den);
+}
+
+pub fn calculatePoolMemberReward(
+    raw_reward: Coin,
+    pool_cost: Coin,
+    pool_margin: UnitInterval,
+    member_stake: Coin,
+    pool_stake: Coin,
+) Coin {
+    if (raw_reward == 0 or raw_reward <= pool_cost or pool_stake == 0 or member_stake == 0) return 0;
+
+    const net_reward = raw_reward - pool_cost;
+    const factor_num = (@as(u128, pool_margin.denominator) - @as(u128, pool_margin.numerator)) * @as(u128, member_stake);
+    const factor_den = @as(u128, pool_margin.denominator) * @as(u128, pool_stake);
+    return floorRationalProduct(net_reward, factor_num, factor_den);
+}
+
 // ──────────────────────────────────── Tests ────────────────────────────────────
 
 test "rewards: epoch reward calculation" {
@@ -190,6 +233,38 @@ test "rewards: split pool reward into leader and member shares" {
 
     try std.testing.expectEqual(@as(Coin, 373_000_000), split.leader_reward);
     try std.testing.expectEqual(@as(Coin, 627_000_000), split.member_rewards);
+}
+
+test "rewards: owner stake increases leader reward" {
+    const without_owner = calculatePoolLeaderReward(
+        1_000_000_000,
+        340_000_000,
+        .{ .numerator = 5, .denominator = 100 },
+        0,
+        1_000_000_000,
+    );
+    const with_owner = calculatePoolLeaderReward(
+        1_000_000_000,
+        340_000_000,
+        .{ .numerator = 5, .denominator = 100 },
+        400_000_000,
+        1_000_000_000,
+    );
+
+    try std.testing.expect(with_owner > without_owner);
+}
+
+test "rewards: member reward excludes operator share" {
+    const member_reward = calculatePoolMemberReward(
+        1_000_000_000,
+        340_000_000,
+        .{ .numerator = 5, .denominator = 100 },
+        200_000_000,
+        1_000_000_000,
+    );
+
+    try std.testing.expect(member_reward > 0);
+    try std.testing.expect(member_reward < 200_000_000);
 }
 
 test "rewards: mainnet default parameters" {

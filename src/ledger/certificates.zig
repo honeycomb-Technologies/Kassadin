@@ -52,7 +52,7 @@ pub const PoolParams = struct {
     cost: Coin,
     margin: types.UnitInterval,
     reward_account: RewardAccount,
-    // owners, relays, metadata deferred for now
+    owners: []const KeyHash,
 };
 
 /// Parse a credential from CBOR: [0, keyhash] or [1, scripthash]
@@ -110,8 +110,44 @@ fn parseUnitInterval(dec: *Decoder) !types.UnitInterval {
     return interval;
 }
 
+fn parsePoolOwners(
+    allocator: Allocator,
+    dec: *Decoder,
+) ![]const KeyHash {
+    var owner_count: u64 = 0;
+    const major = try dec.peekMajorType();
+    if (major == 6) {
+        const tag = try dec.decodeTag();
+        if (tag != 258) return error.InvalidCbor;
+        owner_count = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    } else {
+        owner_count = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    }
+
+    const owners = try allocator.alloc(KeyHash, owner_count);
+    errdefer allocator.free(owners);
+
+    var i: u64 = 0;
+    while (i < owner_count) : (i += 1) {
+        const owner_bytes = try dec.decodeBytes();
+        if (owner_bytes.len != 28) return error.InvalidCbor;
+        @memcpy(&owners[i], owner_bytes);
+    }
+
+    return owners;
+}
+
+pub fn freeCertificate(allocator: Allocator, cert: *const Certificate) void {
+    switch (cert.*) {
+        .pool_registration => |pool| {
+            if (pool.owners.len > 0) allocator.free(pool.owners);
+        },
+        else => {},
+    }
+}
+
 /// Parse a certificate from CBOR.
-pub fn parseCertificate(dec: *Decoder) !Certificate {
+pub fn parseCertificate(allocator: Allocator, dec: *Decoder) !Certificate {
     _ = try dec.decodeArrayLen();
     const tag = try dec.decodeUint();
 
@@ -137,9 +173,10 @@ pub fn parseCertificate(dec: *Decoder) !Certificate {
             if (reward_bytes.len != 29) return error.InvalidCbor;
             var reward_raw: [29]u8 = undefined;
             @memcpy(&reward_raw, reward_bytes);
-            // Skip remaining pool params for now
+            const owners = try parsePoolOwners(allocator, dec);
+            errdefer allocator.free(owners);
             while (!dec.isComplete()) {
-                dec.skipValue() catch break;
+                try dec.skipValue();
             }
             return .{ .pool_registration = .{
                 .operator = op_bytes[0..28].*,
@@ -148,6 +185,7 @@ pub fn parseCertificate(dec: *Decoder) !Certificate {
                 .cost = cost,
                 .margin = margin,
                 .reward_account = try RewardAccount.fromBytes(reward_raw),
+                .owners = owners,
             } };
         },
         4 => {
@@ -276,7 +314,8 @@ test "certificates: parse stake registration" {
     try enc.encodeBytes(&([_]u8{0xab} ** 28));
 
     var dec = Decoder.init(enc.getWritten());
-    const cert = try parseCertificate(&dec);
+    var cert = try parseCertificate(allocator, &dec);
+    defer freeCertificate(allocator, &cert);
 
     switch (cert) {
         .stake_registration => |cred| {
@@ -301,7 +340,8 @@ test "certificates: parse stake delegation" {
     try enc.encodeBytes(&([_]u8{0xdd} ** 28)); // pool hash
 
     var dec = Decoder.init(enc.getWritten());
-    const cert = try parseCertificate(&dec);
+    var cert = try parseCertificate(allocator, &dec);
+    defer freeCertificate(allocator, &cert);
 
     switch (cert) {
         .stake_delegation => |sd| {
@@ -342,7 +382,8 @@ test "certificates: parse pool registration" {
     try enc.encodeNull(); // metadata
 
     var dec = Decoder.init(enc.getWritten());
-    const cert = try parseCertificate(&dec);
+    var cert = try parseCertificate(allocator, &dec);
+    defer freeCertificate(allocator, &cert);
 
     switch (cert) {
         .pool_registration => |pool| {
@@ -350,6 +391,7 @@ test "certificates: parse pool registration" {
             try std.testing.expectEqual(@as(Coin, 500_000), pool.cost);
             try std.testing.expectEqual(types.UnitInterval{ .numerator = 1, .denominator = 2 }, pool.margin);
             try std.testing.expectEqual(reward, pool.reward_account);
+            try std.testing.expectEqual(@as(usize, 0), pool.owners.len);
         },
         else => return error.InvalidCbor,
     }
@@ -368,7 +410,8 @@ test "certificates: parse pool retirement" {
     try enc.encodeUint(100); // retire at epoch 100
 
     var dec = Decoder.init(enc.getWritten());
-    const cert = try parseCertificate(&dec);
+    var cert = try parseCertificate(allocator, &dec);
+    defer freeCertificate(allocator, &cert);
 
     switch (cert) {
         .pool_retirement => |pr| {
@@ -394,7 +437,8 @@ test "certificates: parse Conway DRep registration" {
     try enc.encodeNull(); // no anchor
 
     var dec = Decoder.init(enc.getWritten());
-    const cert = try parseCertificate(&dec);
+    var cert = try parseCertificate(allocator, &dec);
+    defer freeCertificate(allocator, &cert);
 
     switch (cert) {
         .drep_registration => |dr| {
@@ -420,7 +464,8 @@ test "certificates: parse vote delegation" {
     try enc.encodeUint(2); // always_abstain
 
     var dec = Decoder.init(enc.getWritten());
-    const cert = try parseCertificate(&dec);
+    var cert = try parseCertificate(allocator, &dec);
+    defer freeCertificate(allocator, &cert);
 
     switch (cert) {
         .vote_delegation => |vd| {

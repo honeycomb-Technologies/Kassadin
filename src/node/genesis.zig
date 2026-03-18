@@ -4,6 +4,7 @@ const std_json = std.json;
 const types = @import("../types.zig");
 const praos = @import("../consensus/praos.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
+const rewards_mod = @import("../ledger/rewards.zig");
 const ledger_rules = @import("../ledger/rules.zig");
 const UtxoEntry = @import("../storage/ledger.zig").UtxoEntry;
 const byron_genesis_utxo = @import("byron_genesis_utxo.zig");
@@ -129,6 +130,25 @@ pub fn toLedgerProtocolParams(pp: ProtocolParams) ledger_rules.ProtocolParams {
     };
 }
 
+fn toUnitInterval(value: f64) types.UnitInterval {
+    const denominator: u64 = 1_000_000;
+    const scaled = @as(u64, @intFromFloat(@round(value * @as(f64, @floatFromInt(denominator)))));
+    return .{
+        .numerator = @min(scaled, denominator),
+        .denominator = denominator,
+    };
+}
+
+pub fn toRewardParams(genesis: *const ShelleyGenesis) rewards_mod.RewardParams {
+    return .{
+        .rho = toUnitInterval(genesis.protocol_params.rho),
+        .tau = toUnitInterval(genesis.protocol_params.tau),
+        .a0 = toUnitInterval(genesis.protocol_params.a0),
+        .n_opt = genesis.protocol_params.n_opt,
+        .total_lovelace = genesis.max_lovelace_supply,
+    };
+}
+
 pub fn toLedgerProtocolParamsByron(genesis: ByronGenesis) ledger_rules.ProtocolParams {
     return .{
         .min_fee_a = genesis.tx_fee_policy_multiplier,
@@ -162,6 +182,8 @@ pub fn loadShelleyGovernanceConfig(allocator: Allocator, path: []const u8) !prot
     const security_param = try valueToU64(root.get("securityParam") orelse return error.MissingSecurityParam);
     const active_slots_coeff = try valueToF64(root.get("activeSlotsCoeff") orelse return error.MissingActiveSlotsCoeff);
     const update_quorum = try valueToU64(root.get("updateQuorum") orelse return error.MissingUpdateQuorum);
+    var shelley_genesis = try parseShelleyGenesis(allocator, path);
+    defer shelley_genesis.deinit(allocator);
 
     var delegates = try allocator.alloc(types.Hash28, gen_delegs.count());
     errdefer allocator.free(delegates);
@@ -176,6 +198,7 @@ pub fn loadShelleyGovernanceConfig(allocator: Allocator, path: []const u8) !prot
         .epoch_length = epoch_length,
         .stability_window = computeStabilityWindow(security_param, active_slots_coeff),
         .update_quorum = update_quorum,
+        .reward_params = toRewardParams(&shelley_genesis),
         .genesis_delegate_hashes = delegates,
     };
 }
@@ -397,6 +420,10 @@ test "genesis: load Shelley governance config" {
     try std.testing.expectEqual(@as(u64, 432000), config.epoch_length);
     try std.testing.expectEqual(@as(u64, 129600), config.stability_window);
     try std.testing.expectEqual(@as(u64, 5), config.update_quorum);
+    try std.testing.expectEqual(@as(u16, 150), config.reward_params.n_opt);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), config.reward_params.a0.toFloat(), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.003), config.reward_params.rho.toFloat(), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), config.reward_params.tau.toFloat(), 1e-6);
     try std.testing.expect(config.genesis_delegate_hashes.len > 0);
 }
 

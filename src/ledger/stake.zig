@@ -8,6 +8,7 @@ pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
 pub const RewardAccount = types.RewardAccount;
 pub const UnitInterval = types.UnitInterval;
+pub const PoolOwnerMembership = types.PoolOwnerMembership;
 
 pub const DelegatedStake = struct {
     credential: Credential,
@@ -19,6 +20,7 @@ pub const DelegatedStake = struct {
 pub const PoolStake = struct {
     pool_id: KeyHash,
     active_stake: Coin,
+    self_delegated_owner_stake: Coin,
     pledge: Coin,
     cost: Coin,
     margin: UnitInterval,
@@ -37,6 +39,7 @@ pub const StakeDistribution = struct {
     allocator: Allocator,
     pools: std.AutoHashMap(KeyHash, PoolStake),
     delegators: std.AutoHashMap(Credential, DelegatedStake),
+    owner_memberships: std.AutoHashMap(PoolOwnerMembership, void),
     total_stake: Coin,
     epoch: EpochNo,
 
@@ -45,6 +48,7 @@ pub const StakeDistribution = struct {
             .allocator = allocator,
             .pools = std.AutoHashMap(KeyHash, PoolStake).init(allocator),
             .delegators = std.AutoHashMap(Credential, DelegatedStake).init(allocator),
+            .owner_memberships = std.AutoHashMap(PoolOwnerMembership, void).init(allocator),
             .total_stake = 0,
             .epoch = epoch,
         };
@@ -53,6 +57,7 @@ pub const StakeDistribution = struct {
     pub fn deinit(self: *StakeDistribution) void {
         self.pools.deinit();
         self.delegators.deinit();
+        self.owner_memberships.deinit();
     }
 
     /// Register a pool's stake.
@@ -60,6 +65,7 @@ pub const StakeDistribution = struct {
         self: *StakeDistribution,
         pool_id: KeyHash,
         active_stake: Coin,
+        self_delegated_owner_stake: Coin,
         pledge: Coin,
         cost: Coin,
         margin: UnitInterval,
@@ -68,11 +74,34 @@ pub const StakeDistribution = struct {
         try self.pools.put(pool_id, .{
             .pool_id = pool_id,
             .active_stake = active_stake,
+            .self_delegated_owner_stake = self_delegated_owner_stake,
             .pledge = pledge,
             .cost = cost,
             .margin = margin,
             .reward_account = reward_account,
             .total_stake = 0, // updated in finalize
+        });
+    }
+
+    pub fn setPoolOwnerMembership(
+        self: *StakeDistribution,
+        pool_id: KeyHash,
+        owner: KeyHash,
+    ) !void {
+        try self.owner_memberships.put(.{
+            .pool = pool_id,
+            .owner = owner,
+        }, {});
+    }
+
+    pub fn isPoolOwner(
+        self: *const StakeDistribution,
+        pool_id: KeyHash,
+        owner: KeyHash,
+    ) bool {
+        return self.owner_memberships.contains(.{
+            .pool = pool_id,
+            .owner = owner,
         });
     }
 
@@ -175,6 +204,7 @@ test "stake: pool relative stake" {
     const pool = PoolStake{
         .pool_id = [_]u8{0x01} ** 28,
         .active_stake = 1_000_000_000, // 1000 ADA
+        .self_delegated_owner_stake = 0,
         .pledge = 500_000_000,
         .cost = 340_000_000,
         .margin = .{ .numerator = 0, .denominator = 1 },
@@ -197,9 +227,9 @@ test "stake: distribution finalize" {
         .network = .testnet,
         .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x04} ** 28 },
     };
-    try dist.setPoolStake([_]u8{0x01} ** 28, 1_000_000, 500_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
-    try dist.setPoolStake([_]u8{0x02} ** 28, 2_000_000, 1_000_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
-    try dist.setPoolStake([_]u8{0x03} ** 28, 3_000_000, 1_500_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
+    try dist.setPoolStake([_]u8{0x01} ** 28, 1_000_000, 0, 500_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
+    try dist.setPoolStake([_]u8{0x02} ** 28, 2_000_000, 0, 1_000_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
+    try dist.setPoolStake([_]u8{0x03} ** 28, 3_000_000, 0, 1_500_000, 340_000, .{ .numerator = 0, .denominator = 1 }, reward_account);
 
     dist.finalize();
 
@@ -245,6 +275,7 @@ test "stake: 2-epoch delay" {
         try m.setPoolStake(
             [_]u8{0xaa} ** 28,
             10_000_000,
+            0,
             5_000_000,
             340_000,
             .{ .numerator = 0, .denominator = 1 },
@@ -258,6 +289,7 @@ test "stake: 2-epoch delay" {
         try m.setPoolStake(
             [_]u8{0xbb} ** 28,
             20_000_000,
+            0,
             10_000_000,
             340_000,
             .{ .numerator = 0, .denominator = 1 },

@@ -201,7 +201,7 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
                 var j: u64 = 0;
                 while (j < num_certs) : (j += 1) {
                     var cert_dec = Decoder.init(try dec.sliceOfNextValue());
-                    try certificates.append(allocator, try cert_mod.parseCertificate(&cert_dec));
+                    try certificates.append(allocator, try cert_mod.parseCertificate(allocator, &cert_dec));
                 }
             },
             5 => {
@@ -395,6 +395,9 @@ fn parseValue(dec: *Decoder) !Coin {
 pub fn freeTxBody(allocator: std.mem.Allocator, body: *TxBody) void {
     if (body.update) |*update| {
         update.deinit(allocator);
+    }
+    for (body.certificates) |*cert| {
+        cert_mod.freeCertificate(allocator, cert);
     }
     allocator.free(body.inputs);
     allocator.free(body.outputs);

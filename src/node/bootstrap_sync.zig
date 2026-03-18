@@ -8,6 +8,7 @@ const dolos_grpc_mod = @import("../network/dolos_grpc_client.zig");
 const peer_mod = @import("../network/peer.zig");
 const protocol = @import("../network/protocol.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
+const rewards_mod = @import("../ledger/rewards.zig");
 const chunk_reader_mod = @import("chunk_reader.zig");
 const genesis_mod = @import("genesis.zig");
 const ledger_snapshot = @import("ledger_snapshot.zig");
@@ -161,6 +162,7 @@ pub fn bootstrapSync(
                 load_result.slot,
                 chain_db.getProtocolParams(),
                 if (chain_db.shelley_governance_config) |config| config.epoch_length else null,
+                if (chain_db.shelley_governance_config) |config| config.reward_params else rewards_mod.RewardParams.mainnet_defaults,
             ) catch |err| switch (err) {
                 error.Interrupted => {
                     result.stopped_by_signal = true;

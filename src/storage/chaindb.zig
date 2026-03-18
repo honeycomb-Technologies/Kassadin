@@ -464,7 +464,7 @@ pub const ChainDB = struct {
                 self.allocator,
                 slot,
                 block_hash,
-                rewards_mod.RewardParams.mainnet_defaults,
+                config.reward_params,
             )) |diff| {
                 try self.ledger.applyDiff(diff);
                 applied += 1;
@@ -763,6 +763,7 @@ test "chaindb: epoch boundary reaps retiring pool" {
         .epoch_length = 100,
         .stability_window = 10,
         .update_quorum = 1,
+        .reward_params = rewards_mod.RewardParams.mainnet_defaults,
         .genesis_delegate_hashes = try allocator.alloc(types.Hash28, 0),
     });
     try db.enableLedgerValidation();
@@ -856,6 +857,7 @@ test "chaindb: epoch boundary sends unclaimed pool refunds to treasury" {
         .epoch_length = 100,
         .stability_window = 10,
         .update_quorum = 1,
+        .reward_params = rewards_mod.RewardParams.mainnet_defaults,
         .genesis_delegate_hashes = try allocator.alloc(types.Hash28, 0),
     });
     try db.enableLedgerValidation();
