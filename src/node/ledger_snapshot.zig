@@ -1092,7 +1092,13 @@ fn importStakePoolEntry(ledger: *LedgerDB, dec: *Decoder) !void {
         return error.InvalidSnapshotState;
     }
 
-    try dec.skipValue(); // vrf
+    const vrf_bytes = try dec.decodeBytes();
+    if (vrf_bytes.len != 32) {
+        std.debug.print("Snapshot state: unexpected pool vrf len {}\n", .{vrf_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var vrf: types.Hash32 = undefined;
+    @memcpy(&vrf, vrf_bytes);
     const pledge = try dec.decodeUint();
     const cost = try dec.decodeUint();
     const margin = try parseUnitInterval(dec);
@@ -1120,6 +1126,7 @@ fn importStakePoolEntry(ledger: *LedgerDB, dec: *Decoder) !void {
     try ledger.importPoolRewardAccount(pool, reward_account);
     try ledger.importPoolDeposit(pool, deposit);
     try ledger.importPoolConfig(pool, .{
+        .vrf_keyhash = vrf,
         .pledge = pledge,
         .cost = cost,
         .margin = margin,
@@ -1160,7 +1167,13 @@ fn importFutureStakePoolParamEntry(ledger: *LedgerDB, dec: *Decoder) !void {
 
     if (remaining < 5) return error.InvalidSnapshotState;
 
-    try dec.skipValue(); // vrf
+    const vrf_bytes = try dec.decodeBytes();
+    if (vrf_bytes.len != 32) {
+        std.debug.print("Snapshot state: unexpected future pool vrf len {}\n", .{vrf_bytes.len});
+        return error.InvalidSnapshotState;
+    }
+    var vrf: types.Hash32 = undefined;
+    @memcpy(&vrf, vrf_bytes);
     remaining -= 1;
     const pledge = try dec.decodeUint();
     remaining -= 1;
@@ -1192,6 +1205,7 @@ fn importFutureStakePoolParamEntry(ledger: *LedgerDB, dec: *Decoder) !void {
 
     try ledger.importFuturePoolParams(pool, .{
         .config = .{
+            .vrf_keyhash = vrf,
             .pledge = pledge,
             .cost = cost,
             .margin = margin,

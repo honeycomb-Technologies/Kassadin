@@ -98,6 +98,7 @@ pub const PoolDepositChange = struct {
 };
 
 pub const PoolConfig = struct {
+    vrf_keyhash: ?types.Hash32 = null,
     pledge: Coin,
     cost: Coin,
     margin: UnitInterval,
@@ -829,6 +830,21 @@ pub const LedgerDB = struct {
 
     pub fn lookupPoolConfig(self: *const LedgerDB, pool: KeyHash) ?PoolConfig {
         return self.pool_configs.get(pool);
+    }
+
+    pub fn lookupIssuerVrfKeyHash(self: *const LedgerDB, issuer: KeyHash) ?types.Hash32 {
+        if (self.lookupPoolConfig(issuer)) |config| {
+            if (config.vrf_keyhash) |vrf| return vrf;
+        }
+
+        var it = self.genesis_delegations.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, &entry.value_ptr.delegate, &issuer)) {
+                return entry.value_ptr.vrf;
+            }
+        }
+
+        return null;
     }
 
     pub fn lookupFuturePoolParams(self: *const LedgerDB, pool: KeyHash) ?FuturePoolParams {
@@ -1707,7 +1723,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 11, .big);
+        std.mem.writeInt(u32, buf[0..4], 12, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1819,6 +1835,7 @@ pub const LedgerDB = struct {
         var pool_cfg_it = self.pool_configs.iterator();
         while (pool_cfg_it.next()) |entry| {
             try file.writeAll(entry.key_ptr);
+            try writeOptionalHash32ToFile(file, entry.value_ptr.vrf_keyhash);
             std.mem.writeInt(u64, &buf, entry.value_ptr.pledge, .big);
             try file.writeAll(&buf);
             std.mem.writeInt(u64, &buf, entry.value_ptr.cost, .big);
@@ -1832,6 +1849,7 @@ pub const LedgerDB = struct {
         var future_pool_it = self.future_pool_params.iterator();
         while (future_pool_it.next()) |entry| {
             try file.writeAll(entry.key_ptr);
+            try writeOptionalHash32ToFile(file, entry.value_ptr.config.vrf_keyhash);
             std.mem.writeInt(u64, &buf, entry.value_ptr.config.pledge, .big);
             try file.writeAll(&buf);
             std.mem.writeInt(u64, &buf, entry.value_ptr.config.cost, .big);
@@ -1992,7 +2010,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9 and version != 10 and version != 11) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9 and version != 10 and version != 11 and version != 12) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -2141,14 +2159,16 @@ pub const LedgerDB = struct {
             const pool_cfg_count = std.mem.readInt(u64, &buf, .big);
             i = 0;
             while (i < pool_cfg_count) : (i += 1) {
-                var entry_buf: [28 + 8 + 8]u8 = undefined;
-                _ = try file.readAll(&entry_buf);
                 var pool: KeyHash = undefined;
-                @memcpy(&pool, entry_buf[0..28]);
-                const pledge = std.mem.readInt(u64, entry_buf[28..36], .big);
-                const cost = std.mem.readInt(u64, entry_buf[36..44], .big);
+                _ = try file.readAll(&pool);
+                const vrf_keyhash = if (version >= 12) try readOptionalHash32FromFile(file) else null;
+                var entry_buf: [16]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                const pledge = std.mem.readInt(u64, entry_buf[0..8], .big);
+                const cost = std.mem.readInt(u64, entry_buf[8..16], .big);
                 const margin = try readUnitIntervalFromFile(file);
                 try self.pool_configs.put(pool, .{
+                    .vrf_keyhash = vrf_keyhash,
                     .pledge = pledge,
                     .cost = cost,
                     .margin = margin,
@@ -2161,20 +2181,22 @@ pub const LedgerDB = struct {
             const future_pool_count = std.mem.readInt(u64, &buf, .big);
             i = 0;
             while (i < future_pool_count) : (i += 1) {
-                var entry_buf: [28 + 8 + 8 + 1 + 1 + 28]u8 = undefined;
-                _ = try file.readAll(entry_buf[0..44]);
                 var pool: KeyHash = undefined;
-                @memcpy(&pool, entry_buf[0..28]);
-                const pledge = std.mem.readInt(u64, entry_buf[28..36], .big);
-                const cost = std.mem.readInt(u64, entry_buf[36..44], .big);
+                _ = try file.readAll(&pool);
+                const vrf_keyhash = if (version >= 12) try readOptionalHash32FromFile(file) else null;
+                var entry_buf: [16 + 1 + 1 + 28]u8 = undefined;
+                _ = try file.readAll(entry_buf[0..16]);
+                const pledge = std.mem.readInt(u64, entry_buf[0..8], .big);
+                const cost = std.mem.readInt(u64, entry_buf[8..16], .big);
                 const margin = try readUnitIntervalFromFile(file);
-                _ = try file.readAll(entry_buf[44..74]);
-                const network: types.Network = @enumFromInt(entry_buf[44]);
-                const cred_type: types.CredentialType = @enumFromInt(entry_buf[45]);
+                _ = try file.readAll(entry_buf[16..46]);
+                const network: types.Network = @enumFromInt(entry_buf[16]);
+                const cred_type: types.CredentialType = @enumFromInt(entry_buf[17]);
                 var hash: types.Hash28 = undefined;
-                @memcpy(&hash, entry_buf[46..74]);
+                @memcpy(&hash, entry_buf[18..46]);
                 try self.future_pool_params.put(pool, .{
                     .config = .{
+                        .vrf_keyhash = vrf_keyhash,
                         .pledge = pledge,
                         .cost = cost,
                         .margin = margin,
@@ -2575,6 +2597,15 @@ fn writeOptionalKeyHashToFile(file: std.fs.File, maybe_hash: ?KeyHash) !void {
     }
 }
 
+fn writeOptionalHash32ToFile(file: std.fs.File, maybe_hash: ?types.Hash32) !void {
+    if (maybe_hash) |hash| {
+        try file.writeAll(&[_]u8{1});
+        try file.writeAll(&hash);
+    } else {
+        try file.writeAll(&[_]u8{0});
+    }
+}
+
 fn writeOptionalDRepToFile(file: std.fs.File, maybe_drep: ?DRep) !void {
     if (maybe_drep) |drep| {
         try file.writeAll(&[_]u8{1});
@@ -2639,6 +2670,16 @@ fn readOptionalKeyHashFromFile(file: std.fs.File) !?KeyHash {
     if (present_buf[0] == 0) return null;
 
     var hash: KeyHash = undefined;
+    _ = try file.readAll(&hash);
+    return hash;
+}
+
+fn readOptionalHash32FromFile(file: std.fs.File) !?types.Hash32 {
+    var present_buf: [1]u8 = undefined;
+    _ = try file.readAll(&present_buf);
+    if (present_buf[0] == 0) return null;
+
+    var hash: types.Hash32 = undefined;
     _ = try file.readAll(&hash);
     return hash;
 }
@@ -3930,12 +3971,14 @@ test "ledgerdb: checkpoint save and load round-trip" {
         const pool = [_]u8{0xbb} ** 28;
         try db.importPoolDeposit(pool, 500_000_000);
         try db.importPoolConfig(pool, .{
+            .vrf_keyhash = [_]u8{0xb1} ** 32,
             .pledge = 250_000_000,
             .cost = 340_000_000,
             .margin = .{ .numerator = 1, .denominator = 20 },
         });
         try db.importFuturePoolParams(pool, .{
             .config = .{
+                .vrf_keyhash = [_]u8{0xb2} ** 32,
                 .pledge = 300_000_000,
                 .cost = 345_000_000,
                 .margin = .{ .numerator = 1, .denominator = 10 },
@@ -4013,12 +4056,14 @@ test "ledgerdb: checkpoint save and load round-trip" {
         const pool = [_]u8{0xbb} ** 28;
         try std.testing.expectEqual(@as(?Coin, 500_000_000), db2.lookupPoolDeposit(pool));
         try std.testing.expectEqual(PoolConfig{
+            .vrf_keyhash = [_]u8{0xb1} ** 32,
             .pledge = 250_000_000,
             .cost = 340_000_000,
             .margin = .{ .numerator = 1, .denominator = 20 },
         }, db2.lookupPoolConfig(pool).?);
         try std.testing.expectEqual(FuturePoolParams{
             .config = .{
+                .vrf_keyhash = [_]u8{0xb2} ** 32,
                 .pledge = 300_000_000,
                 .cost = 345_000_000,
                 .margin = .{ .numerator = 1, .denominator = 10 },

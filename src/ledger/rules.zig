@@ -427,6 +427,7 @@ pub fn evaluateCertificateEffectWithContext(
                         ledger,
                         pool.operator,
                         .{
+                            .vrf_keyhash = pool.vrf_keyhash,
                             .pledge = pool.pledge,
                             .cost = pool.cost,
                             .margin = pool.margin,
@@ -455,6 +456,7 @@ pub fn evaluateCertificateEffectWithContext(
                         pool.operator,
                         .{
                             .config = .{
+                                .vrf_keyhash = pool.vrf_keyhash,
                                 .pledge = pool.pledge,
                                 .cost = pool.cost,
                                 .margin = pool.margin,
@@ -2148,6 +2150,7 @@ test "rules: pool re-registration stages future params and clears retirement" {
     try std.testing.expectEqual(@as(usize, 1), effect.future_pool_param_changes.len);
     try std.testing.expectEqual(FuturePoolParams{
         .config = .{
+            .vrf_keyhash = [_]u8{0xe4} ** 32,
             .pledge = 0,
             .cost = 0,
             .margin = .{ .numerator = 1, .denominator = 10 },

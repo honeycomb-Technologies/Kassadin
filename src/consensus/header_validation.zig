@@ -70,9 +70,16 @@ pub fn validateVRFKey(
     header: *const block_mod.BlockHeader,
     pool_info: *const PoolInfo,
 ) ValidationError!void {
+    return validateExpectedVRFKeyHash(header, pool_info.vrf_key_hash);
+}
+
+pub fn validateExpectedVRFKeyHash(
+    header: *const block_mod.BlockHeader,
+    expected_vrf_key_hash: [32]u8,
+) ValidationError!void {
     // The VRF key in the header must hash to the registered VRF key hash
     const vrf_key_hash = Blake2b256.hash(&header.vrf_vkey);
-    if (!std.mem.eql(u8, &vrf_key_hash, &pool_info.vrf_key_hash)) {
+    if (!std.mem.eql(u8, &vrf_key_hash, &expected_vrf_key_hash)) {
         return error.VRFKeyMismatch;
     }
 }

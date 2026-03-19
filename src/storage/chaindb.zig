@@ -186,6 +186,16 @@ pub const ChainDB = struct {
         }
     }
 
+    fn validateConsensusPrereqs(self: *const ChainDB, block: *const block_mod.Block) !void {
+        if (block.era == .byron) return;
+
+        const issuer = header_validation.poolKeyHash(block.header.issuer_vkey);
+        const expected_vrf_key_hash = self.ledger.lookupIssuerVrfKeyHash(issuer) orelse {
+            return error.VRFKeyUnknown;
+        };
+        try header_validation.validateExpectedVRFKeyHash(&block.header, expected_vrf_key_hash);
+    }
+
     /// Add a block to the chain database.
     /// First validates it's not a duplicate, then stores in volatile DB.
     pub fn addBlock(self: *ChainDB, hash: HeaderHash, block_data: []const u8, slot: SlotNo, block_no: BlockNo, prev_hash: ?HeaderHash) !AddBlockResult {
@@ -255,6 +265,16 @@ pub const ChainDB = struct {
                 if (block.era == .conway) {
                     self.ledger.setPointerInstantStakeEnabled(false);
                 }
+                self.validateConsensusPrereqs(block) catch |err| {
+                    if (!builtin.is_test) {
+                        std.debug.print("ChainDB consensus rejected block {}: {}\n", .{ block_no, err });
+                    }
+                    if (governance_snapshot) |*snapshot| {
+                        try self.governance_state.restoreSnapshot(self.allocator, snapshot);
+                        self.protocol_params = snapshot.active_params;
+                    }
+                    return .invalid;
+                };
             }
 
             ledger_diffs_applied = try self.applyEpochBoundaryEffects(slot, hash);
@@ -706,6 +726,9 @@ test "chaindb: ledger validation applies a real block" {
     var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-validated", 2160);
     defer db.close();
 
+    const issuer_pool = header_validation.poolKeyHash(block.header.issuer_vkey);
+    const vrf_hash = Blake2b256.hash(&block.header.vrf_vkey);
+
     const seed_produced = try allocator.alloc(UtxoEntry, 1);
     seed_produced[0] = .{
         .tx_in = input,
@@ -717,6 +740,12 @@ test "chaindb: ledger validation applies a real block" {
         .block_hash = [_]u8{0} ** 32,
         .consumed = try allocator.alloc(UtxoEntry, 0),
         .produced = seed_produced,
+    });
+    try db.ledger.importPoolConfig(issuer_pool, .{
+        .vrf_keyhash = vrf_hash,
+        .pledge = 0,
+        .cost = 0,
+        .margin = .{ .numerator = 0, .denominator = 1 },
     });
 
     try db.enableLedgerValidation();
@@ -791,6 +820,9 @@ test "chaindb: epoch boundary reaps retiring pool" {
     var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-pool-reap", 2160);
     defer db.close();
 
+    const issuer_pool = header_validation.poolKeyHash(block.header.issuer_vkey);
+    const vrf_hash = Blake2b256.hash(&block.header.vrf_vkey);
+
     const pool = [_]u8{0x75} ** 28;
     const delegated_cred = types.Credential{
         .cred_type = .key_hash,
@@ -809,6 +841,12 @@ test "chaindb: epoch boundary reaps retiring pool" {
     try db.ledger.importPoolRewardAccount(pool, reward_account);
     try db.ledger.importPoolRetirement(pool, 1);
     try db.ledger.importStakePoolDelegation(delegated_cred, pool);
+    try db.ledger.importPoolConfig(issuer_pool, .{
+        .vrf_keyhash = vrf_hash,
+        .pledge = 0,
+        .cost = 0,
+        .margin = .{ .numerator = 0, .denominator = 1 },
+    });
 
     try db.configureShelleyGovernanceTracking(.{
         .epoch_length = 100,
@@ -890,6 +928,9 @@ test "chaindb: epoch boundary sends unclaimed pool refunds to treasury" {
     var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-pool-reap-treasury", 2160);
     defer db.close();
 
+    const issuer_pool = header_validation.poolKeyHash(block.header.issuer_vkey);
+    const vrf_hash = Blake2b256.hash(&block.header.vrf_vkey);
+
     const pool = [_]u8{0x84} ** 28;
     const reward_account = types.RewardAccount{
         .network = .testnet,
@@ -903,6 +944,12 @@ test "chaindb: epoch boundary sends unclaimed pool refunds to treasury" {
     try db.ledger.importPoolDeposit(pool, rules.ProtocolParams.mainnet_defaults.pool_deposit);
     try db.ledger.importPoolRewardAccount(pool, reward_account);
     try db.ledger.importPoolRetirement(pool, 1);
+    try db.ledger.importPoolConfig(issuer_pool, .{
+        .vrf_keyhash = vrf_hash,
+        .pledge = 0,
+        .cost = 0,
+        .margin = .{ .numerator = 0, .denominator = 1 },
+    });
 
     try db.configureShelleyGovernanceTracking(.{
         .epoch_length = 100,

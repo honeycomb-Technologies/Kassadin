@@ -523,6 +523,7 @@ headers from ouroboros-consensus golden data.
 - [x] Resolve epoch active stake from the unified local stake-account state instead of stitching reward balances and delegations together from separate maps
 - [x] Keep pre-Conway pointer-backed instant stake live while disabling pointer-backed instant stake in Conway-era snapshot rotation and epoch-boundary processing, matching the Haskell instant-stake split
 - [x] Hydrate current + future pool params from ancillary snapshot state, track them rollback-safely in `LedgerDB`, and activate staged pool re-registration params at epoch processing
+- [x] Persist pool VRF key hashes in current/future pool params, hydrate them from ancillary snapshot state, and reject Shelley+ blocks whose issuer `vrf_vkey` hash does not match the tracked pool or current genesis-delegation VRF key hash
 - [x] Credit delegator reward accounts as well as pool reward accounts from `go`-snapshot stake during epoch reward distribution (current follower reward model)
 - [x] Import/rotate Haskell-shaped `BlocksMade` (`nesBprev` / `nesBcur`) and use real block production plus Shelley `activeSlotsCoeff` in the follower reward path
 - [x] Replace the ad hoc epoch reward diff with an explicit Haskell-shaped `deltaT` / `deltaR` / `deltaF` balance sheet so snapshot fees roll forward into reserves/treasury/rewards instead of being dropped
