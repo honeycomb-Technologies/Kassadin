@@ -67,6 +67,7 @@ pub fn bootstrapSync(
     var result = std.mem.zeroes(BootstrapSyncResult);
     const max = if (max_blocks == 0) std.math.maxInt(u64) else max_blocks;
     var loaded_governance_config: ?protocol_update.GovernanceConfig = null;
+    var loaded_consensus_params: ?genesis_mod.ConsensusParams = null;
     defer {
         if (loaded_governance_config) |*config| config.deinit(allocator);
     }
@@ -116,9 +117,18 @@ pub fn bootstrapSync(
         if (genesis_mod.loadLedgerProtocolParams(allocator, path) catch null) |protocol_params| {
             chain_db.setProtocolParams(protocol_params);
         }
+        if (genesis_mod.loadShelleyConsensusParams(allocator, path) catch null) |consensus_params| {
+            loaded_consensus_params = consensus_params;
+        }
         if (genesis_mod.loadShelleyGovernanceConfig(allocator, path) catch null) |governance_config| {
             loaded_governance_config = governance_config;
         }
+    }
+    if (loaded_consensus_params) |consensus_params| {
+        chain_db.setConsensusParams(
+            consensus_params.slots_per_kes_period,
+            consensus_params.max_kes_evolutions,
+        );
     }
     if (loaded_governance_config) |governance_config| {
         try chain_db.configureShelleyGovernanceTracking(governance_config);
@@ -370,6 +380,7 @@ pub fn bootstrapSync(
                     switch (add_result) {
                         .added_to_current_chain => {
                             result.blocks_added_to_chain += 1;
+                            _ = try chain_db.promoteFinalized();
                         },
                         .invalid => {
                             result.invalid_blocks += 1;

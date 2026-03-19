@@ -118,7 +118,7 @@ The certified natural (leader value) is derived by interpreting the first 8 byte
 
 ## 3. KES (Key Evolving Signature)
 
-**Algorithm:** CompactSumKES (binary tree of Ed25519, depth 6)
+**Algorithm:** SumKES (binary tree of Ed25519, depth 6)
 **No external library** — implemented using Ed25519 primitives.
 
 ### Structure
@@ -126,31 +126,31 @@ The certified natural (leader value) is derived by interpreting the first 8 byte
 KES is a tree-based forward-secure signature scheme. At depth d, it supports 2^d time periods. Cardano mainnet uses depth 6 = 64 periods.
 
 ```
-CompactSumKES = recursive binary tree:
-  Level 0: CompactSingleKES (1 period, wraps Ed25519)
-  Level n: CompactSumKES (2^n periods, two Level-(n-1) subtrees)
+SumKES = recursive binary tree:
+  Level 0: SingleKES (1 period, wraps Ed25519)
+  Level n: SumKES (2^n periods, two Level-(n-1) subtrees)
 ```
 
-### CompactSingleKES (Base Case)
+### SingleKES (Base Case)
 ```
 VerKey = Ed25519.VerKey (32 bytes)
-SignKey = Ed25519.SignKey (64 bytes, but stored as 32-byte seed)
-Signature = Ed25519.Signature ++ Ed25519.VerKey (64 + 32 = 96 bytes)
+SignKey = Ed25519.SignKey (64 bytes)
+Signature = Ed25519.Signature (64 bytes)
 ```
 
-### CompactSumKES (Recursive Case)
+### SumKES (Recursive Case)
 ```
-VerKey = Blake2b-256(vk_left ++ vk_right) (32 bytes — compact!)
-SignKey = (sk_current, seed_other, vk_current, vk_other)
-Signature = (inner_sig, vk_other)
+VerKey = Blake2b-256(vk_left ++ vk_right) (32 bytes)
+SignKey = (sk_current, seed_other, vk_left, vk_right)
+Signature = (inner_sig, vk_left, vk_right)
 ```
 
 ### Key Sizes at Depth 6
 | Component | Size (bytes) |
 |-----------|-------------|
-| Verification key | 32 (single hash) |
-| Signing key | 32 (seed) + 32 (seed) + 32 (vk) + 32 (vk) × depth = varies |
-| Signature | (64 + 32) × (depth + 1) + 32 × depth |
+| Verification key | 32 |
+| Signing key | 640 |
+| Signature | 448 |
 
 ### Period Management
 - **Total periods:** 64 (2^6)
@@ -162,36 +162,29 @@ Signature = (inner_sig, vk_other)
 ```
 fn signKES(depth, period, msg, sk) -> Signature:
     if depth == 0:
-        sig = Ed25519.sign(msg, sk.ed_sk)
-        return (sig, sk.ed_vk)
+        return Ed25519.sign(msg, sk.ed_sk)
 
     half = 2^(depth-1)
     if period < half:
         inner_sig = signKES(depth-1, period, msg, sk.left)
-        return (inner_sig, sk.vk_right)
+        return (inner_sig, sk.vk_left, sk.vk_right)
     else:
         inner_sig = signKES(depth-1, period - half, msg, sk.right)
-        return (inner_sig, sk.vk_left)
+        return (inner_sig, sk.vk_left, sk.vk_right)
 ```
 
 ### Algorithm: Verify at Period t
 ```
 fn verifyKES(depth, vk, period, msg, sig) -> bool:
     if depth == 0:
-        (ed_sig, ed_vk) = sig
-        if Blake2b256(ed_vk) != vk: return false
-        return Ed25519.verify(msg, ed_sig, ed_vk)
+        return Ed25519.verify(msg, sig, vk)
 
-    (inner_sig, vk_other) = sig
+    (inner_sig, vk_left, vk_right) = sig
     half = 2^(depth-1)
+    if Blake2b256(vk_left ++ vk_right) != vk: return false
     if period < half:
-        expected_vk = Blake2b256(inner_vk ++ vk_other)
-        // inner_vk extracted from inner_sig recursively
-    else:
-        expected_vk = Blake2b256(vk_other ++ inner_vk)
-
-    if expected_vk != vk: return false
-    return verifyKES(depth-1, inner_vk, period mod half, msg, inner_sig)
+        return verifyKES(depth-1, vk_left, period, msg, inner_sig)
+    return verifyKES(depth-1, vk_right, period mod half, msg, inner_sig)
 ```
 
 ### Algorithm: Evolve Key to Next Period

@@ -47,6 +47,11 @@ pub const ProtocolParams = struct {
     min_utxo_value: u64,
 };
 
+pub const ConsensusParams = struct {
+    slots_per_kes_period: u64,
+    max_kes_evolutions: u32,
+};
+
 pub const ByronGenesisBalance = struct {
     id: []u8,
     lovelace: u64,
@@ -166,6 +171,15 @@ pub fn loadLedgerProtocolParams(allocator: Allocator, path: []const u8) !ledger_
     var genesis = try parseShelleyGenesis(allocator, path);
     defer genesis.deinit(allocator);
     return toLedgerProtocolParams(genesis.protocol_params);
+}
+
+pub fn loadShelleyConsensusParams(allocator: Allocator, path: []const u8) !ConsensusParams {
+    var genesis = try parseShelleyGenesis(allocator, path);
+    defer genesis.deinit(allocator);
+    return .{
+        .slots_per_kes_period = genesis.slots_per_kes_period,
+        .max_kes_evolutions = genesis.max_kes_evolutions,
+    };
 }
 
 pub fn loadShelleyGovernanceConfig(allocator: Allocator, path: []const u8) !protocol_update.GovernanceConfig {

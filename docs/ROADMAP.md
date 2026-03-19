@@ -27,7 +27,7 @@ semantics, serialization, and troubleshooting.
 - [x] Ed25519 signing/verification via Zig std.crypto (RFC 8032, byte-compatible with libsodium)
 - [x] Blake2b-224 and Blake2b-256 hashing via Zig std.crypto (RFC 7693)
 - [x] VRF (PraosBatchCompatVRF, IETF draft-13) via vendored C code from cardano-crypto-praos/cbits
-- [x] KES (CompactSumKES depth-6 over Ed25519) pure Zig implementation
+- [x] KES verification path now uses Haskell-aligned `Sum6KES Ed25519DSIGN Blake2b_256` semantics for live header validation
 - [x] Operational certificate creation and validation
 - [x] Bech32 encoding/decoding (BIP-173) for key serialization
 
@@ -51,7 +51,7 @@ semantics, serialization, and troubleshooting.
 ### Testing Gate 0 -- PASSED
 - [x] Ed25519: sign/verify, indirectly proven byte-exact via KES golden match
 - [x] VRF: 5 Haskell test vectors (vrf_ver13_*), byte-exact proof/output match. Same C code as Haskell node.
-- [x] KES: 5 Rust golden files (compactkey6.bin family), byte-exact 608-byte SK, 288-byte signatures
+- [x] Legacy compact KES golden files still cover the old experimental module; runtime/header validation now uses the real `Sum6KES` layout with 448-byte signatures
 - [x] CBOR: encode/decode all major types + decoded real 1,865-byte Alonzo block
 - [x] CBOR: byte-exact preservation verified (sliceOfNextValue captures original bytes)
 - [x] Address: 6 CIP-0019 official golden vectors (base, enterprise, reward, script)
@@ -330,7 +330,7 @@ DO NOT mark Phase 3 fully complete until these are validated in Phase 7/8.
 - [x] Golden Alonzo block structural validation
 - [x] Retain Shelley+ VRF cert payloads and structured operational-cert fields in parsed headers for later VRF/KES/OCert validation
 - [ ] VRF proof verification (needs epoch nonce from chain state — Phase 7)
-- [ ] KES signature verification (needs KES period calculation — can do now)
+- [x] KES signature verification on Shelley+ headers using relative KES periods and Haskell-aligned `Sum6KES`
 - [ ] OCert counter validation (needs counter map from chain state — Phase 7)
 
 ### 4.5 Protocol State (PraosState)
@@ -349,7 +349,7 @@ DO NOT mark Phase 3 fully complete until these are validated in Phase 7/8.
 **Deferred to Phase 7/8 (require chain state):**
 - [ ] VRF leader check against 10,000 real slots with real stake distribution
 - [ ] VRF proof verification on real headers (needs epoch nonce)
-- [ ] KES signature verification on real headers (needs KES period from chain)
+- [x] KES signature verification on real preprod headers
 - [ ] OCert counter validation against real counter map
 - [ ] Full chain sync maintaining tip within 2160 slots
 

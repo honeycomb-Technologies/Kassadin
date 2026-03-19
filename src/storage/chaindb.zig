@@ -57,6 +57,8 @@ pub const ChainDB = struct {
     ledger_validation_enabled: bool,
     ledger_ready: bool,
     protocol_params: rules.ProtocolParams,
+    slots_per_kes_period: u64,
+    max_kes_evolutions: u32,
     shelley_governance_config: ?protocol_update.GovernanceConfig,
     governance_state: protocol_update.GovernanceState,
 
@@ -64,11 +66,11 @@ pub const ChainDB = struct {
     security_param: u64,
 
     pub fn open(allocator: Allocator, db_path: []const u8, security_param: u64) !ChainDB {
-        var imm_path_buf: [256]u8 = undefined;
-        const imm_path = try std.fmt.bufPrint(&imm_path_buf, "{s}/immutable", .{db_path});
+        const imm_path = try std.fmt.allocPrint(allocator, "{s}/immutable", .{db_path});
+        errdefer allocator.free(imm_path);
 
-        var ledger_path_buf: [256]u8 = undefined;
-        const ledger_path = try std.fmt.bufPrint(&ledger_path_buf, "{s}/ledger", .{db_path});
+        const ledger_path = try std.fmt.allocPrint(allocator, "{s}/ledger", .{db_path});
+        errdefer allocator.free(ledger_path);
 
         var db = ChainDB{
             .allocator = allocator,
@@ -83,6 +85,8 @@ pub const ChainDB = struct {
             .ledger_validation_enabled = false,
             .ledger_ready = false,
             .protocol_params = rules.ProtocolParams.compatibility_defaults,
+            .slots_per_kes_period = types.mainnet.slots_per_kes_period,
+            .max_kes_evolutions = types.mainnet.max_kes_evolutions,
             .shelley_governance_config = null,
             .governance_state = .{},
             .security_param = security_param,
@@ -106,8 +110,10 @@ pub const ChainDB = struct {
             if (entry.governance_snapshot) |*snapshot| snapshot.deinit(self.allocator);
         }
         self.immutable.close();
+        self.allocator.free(self.immutable.base_path);
         self.@"volatile".deinit();
         self.ledger.deinit();
+        self.allocator.free(self.ledger.snapshot_path);
         self.current_chain.deinit(self.allocator);
         self.governance_state.deinit(self.allocator);
         if (self.shelley_governance_config) |*config| {
@@ -145,6 +151,11 @@ pub const ChainDB = struct {
 
     pub fn getProtocolParams(self: *const ChainDB) rules.ProtocolParams {
         return self.protocol_params;
+    }
+
+    pub fn setConsensusParams(self: *ChainDB, slots_per_kes_period: u64, max_kes_evolutions: u32) void {
+        self.slots_per_kes_period = slots_per_kes_period;
+        self.max_kes_evolutions = max_kes_evolutions;
     }
 
     pub fn configureShelleyGovernanceTracking(
@@ -194,6 +205,12 @@ pub const ChainDB = struct {
             return error.VRFKeyUnknown;
         };
         try header_validation.validateExpectedVRFKeyHash(&block.header, expected_vrf_key_hash);
+        try header_validation.validateOperationalCertificateAndKes(
+            &block.header,
+            block.header.slot,
+            self.slots_per_kes_period,
+            self.max_kes_evolutions,
+        );
     }
 
     /// Add a block to the chain database.
@@ -393,28 +410,42 @@ pub const ChainDB = struct {
     /// Promote finalized blocks from volatile to immutable.
     /// Blocks deeper than k from the tip are considered final.
     pub fn promoteFinalized(self: *ChainDB) !u32 {
-        var promoted: u32 = 0;
         const vol = &self.@"volatile";
-
-        var to_promote: std.ArrayList(HeaderHash) = .empty;
-        defer to_promote.deinit(self.allocator);
-
-        var it = vol.blocks.iterator();
-        while (it.next()) |entry| {
-            const info = entry.value_ptr;
-            if (self.tip_block_no > self.security_param and
-                info.block_no <= self.tip_block_no - self.security_param)
-            {
-                try to_promote.append(self.allocator, info.hash);
-            }
+        if (self.tip_block_no <= self.security_param or self.current_chain.items.len == 0) {
+            return 0;
         }
 
-        for (to_promote.items) |hash| {
-            if (vol.getBlock(hash)) |info| {
-                try self.immutable.appendBlock(info.hash, info.data, info.slot, info.block_no);
-                promoted += 1;
-            }
+        const finalized_block_no = self.tip_block_no - self.security_param;
+        var promoted_len: usize = 0;
+        while (promoted_len < self.current_chain.items.len and
+            self.current_chain.items[promoted_len].block_no <= finalized_block_no)
+        {
+            promoted_len += 1;
         }
+        if (promoted_len == 0) return 0;
+
+        for (self.current_chain.items[0..promoted_len]) |entry| {
+            const info = vol.getBlock(entry.point.hash) orelse return error.MissingVolatileBlock;
+            try self.immutable.appendBlock(info.hash, info.data, info.slot, info.block_no);
+        }
+
+        const last_promoted = self.current_chain.items[promoted_len - 1];
+        self.base_tip = .{
+            .point = last_promoted.point,
+            .block_no = last_promoted.block_no,
+        };
+
+        for (self.current_chain.items[0..promoted_len]) |*entry| {
+            if (entry.governance_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+        }
+
+        const remaining = self.current_chain.items.len - promoted_len;
+        std.mem.copyForwards(
+            CurrentChainEntry,
+            self.current_chain.items[0..remaining],
+            self.current_chain.items[promoted_len..],
+        );
+        self.current_chain.items.len = remaining;
 
         // GC promoted blocks from volatile
         if (self.tip_block_no > self.security_param) {
@@ -422,7 +453,7 @@ pub const ChainDB = struct {
             try vol.garbageCollect(min_slot);
         }
 
-        return promoted;
+        return @intCast(promoted_len);
     }
 
     /// Get current tip.
@@ -634,6 +665,50 @@ test "chaindb: rollback rewinds current chain tip" {
     try std.testing.expectEqual(@as(SlotNo, 10), db.getTip().slot);
 }
 
+test "chaindb: promote finalized uses ordered current-chain prefix" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-test-chaindb-promote";
+
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+
+    const hash0 = Blake2b256.hash("main-0");
+    const hash1 = Blake2b256.hash("main-1");
+    const hash2 = Blake2b256.hash("main-2");
+    const fork_hash = Blake2b256.hash("fork-1");
+
+    {
+        var db = try ChainDB.open(allocator, path, 1);
+        defer db.close();
+
+        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash0, "main-0", 0, 0, null));
+        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash1, "main-1", 10, 1, hash0));
+        try std.testing.expectEqual(AddBlockResult.added_to_fork, try db.addBlock(fork_hash, "fork-1", 11, 1, hash0));
+        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash2, "main-2", 20, 2, hash1));
+
+        const promoted = try db.promoteFinalized();
+        try std.testing.expectEqual(@as(u32, 2), promoted);
+        try std.testing.expectEqual(@as(usize, 1), db.current_chain.items.len);
+        try std.testing.expectEqual(hash2, db.current_chain.items[0].point.hash);
+        try std.testing.expectEqual(@as(BlockNo, 1), db.base_tip.?.block_no);
+        try std.testing.expectEqual(hash1, db.base_tip.?.point.hash);
+        try std.testing.expectEqual(@as(BlockNo, 2), db.getTip().block_no);
+        try std.testing.expectEqual(@as(usize, 2), db.immutable.blockCount());
+        const promoted0 = (try db.immutable.getBlock(hash0)).?;
+        defer allocator.free(promoted0);
+        const promoted1 = (try db.immutable.getBlock(hash1)).?;
+        defer allocator.free(promoted1);
+        try std.testing.expectEqualStrings("main-0", promoted0);
+        try std.testing.expectEqualStrings("main-1", promoted1);
+        try std.testing.expect((try db.immutable.getBlock(fork_hash)) == null);
+    }
+
+    var reopened = try ChainDB.open(allocator, path, 1);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(BlockNo, 1), reopened.getTip().block_no);
+    try std.testing.expectEqual(hash1, reopened.getTip().hash);
+}
+
 test "chaindb: ledger validation rejects invalid current-chain blocks" {
     const allocator = std.testing.allocator;
     std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-invalid") catch {};
@@ -649,6 +724,78 @@ test "chaindb: ledger validation rejects invalid current-chain blocks" {
     try std.testing.expect(result == .invalid);
     try std.testing.expectEqual(@as(usize, 0), db.totalBlocks());
     try std.testing.expectEqual(@as(BlockNo, 0), db.getTip().block_no);
+}
+
+fn buildSignedShelleyTestBlock(
+    allocator: Allocator,
+    tx_bodies_raw: []const u8,
+    block_no: BlockNo,
+    slot: SlotNo,
+    prev_hash: ?HeaderHash,
+    issuer_seed: [32]u8,
+    kes_seed: [32]u8,
+    vrf_vkey: [32]u8,
+    body_hash: [32]u8,
+) ![]u8 {
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+    const Ed25519 = @import("../crypto/ed25519.zig").Ed25519;
+    const LiveKES = @import("../crypto/kes_sum.zig").KES;
+    const opcert_mod = @import("../crypto/opcert.zig");
+
+    const cold_kp = try Ed25519.keyFromSeed(issuer_seed);
+    const kes_kp = try LiveKES.generate(kes_seed);
+    const current_kes_period: u32 = @intCast(slot / types.mainnet.slots_per_kes_period);
+    const opcert = try opcert_mod.OperationalCert.create(
+        kes_kp.vk,
+        0,
+        current_kes_period,
+        cold_kp.sk,
+    );
+
+    var header_body_enc = Encoder.init(allocator);
+    defer header_body_enc.deinit();
+    try header_body_enc.encodeArrayLen(10);
+    try header_body_enc.encodeUint(block_no);
+    try header_body_enc.encodeUint(slot);
+    if (prev_hash) |hash| {
+        try header_body_enc.encodeBytes(&hash);
+    } else {
+        try header_body_enc.encodeNull();
+    }
+    try header_body_enc.encodeBytes(&cold_kp.vk);
+    try header_body_enc.encodeBytes(&vrf_vkey);
+    try header_body_enc.encodeArrayLen(0); // vrf result placeholder
+    try header_body_enc.encodeUint(tx_bodies_raw.len);
+    try header_body_enc.encodeBytes(&body_hash);
+    try header_body_enc.encodeArrayLen(4);
+    try header_body_enc.encodeBytes(&opcert.hot_vkey);
+    try header_body_enc.encodeUint(opcert.sequence_number);
+    try header_body_enc.encodeUint(opcert.kes_period);
+    try header_body_enc.encodeBytes(&opcert.cold_key_signature);
+    try header_body_enc.encodeArrayLen(2);
+    try header_body_enc.encodeUint(1);
+    try header_body_enc.encodeUint(0);
+    const header_body_raw = try header_body_enc.toOwnedSlice();
+    defer allocator.free(header_body_raw);
+
+    const kes_sig = try LiveKES.sign(current_kes_period, header_body_raw, &kes_kp.sk);
+
+    var header_enc = Encoder.init(allocator);
+    defer header_enc.deinit();
+    try header_enc.encodeArrayLen(2);
+    try header_enc.writeRaw(header_body_raw);
+    try header_enc.encodeBytes(&kes_sig);
+    const header_raw = try header_enc.toOwnedSlice();
+    defer allocator.free(header_raw);
+
+    var block_enc = Encoder.init(allocator);
+    defer block_enc.deinit();
+    try block_enc.encodeArrayLen(4);
+    try block_enc.writeRaw(header_raw);
+    try block_enc.writeRaw(tx_bodies_raw);
+    try block_enc.encodeArrayLen(0); // witnesses
+    try block_enc.encodeMapLen(0); // auxiliary data
+    return block_enc.toOwnedSlice();
 }
 
 test "chaindb: ledger validation applies a real block" {
@@ -685,40 +832,17 @@ test "chaindb: ledger validation applies a real block" {
     const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
     defer allocator.free(tx_bodies_raw);
 
-    var header_body_enc = Encoder.init(allocator);
-    defer header_body_enc.deinit();
-    try header_body_enc.encodeArrayLen(10);
-    try header_body_enc.encodeUint(1); // block_no
-    try header_body_enc.encodeUint(42); // slot
-    try header_body_enc.encodeNull(); // prev_hash
-    try header_body_enc.encodeBytes(&([_]u8{0x22} ** 32));
-    try header_body_enc.encodeBytes(&([_]u8{0x33} ** 32));
-    try header_body_enc.encodeArrayLen(0); // vrf result
-    try header_body_enc.encodeUint(tx_bodies_raw.len);
-    try header_body_enc.encodeBytes(&([_]u8{0x44} ** 32)); // body hash placeholder
-    try header_body_enc.encodeArrayLen(0); // opcert placeholder
-    try header_body_enc.encodeArrayLen(2);
-    try header_body_enc.encodeUint(1);
-    try header_body_enc.encodeUint(0);
-    const header_body_raw = try header_body_enc.toOwnedSlice();
-    defer allocator.free(header_body_raw);
-
-    var header_enc = Encoder.init(allocator);
-    defer header_enc.deinit();
-    try header_enc.encodeArrayLen(2);
-    try header_enc.writeRaw(header_body_raw);
-    try header_enc.encodeBytes(&[_]u8{}); // kes signature placeholder
-    const header_raw = try header_enc.toOwnedSlice();
-    defer allocator.free(header_raw);
-
-    var block_enc = Encoder.init(allocator);
-    defer block_enc.deinit();
-    try block_enc.encodeArrayLen(4);
-    try block_enc.writeRaw(header_raw);
-    try block_enc.writeRaw(tx_bodies_raw);
-    try block_enc.encodeArrayLen(0); // witnesses
-    try block_enc.encodeMapLen(0); // auxiliary data
-    const block_data = try block_enc.toOwnedSlice();
+    const block_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        1,
+        42,
+        null,
+        [_]u8{0x22} ** 32,
+        [_]u8{0x23} ** 32,
+        [_]u8{0x33} ** 32,
+        [_]u8{0x44} ** 32,
+    );
     defer allocator.free(block_data);
 
     const block = try block_mod.parseBlock(block_data);
@@ -779,40 +903,17 @@ test "chaindb: epoch boundary reaps retiring pool" {
     const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
     defer allocator.free(tx_bodies_raw);
 
-    var header_body_enc = Encoder.init(allocator);
-    defer header_body_enc.deinit();
-    try header_body_enc.encodeArrayLen(10);
-    try header_body_enc.encodeUint(1); // block_no
-    try header_body_enc.encodeUint(100); // slot
-    try header_body_enc.encodeNull(); // prev_hash
-    try header_body_enc.encodeBytes(&([_]u8{0x72} ** 32));
-    try header_body_enc.encodeBytes(&([_]u8{0x73} ** 32));
-    try header_body_enc.encodeArrayLen(0); // vrf result
-    try header_body_enc.encodeUint(tx_bodies_raw.len);
-    try header_body_enc.encodeBytes(&([_]u8{0x74} ** 32)); // body hash placeholder
-    try header_body_enc.encodeArrayLen(0); // opcert placeholder
-    try header_body_enc.encodeArrayLen(2);
-    try header_body_enc.encodeUint(1);
-    try header_body_enc.encodeUint(0);
-    const header_body_raw = try header_body_enc.toOwnedSlice();
-    defer allocator.free(header_body_raw);
-
-    var header_enc = Encoder.init(allocator);
-    defer header_enc.deinit();
-    try header_enc.encodeArrayLen(2);
-    try header_enc.writeRaw(header_body_raw);
-    try header_enc.encodeBytes(&[_]u8{}); // kes signature placeholder
-    const header_raw = try header_enc.toOwnedSlice();
-    defer allocator.free(header_raw);
-
-    var block_enc = Encoder.init(allocator);
-    defer block_enc.deinit();
-    try block_enc.encodeArrayLen(4);
-    try block_enc.writeRaw(header_raw);
-    try block_enc.writeRaw(tx_bodies_raw);
-    try block_enc.encodeArrayLen(0); // witnesses
-    try block_enc.encodeMapLen(0); // auxiliary data
-    const block_data = try block_enc.toOwnedSlice();
+    const block_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        1,
+        100,
+        null,
+        [_]u8{0x72} ** 32,
+        [_]u8{0x73} ** 32,
+        [_]u8{0x74} ** 32,
+        [_]u8{0x75} ** 32,
+    );
     defer allocator.free(block_data);
 
     const block = try block_mod.parseBlock(block_data);
@@ -887,40 +988,17 @@ test "chaindb: epoch boundary sends unclaimed pool refunds to treasury" {
     const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
     defer allocator.free(tx_bodies_raw);
 
-    var header_body_enc = Encoder.init(allocator);
-    defer header_body_enc.deinit();
-    try header_body_enc.encodeArrayLen(10);
-    try header_body_enc.encodeUint(1);
-    try header_body_enc.encodeUint(100);
-    try header_body_enc.encodeNull();
-    try header_body_enc.encodeBytes(&([_]u8{0x81} ** 32));
-    try header_body_enc.encodeBytes(&([_]u8{0x82} ** 32));
-    try header_body_enc.encodeArrayLen(0);
-    try header_body_enc.encodeUint(tx_bodies_raw.len);
-    try header_body_enc.encodeBytes(&([_]u8{0x83} ** 32));
-    try header_body_enc.encodeArrayLen(0);
-    try header_body_enc.encodeArrayLen(2);
-    try header_body_enc.encodeUint(1);
-    try header_body_enc.encodeUint(0);
-    const header_body_raw = try header_body_enc.toOwnedSlice();
-    defer allocator.free(header_body_raw);
-
-    var header_enc = Encoder.init(allocator);
-    defer header_enc.deinit();
-    try header_enc.encodeArrayLen(2);
-    try header_enc.writeRaw(header_body_raw);
-    try header_enc.encodeBytes(&[_]u8{});
-    const header_raw = try header_enc.toOwnedSlice();
-    defer allocator.free(header_raw);
-
-    var block_enc = Encoder.init(allocator);
-    defer block_enc.deinit();
-    try block_enc.encodeArrayLen(4);
-    try block_enc.writeRaw(header_raw);
-    try block_enc.writeRaw(tx_bodies_raw);
-    try block_enc.encodeArrayLen(0);
-    try block_enc.encodeMapLen(0);
-    const block_data = try block_enc.toOwnedSlice();
+    const block_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        1,
+        100,
+        null,
+        [_]u8{0x81} ** 32,
+        [_]u8{0x82} ** 32,
+        [_]u8{0x83} ** 32,
+        [_]u8{0x84} ** 32,
+    );
     defer allocator.free(block_data);
 
     const block = try block_mod.parseBlock(block_data);

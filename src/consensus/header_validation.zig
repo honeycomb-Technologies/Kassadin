@@ -1,9 +1,11 @@
 const std = @import("std");
+const Decoder = @import("../cbor/decoder.zig").Decoder;
 const types = @import("../types.zig");
 const block_mod = @import("../ledger/block.zig");
 const VRF = @import("../crypto/vrf.zig").VRF;
-const KES = @import("../crypto/kes.zig").KES;
+const LiveKES = @import("../crypto/kes_sum.zig").KES;
 const Ed25519 = @import("../crypto/ed25519.zig").Ed25519;
+const opcert_mod = @import("../crypto/opcert.zig");
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
 const Blake2b224 = @import("../crypto/hash.zig").Blake2b224;
 
@@ -82,6 +84,68 @@ pub fn validateExpectedVRFKeyHash(
     if (!std.mem.eql(u8, &vrf_key_hash, &expected_vrf_key_hash)) {
         return error.VRFKeyMismatch;
     }
+}
+
+pub fn validateOperationalCertificate(
+    header: *const block_mod.BlockHeader,
+    current_kes_period: u32,
+    max_kes_evolutions: u32,
+) ValidationError!void {
+    const hot_vkey = header.opcert_hot_vkey orelse return error.OCertInvalidSignature;
+    const sequence_no = header.opcert_sequence_no orelse return error.OCertInvalidSignature;
+    const cert_kes_period = header.opcert_kes_period orelse return error.OCertInvalidSignature;
+    const sigma = header.opcert_sigma orelse return error.OCertInvalidSignature;
+    const kes_period: u32 = std.math.cast(u32, cert_kes_period) orelse return error.OCertInvalidSignature;
+
+    const cert = opcert_mod.OperationalCert.fromRawParts(
+        hot_vkey,
+        sequence_no,
+        kes_period,
+        sigma,
+    );
+    if (!cert.validate(header.issuer_vkey)) {
+        return error.OCertInvalidSignature;
+    }
+    if (current_kes_period < kes_period) {
+        return error.KESBeforeStart;
+    }
+    if (!cert.isKesValidAt(current_kes_period, max_kes_evolutions)) {
+        return error.KESAfterEnd;
+    }
+}
+
+pub fn validateKesSignature(
+    header: *const block_mod.BlockHeader,
+    current_kes_period: u32,
+) ValidationError!void {
+    const hot_vkey = header.opcert_hot_vkey orelse return error.KESInvalidSignature;
+    const cert_kes_period = header.opcert_kes_period orelse return error.KESInvalidSignature;
+    const cert_kes_period_u32: u32 = std.math.cast(u32, cert_kes_period) orelse return error.KESInvalidSignature;
+    if (current_kes_period < cert_kes_period_u32) return error.KESBeforeStart;
+    const relative_kes_period = current_kes_period - cert_kes_period_u32;
+
+    var dec = Decoder.init(header.kes_signature_raw);
+    const sig_bytes = dec.decodeBytes() catch return error.KESInvalidSignature;
+    if (sig_bytes.len != LiveKES.sig_length) return error.KESInvalidSignature;
+
+    var sig: LiveKES.Signature = undefined;
+    @memcpy(&sig, sig_bytes);
+
+    if (!LiveKES.verify(hot_vkey, relative_kes_period, header.header_body_raw, sig)) {
+        return error.KESInvalidSignature;
+    }
+}
+
+pub fn validateOperationalCertificateAndKes(
+    header: *const block_mod.BlockHeader,
+    slot: SlotNo,
+    slots_per_kes_period: u64,
+    max_kes_evolutions: u32,
+) ValidationError!void {
+    if (slots_per_kes_period == 0) return error.KESInvalidSignature;
+    const current_kes_period: u32 = std.math.cast(u32, slot / slots_per_kes_period) orelse return error.KESInvalidSignature;
+    try validateOperationalCertificate(header, current_kes_period, max_kes_evolutions);
+    try validateKesSignature(header, current_kes_period);
 }
 
 /// Compute the pool key hash (Blake2b-224 of the issuer VKey).
@@ -189,4 +253,82 @@ test "header_validation: golden block header structure" {
 
     // Should fail if last_slot is >= 9
     try std.testing.expectError(error.SlotNotIncreasing, validateHeaderStructure(&block.header, null, 9, null));
+}
+
+test "header_validation: operational certificate and KES signature validate" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+    const cold_seed = [_]u8{0x31} ** 32;
+    const kes_seed = [_]u8{0x32} ** 32;
+    const cold_kp = try Ed25519.keyFromSeed(cold_seed);
+    const kes_kp = try LiveKES.generate(kes_seed);
+    const opcert = try opcert_mod.OperationalCert.create(kes_kp.vk, 7, 0, cold_kp.sk);
+    const header_body_raw = "signed-header-body";
+    const kes_sig = try LiveKES.sign(0, header_body_raw, &kes_kp.sk);
+
+    var kes_sig_enc = Encoder.init(allocator);
+    defer kes_sig_enc.deinit();
+    try kes_sig_enc.encodeBytes(&kes_sig);
+    const kes_signature_raw = try kes_sig_enc.toOwnedSlice();
+    defer allocator.free(kes_signature_raw);
+
+    const header = block_mod.BlockHeader{
+        .block_no = 1,
+        .slot = 99,
+        .prev_hash = null,
+        .issuer_vkey = cold_kp.vk,
+        .vrf_vkey = [_]u8{0x33} ** 32,
+        .block_body_size = 0,
+        .block_body_hash = [_]u8{0} ** 32,
+        .opcert_hot_vkey = opcert.hot_vkey,
+        .opcert_sequence_no = opcert.sequence_number,
+        .opcert_kes_period = opcert.kes_period,
+        .opcert_sigma = opcert.cold_key_signature,
+        .protocol_version_major = 0,
+        .protocol_version_minor = 0,
+        .header_body_raw = header_body_raw,
+        .kes_signature_raw = kes_signature_raw,
+    };
+
+    try validateOperationalCertificateAndKes(&header, header.slot, 129_600, 62);
+}
+
+test "header_validation: invalid KES signature is rejected" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+    const cold_seed = [_]u8{0x41} ** 32;
+    const kes_seed = [_]u8{0x42} ** 32;
+    const cold_kp = try Ed25519.keyFromSeed(cold_seed);
+    const kes_kp = try LiveKES.generate(kes_seed);
+    const opcert = try opcert_mod.OperationalCert.create(kes_kp.vk, 0, 0, cold_kp.sk);
+    const bad_sig = [_]u8{0xaa} ** LiveKES.sig_length;
+
+    var kes_sig_enc = Encoder.init(allocator);
+    defer kes_sig_enc.deinit();
+    try kes_sig_enc.encodeBytes(&bad_sig);
+    const kes_signature_raw = try kes_sig_enc.toOwnedSlice();
+    defer allocator.free(kes_signature_raw);
+
+    const header = block_mod.BlockHeader{
+        .block_no = 1,
+        .slot = 5,
+        .prev_hash = null,
+        .issuer_vkey = cold_kp.vk,
+        .vrf_vkey = [_]u8{0x43} ** 32,
+        .block_body_size = 0,
+        .block_body_hash = [_]u8{0} ** 32,
+        .opcert_hot_vkey = opcert.hot_vkey,
+        .opcert_sequence_no = opcert.sequence_number,
+        .opcert_kes_period = opcert.kes_period,
+        .opcert_sigma = opcert.cold_key_signature,
+        .protocol_version_major = 0,
+        .protocol_version_minor = 0,
+        .header_body_raw = "signed-header-body",
+        .kes_signature_raw = kes_signature_raw,
+    };
+
+    try std.testing.expectError(
+        error.KESInvalidSignature,
+        validateOperationalCertificateAndKes(&header, header.slot, 129_600, 62),
+    );
 }

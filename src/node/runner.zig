@@ -457,6 +457,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
 
     var loaded_protocol_params: ?ledger_rules.ProtocolParams = null;
     var loaded_governance_config: ?protocol_update.GovernanceConfig = null;
+    var loaded_consensus_params: ?genesis_mod.ConsensusParams = null;
     defer {
         if (loaded_governance_config) |*governance_config| governance_config.deinit(allocator);
     }
@@ -501,6 +502,12 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
             result.genesis_loaded = true;
         }
     }
+    if (config.shelley_genesis_path) |path| {
+        if (genesis_mod.loadShelleyConsensusParams(allocator, path) catch null) |consensus_params| {
+            loaded_consensus_params = consensus_params;
+            result.genesis_loaded = true;
+        }
+    }
 
     // Open chain database
     var chain_db = try ChainDB.open(allocator, config.db_path, 2160);
@@ -509,6 +516,12 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
 
     if (loaded_protocol_params) |protocol_params| {
         chain_db.setProtocolParams(protocol_params);
+    }
+    if (loaded_consensus_params) |consensus_params| {
+        chain_db.setConsensusParams(
+            consensus_params.slots_per_kes_period,
+            consensus_params.max_kes_evolutions,
+        );
     }
     if (loaded_governance_config) |governance_config| {
         try chain_db.configureShelleyGovernanceTracking(governance_config);
@@ -701,6 +714,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                             result.blocks_added_to_chain += 1;
                             try pushResumePoint(&resume_points, allocator, point);
                             saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
+                            _ = try chain_db.promoteFinalized();
                         },
                         .invalid => {
                             if (switched_shelley_params) {
