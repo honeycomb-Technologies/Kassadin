@@ -518,6 +518,7 @@ headers from ouroboros-consensus golden data.
 - [x] Carry stake credentials through live/snapshot UTxO entries and rebuild epoch mark stake from Haskell-style instant stake plus reward balances instead of approximating it from reward balances plus deposits
 - [x] Track explicit per-credential stake-account registration state locally, rebuild it from checkpoint/live reward-deposit-delegation maps, and preserve UTxO staking credentials across rollbacks so follower registration/instant-stake logic no longer depends purely on reward/deposit map presence
 - [x] Route ancillary snapshot account import through one explicit stake-account path so registered empty accounts survive snapshot hydration instead of being dropped when reward/deposit/delegation fields are all zero
+- [x] Persist unified stake-account state directly in local ledger checkpoints so registered empty accounts survive reload without depending on reconstruction from split reward/deposit/delegation maps
 - [x] Resolve epoch active stake from the unified local stake-account state instead of stitching reward balances and delegations together from separate maps
 - [x] Keep pre-Conway pointer-backed instant stake live while disabling pointer-backed instant stake in Conway-era snapshot rotation and epoch-boundary processing, matching the Haskell instant-stake split
 - [x] Hydrate current + future pool params from ancillary snapshot state, track them rollback-safely in `LedgerDB`, and activate staged pool re-registration params at epoch processing

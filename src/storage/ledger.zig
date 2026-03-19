@@ -1707,7 +1707,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 10, .big);
+        std.mem.writeInt(u32, buf[0..4], 11, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1951,6 +1951,24 @@ pub const LedgerDB = struct {
             try file.writeAll(&entry.value_ptr.delegate);
             try file.writeAll(&entry.value_ptr.vrf);
         }
+
+        // Section 26: Unified stake-account state
+        std.mem.writeInt(u64, &buf, @intCast(self.stake_accounts.count()), .big);
+        try file.writeAll(&buf);
+        var stake_account_it = self.stake_accounts.iterator();
+        while (stake_account_it.next()) |entry| {
+            try file.writeAll(&[_]u8{self.rewardAccountNetworkForCredential(entry.key_ptr.*)});
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            try file.writeAll(&[_]u8{if (entry.value_ptr.registered) 1 else 0});
+            std.mem.writeInt(u64, &buf, entry.value_ptr.reward_balance, .big);
+            try file.writeAll(&buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.deposit, .big);
+            try file.writeAll(&buf);
+            try writeOptionalKeyHashToFile(file, entry.value_ptr.stake_pool_delegation);
+            try writeOptionalDRepToFile(file, entry.value_ptr.drep_delegation);
+            try writeOptionalPointerToFile(file, entry.value_ptr.pointer);
+        }
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -1974,7 +1992,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9 and version != 10) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9 and version != 10 and version != 11) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -2339,7 +2357,41 @@ pub const LedgerDB = struct {
             }
         }
 
-        try self.rebuildStakeAccounts();
+        if (version >= 11) {
+            _ = try file.readAll(&buf);
+            const stake_account_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < stake_account_count) : (i += 1) {
+                var header_buf: [1 + 1 + 28 + 1 + 8 + 8]u8 = undefined;
+                _ = try file.readAll(&header_buf);
+                const network: types.Network = @enumFromInt(header_buf[0]);
+                const cred_type: types.CredentialType = @enumFromInt(header_buf[1]);
+                var hash: types.Hash28 = undefined;
+                @memcpy(&hash, header_buf[2..30]);
+                const registered = header_buf[30] != 0;
+                const reward_balance = std.mem.readInt(u64, header_buf[31..39], .big);
+                const deposit = std.mem.readInt(u64, header_buf[39..47], .big);
+                const stake_pool = try readOptionalKeyHashFromFile(file);
+                const drep = try readOptionalDRepFromFile(file);
+                const pointer = try readOptionalPointerFromFile(file);
+                try self.importStakeAccount(.{
+                    .network = network,
+                    .credential = .{
+                        .cred_type = cred_type,
+                        .hash = hash,
+                    },
+                }, .{
+                    .registered = registered,
+                    .reward_balance = reward_balance,
+                    .deposit = deposit,
+                    .stake_pool_delegation = stake_pool,
+                    .drep_delegation = drep,
+                    .pointer = pointer,
+                });
+            }
+        } else {
+            try self.rebuildStakeAccounts();
+        }
         return true;
     }
 
@@ -2396,6 +2448,15 @@ pub const LedgerDB = struct {
 
     fn isRegisteredRewardCredential(self: *const LedgerDB, credential: Credential) bool {
         return self.isStakeCredentialRegistered(credential);
+    }
+
+    fn rewardAccountNetworkForCredential(self: *const LedgerDB, credential: Credential) u8 {
+        var reward_it = self.reward_balances.iterator();
+        while (reward_it.next()) |entry| {
+            if (!Credential.eql(entry.key_ptr.credential, credential)) continue;
+            return @intFromEnum(entry.key_ptr.network);
+        }
+        return @intFromEnum(self.reward_account_network);
     }
 
     fn setStakeAccountRegistered(self: *LedgerDB, credential: Credential, registered: bool) !void {
@@ -2505,6 +2566,39 @@ fn writeDRepToFile(file: std.fs.File, drep: DRep) !void {
     }
 }
 
+fn writeOptionalKeyHashToFile(file: std.fs.File, maybe_hash: ?KeyHash) !void {
+    if (maybe_hash) |hash| {
+        try file.writeAll(&[_]u8{1});
+        try file.writeAll(&hash);
+    } else {
+        try file.writeAll(&[_]u8{0});
+    }
+}
+
+fn writeOptionalDRepToFile(file: std.fs.File, maybe_drep: ?DRep) !void {
+    if (maybe_drep) |drep| {
+        try file.writeAll(&[_]u8{1});
+        try writeDRepToFile(file, drep);
+    } else {
+        try file.writeAll(&[_]u8{0});
+    }
+}
+
+fn writeOptionalPointerToFile(file: std.fs.File, maybe_pointer: ?Pointer) !void {
+    if (maybe_pointer) |pointer| {
+        var buf: [8]u8 = undefined;
+        try file.writeAll(&[_]u8{1});
+        std.mem.writeInt(u64, &buf, pointer.slot, .big);
+        try file.writeAll(&buf);
+        std.mem.writeInt(u64, &buf, pointer.tx_ix, .big);
+        try file.writeAll(&buf);
+        std.mem.writeInt(u64, &buf, pointer.cert_ix, .big);
+        try file.writeAll(&buf);
+    } else {
+        try file.writeAll(&[_]u8{0});
+    }
+}
+
 fn writeUnitIntervalToFile(file: std.fs.File, interval: UnitInterval) !void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, interval.numerator, .big);
@@ -2537,6 +2631,42 @@ fn readDRepFromFile(file: std.fs.File) !DRep {
         3 => return .{ .always_no_confidence = {} },
         else => return error.InvalidCheckpoint,
     }
+}
+
+fn readOptionalKeyHashFromFile(file: std.fs.File) !?KeyHash {
+    var present_buf: [1]u8 = undefined;
+    _ = try file.readAll(&present_buf);
+    if (present_buf[0] == 0) return null;
+
+    var hash: KeyHash = undefined;
+    _ = try file.readAll(&hash);
+    return hash;
+}
+
+fn readOptionalDRepFromFile(file: std.fs.File) !?DRep {
+    var present_buf: [1]u8 = undefined;
+    _ = try file.readAll(&present_buf);
+    if (present_buf[0] == 0) return null;
+    return try readDRepFromFile(file);
+}
+
+fn readOptionalPointerFromFile(file: std.fs.File) !?Pointer {
+    var present_buf: [1]u8 = undefined;
+    _ = try file.readAll(&present_buf);
+    if (present_buf[0] == 0) return null;
+
+    var buf: [8]u8 = undefined;
+    _ = try file.readAll(&buf);
+    const slot = std.mem.readInt(u64, &buf, .big);
+    _ = try file.readAll(&buf);
+    const tx_ix = std.mem.readInt(u64, &buf, .big);
+    _ = try file.readAll(&buf);
+    const cert_ix = std.mem.readInt(u64, &buf, .big);
+    return .{
+        .slot = slot,
+        .tx_ix = tx_ix,
+        .cert_ix = cert_ix,
+    };
 }
 
 fn readUnitIntervalFromFile(file: std.fs.File) !UnitInterval {
@@ -3780,10 +3910,22 @@ test "ledgerdb: checkpoint save and load round-trip" {
             .network = .testnet,
             .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xaa} ** 28 },
         };
+        const empty_account = RewardAccount{
+            .network = .testnet,
+            .credential = .{ .cred_type = .script_hash, .hash = [_]u8{0xa9} ** 28 },
+        };
         const pointer = Pointer{ .slot = 88, .tx_ix = 2, .cert_ix = 1 };
         try db.importRewardBalance(account, 7_000);
         try db.importStakeDeposit(account.credential, 2_000_000);
         try db.importStakePointer(account.credential, pointer);
+        try db.importStakeAccount(empty_account, .{
+            .registered = true,
+            .reward_balance = 0,
+            .deposit = 0,
+            .stake_pool_delegation = null,
+            .drep_delegation = null,
+            .pointer = null,
+        });
 
         const pool = [_]u8{0xbb} ** 28;
         try db.importPoolDeposit(pool, 500_000_000);
@@ -3856,10 +3998,17 @@ test "ledgerdb: checkpoint save and load round-trip" {
             .network = .testnet,
             .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xaa} ** 28 },
         };
+        const empty_account = RewardAccount{
+            .network = .testnet,
+            .credential = .{ .cred_type = .script_hash, .hash = [_]u8{0xa9} ** 28 },
+        };
         const pointer = Pointer{ .slot = 88, .tx_ix = 2, .cert_ix = 1 };
         try std.testing.expectEqual(@as(?Coin, 7_000), db2.lookupRewardBalance(account));
         try std.testing.expectEqual(@as(?Coin, 2_000_000), db2.lookupStakeDeposit(account.credential));
         try std.testing.expectEqual(pointer, db2.lookupStakePointer(account.credential).?);
+        try std.testing.expect(db2.isStakeCredentialRegistered(empty_account.credential));
+        try std.testing.expectEqual(@as(?Coin, 0), db2.lookupRewardBalance(empty_account));
+        try std.testing.expectEqual(@as(?Coin, 0), db2.lookupStakeDeposit(empty_account.credential));
 
         const pool = [_]u8{0xbb} ** 28;
         try std.testing.expectEqual(@as(?Coin, 500_000_000), db2.lookupPoolDeposit(pool));
