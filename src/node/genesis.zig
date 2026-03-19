@@ -186,13 +186,18 @@ pub fn loadShelleyGovernanceConfig(allocator: Allocator, path: []const u8) !prot
     var shelley_genesis = try parseShelleyGenesis(allocator, path);
     defer shelley_genesis.deinit(allocator);
 
-    var delegates = try allocator.alloc(types.Hash28, gen_delegs.count());
-    errdefer allocator.free(delegates);
+    var delegations = try allocator.alloc(protocol_update.GenesisDelegation, gen_delegs.count());
+    errdefer allocator.free(delegations);
 
     var iter = gen_delegs.iterator();
     var i: usize = 0;
     while (iter.next()) |entry| : (i += 1) {
-        delegates[i] = try decodeHexHash28(entry.key_ptr.*);
+        const delegation_value = valueAsObject(entry.value_ptr.*);
+        delegations[i] = .{
+            .genesis = try decodeHexHash28(entry.key_ptr.*),
+            .delegate = try decodeHexHash28(valueAsString(delegation_value.get("delegate") orelse return error.MissingGenesisDelegates)),
+            .vrf = try decodeHexHash32(valueAsString(delegation_value.get("vrf") orelse return error.MissingGenesisDelegates)),
+        };
     }
 
     return .{
@@ -200,7 +205,7 @@ pub fn loadShelleyGovernanceConfig(allocator: Allocator, path: []const u8) !prot
         .stability_window = computeStabilityWindow(security_param, active_slots_coeff),
         .update_quorum = update_quorum,
         .reward_params = toRewardParams(&shelley_genesis),
-        .genesis_delegate_hashes = delegates,
+        .initial_genesis_delegations = delegations,
     };
 }
 
@@ -352,9 +357,24 @@ fn valueToF64(value: std_json.Value) !f64 {
     };
 }
 
+fn valueAsString(value: std_json.Value) []const u8 {
+    return switch (value) {
+        .string => |s| s,
+        .number_string => |s| s,
+        else => @panic("expected JSON string"),
+    };
+}
+
 fn decodeHexHash28(text: []const u8) !types.Hash28 {
     if (text.len != 56) return error.InvalidGenesisHash;
     var out: types.Hash28 = undefined;
+    _ = try std.fmt.hexToBytes(&out, text);
+    return out;
+}
+
+fn decodeHexHash32(text: []const u8) !types.Hash32 {
+    if (text.len != 64) return error.InvalidGenesisHash;
+    var out: types.Hash32 = undefined;
     _ = try std.fmt.hexToBytes(&out, text);
     return out;
 }
@@ -425,7 +445,10 @@ test "genesis: load Shelley governance config" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.3), config.reward_params.a0.toFloat(), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f64, 0.003), config.reward_params.rho.toFloat(), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f64, 0.2), config.reward_params.tau.toFloat(), 1e-6);
-    try std.testing.expect(config.genesis_delegate_hashes.len > 0);
+    try std.testing.expect(config.initial_genesis_delegations.len > 0);
+    try std.testing.expectEqual(@as(usize, 28), config.initial_genesis_delegations[0].genesis.len);
+    try std.testing.expectEqual(@as(usize, 28), config.initial_genesis_delegations[0].delegate.len);
+    try std.testing.expectEqual(@as(usize, 32), config.initial_genesis_delegations[0].vrf.len);
 }
 
 test "genesis: default values when file missing" {

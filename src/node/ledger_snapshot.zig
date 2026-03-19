@@ -1254,9 +1254,90 @@ fn parseDState(
     }
 
     try parseAccounts(allocator, ledger, network, active_era, dec);
-    try dec.skipValue(); // futureGenDelegs
-    try dec.skipValue(); // genDelegs
+    try parseFutureGenesisDelegations(ledger, dec);
+    try parseGenesisDelegations(ledger, dec);
     try parseInstantaneousRewards(allocator, ledger, dec);
+}
+
+fn parseFutureGenesisDelegations(
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            const future = try parseFutureGenesisDelegationKey(dec);
+            const delegation = try parseGenesisDelegation(dec);
+            try ledger.importFutureGenesisDelegation(future, delegation);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            const future = try parseFutureGenesisDelegationKey(dec);
+            const delegation = try parseGenesisDelegation(dec);
+            try ledger.importFutureGenesisDelegation(future, delegation);
+        }
+        try dec.decodeBreak();
+    }
+}
+
+fn parseGenesisDelegations(
+    ledger: *LedgerDB,
+    dec: *Decoder,
+) !void {
+    const map_len = try dec.decodeMapLen();
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            const genesis = try parseGenesisKeyHash(dec);
+            const delegation = try parseGenesisDelegation(dec);
+            try ledger.importGenesisDelegation(genesis, delegation);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            const genesis = try parseGenesisKeyHash(dec);
+            const delegation = try parseGenesisDelegation(dec);
+            try ledger.importGenesisDelegation(genesis, delegation);
+        }
+        try dec.decodeBreak();
+    }
+}
+
+fn parseFutureGenesisDelegationKey(dec: *Decoder) !@import("../storage/ledger.zig").FutureGenesisDelegation {
+    const key_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (key_len != 2) return error.InvalidSnapshotState;
+    return .{
+        .slot = try dec.decodeUint(),
+        .genesis = try parseGenesisKeyHash(dec),
+    };
+}
+
+fn parseGenesisKeyHash(dec: *Decoder) !types.KeyHash {
+    const genesis_bytes = try dec.decodeBytes();
+    if (genesis_bytes.len != 28) return error.InvalidSnapshotState;
+    var genesis: types.KeyHash = undefined;
+    @memcpy(&genesis, genesis_bytes);
+    return genesis;
+}
+
+fn parseGenesisDelegation(dec: *Decoder) !@import("../storage/ledger.zig").GenesisDelegation {
+    const pair_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (pair_len != 2) return error.InvalidSnapshotState;
+
+    const delegate_bytes = try dec.decodeBytes();
+    if (delegate_bytes.len != 28) return error.InvalidSnapshotState;
+    var delegate: types.KeyHash = undefined;
+    @memcpy(&delegate, delegate_bytes);
+
+    const vrf_bytes = try dec.decodeBytes();
+    if (vrf_bytes.len != 32) return error.InvalidSnapshotState;
+    var vrf: types.Hash32 = undefined;
+    @memcpy(&vrf, vrf_bytes);
+
+    return .{
+        .delegate = delegate,
+        .vrf = vrf,
+    };
 }
 
 fn parseInstantaneousRewards(

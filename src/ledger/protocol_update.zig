@@ -7,6 +7,13 @@ const types = @import("../types.zig");
 
 pub const EpochNo = types.EpochNo;
 pub const Hash28 = types.Hash28;
+pub const Hash32 = types.Hash32;
+
+pub const GenesisDelegation = struct {
+    genesis: Hash28,
+    delegate: Hash28,
+    vrf: Hash32,
+};
 
 pub const SupportedProtocolParamUpdate = struct {
     min_fee_a: ?u64 = null,
@@ -44,10 +51,10 @@ pub const GovernanceConfig = struct {
     stability_window: u64,
     update_quorum: u64,
     reward_params: rewards_mod.RewardParams,
-    genesis_delegate_hashes: []Hash28,
+    initial_genesis_delegations: []GenesisDelegation,
 
     pub fn deinit(self: *GovernanceConfig, allocator: Allocator) void {
-        allocator.free(self.genesis_delegate_hashes);
+        allocator.free(self.initial_genesis_delegations);
     }
 };
 
@@ -304,8 +311,8 @@ fn epochBoundaryPointOfNoReturn(config: *const GovernanceConfig, epoch: EpochNo)
 }
 
 fn isGenesisDelegate(config: *const GovernanceConfig, proposer: Hash28) bool {
-    for (config.genesis_delegate_hashes) |key_hash| {
-        if (std.mem.eql(u8, &key_hash, &proposer)) return true;
+    for (config.initial_genesis_delegations) |delegation| {
+        if (std.mem.eql(u8, &delegation.genesis, &proposer)) return true;
     }
     return false;
 }
@@ -465,17 +472,25 @@ test "protocol update: parse tx update with supported fields" {
 test "protocol update: stage and adopt updates across epoch boundary" {
     const allocator = std.testing.allocator;
 
-    const delegates = try allocator.alloc(Hash28, 2);
-    defer allocator.free(delegates);
-    delegates[0] = [_]u8{0xaa} ** 28;
-    delegates[1] = [_]u8{0xbb} ** 28;
+    const delegations = try allocator.alloc(GenesisDelegation, 2);
+    defer allocator.free(delegations);
+    delegations[0] = .{
+        .genesis = [_]u8{0xaa} ** 28,
+        .delegate = [_]u8{0xca} ** 28,
+        .vrf = [_]u8{0xda} ** 32,
+    };
+    delegations[1] = .{
+        .genesis = [_]u8{0xbb} ** 28,
+        .delegate = [_]u8{0xcb} ** 28,
+        .vrf = [_]u8{0xdb} ** 32,
+    };
 
     const config = GovernanceConfig{
         .epoch_length = 100,
         .stability_window = 10,
         .update_quorum = 2,
         .reward_params = rewards_mod.RewardParams.mainnet_defaults,
-        .genesis_delegate_hashes = delegates,
+        .initial_genesis_delegations = delegations,
     };
 
     var state = GovernanceState{};
@@ -484,12 +499,12 @@ test "protocol update: stage and adopt updates across epoch boundary" {
 
     const borrowed_votes = [_]UpdateVote{
         .{
-            .proposer = delegates[0],
+            .proposer = delegations[0].genesis,
             .raw_update = &[_]u8{ 0xa1, 0x00, 0x18, 0x2c },
             .update = .{ .min_fee_a = 44 },
         },
         .{
-            .proposer = delegates[1],
+            .proposer = delegations[1].genesis,
             .raw_update = &[_]u8{ 0xa1, 0x00, 0x18, 0x2c },
             .update = .{ .min_fee_a = 44 },
         },
@@ -512,16 +527,20 @@ test "protocol update: stage and adopt updates across epoch boundary" {
 test "protocol update: reject non-genesis proposer" {
     const allocator = std.testing.allocator;
 
-    const delegates = try allocator.alloc(Hash28, 1);
-    defer allocator.free(delegates);
-    delegates[0] = [_]u8{0xaa} ** 28;
+    const delegations = try allocator.alloc(GenesisDelegation, 1);
+    defer allocator.free(delegations);
+    delegations[0] = .{
+        .genesis = [_]u8{0xaa} ** 28,
+        .delegate = [_]u8{0xca} ** 28,
+        .vrf = [_]u8{0xda} ** 32,
+    };
 
     const config = GovernanceConfig{
         .epoch_length = 100,
         .stability_window = 10,
         .update_quorum = 1,
         .reward_params = rewards_mod.RewardParams.mainnet_defaults,
-        .genesis_delegate_hashes = delegates,
+        .initial_genesis_delegations = delegations,
     };
 
     var state = GovernanceState{};

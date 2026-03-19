@@ -151,6 +151,14 @@ pub const ChainDB = struct {
         self: *ChainDB,
         config: protocol_update.GovernanceConfig,
     ) !void {
+        if (!self.ledger.hasGenesisDelegations()) {
+            for (config.initial_genesis_delegations) |delegation| {
+                try self.ledger.importGenesisDelegation(delegation.genesis, .{
+                    .delegate = delegation.delegate,
+                    .vrf = delegation.vrf,
+                });
+            }
+        }
         if (self.shelley_governance_config) |*existing| {
             existing.deinit(self.allocator);
         }
@@ -250,6 +258,7 @@ pub const ChainDB = struct {
             }
 
             ledger_diffs_applied = try self.applyEpochBoundaryEffects(slot, hash);
+            ledger_diffs_applied += try self.applyGenesisDelegationEffects(slot, hash);
             apply_result = ledger_apply.applyBlock(
                 self.allocator,
                 &self.ledger,
@@ -517,6 +526,18 @@ pub const ChainDB = struct {
         }
 
         return applied;
+    }
+
+    fn applyGenesisDelegationEffects(
+        self: *ChainDB,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+    ) !u32 {
+        if (try self.ledger.buildGenesisDelegationAdoptionDiff(self.allocator, slot, block_hash)) |diff| {
+            try self.ledger.applyDiff(diff);
+            return 1;
+        }
+        return 0;
     }
 };
 
@@ -794,7 +815,7 @@ test "chaindb: epoch boundary reaps retiring pool" {
         .stability_window = 10,
         .update_quorum = 1,
         .reward_params = rewards_mod.RewardParams.mainnet_defaults,
-        .genesis_delegate_hashes = try allocator.alloc(types.Hash28, 0),
+        .initial_genesis_delegations = try allocator.alloc(protocol_update.GenesisDelegation, 0),
     });
     try db.enableLedgerValidation();
 
@@ -888,7 +909,7 @@ test "chaindb: epoch boundary sends unclaimed pool refunds to treasury" {
         .stability_window = 10,
         .update_quorum = 1,
         .reward_params = rewards_mod.RewardParams.mainnet_defaults,
-        .genesis_delegate_hashes = try allocator.alloc(types.Hash28, 0),
+        .initial_genesis_delegations = try allocator.alloc(protocol_update.GenesisDelegation, 0),
     });
     try db.enableLedgerValidation();
 

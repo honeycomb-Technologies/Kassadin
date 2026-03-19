@@ -17,6 +17,10 @@ const FuturePoolParamsChange = @import("../storage/ledger.zig").FuturePoolParams
 const PoolRewardAccountChange = @import("../storage/ledger.zig").PoolRewardAccountChange;
 const PoolOwnerMembershipChange = @import("../storage/ledger.zig").PoolOwnerMembershipChange;
 const PoolRetirementChange = @import("../storage/ledger.zig").PoolRetirementChange;
+const GenesisDelegation = @import("../storage/ledger.zig").GenesisDelegation;
+const FutureGenesisDelegation = @import("../storage/ledger.zig").FutureGenesisDelegation;
+const GenesisDelegationChange = @import("../storage/ledger.zig").GenesisDelegationChange;
+const FutureGenesisDelegationChange = @import("../storage/ledger.zig").FutureGenesisDelegationChange;
 const DRepDepositChange = @import("../storage/ledger.zig").DRepDepositChange;
 const StakePoolDelegationChange = @import("../storage/ledger.zig").StakePoolDelegationChange;
 const DRepDelegationChange = @import("../storage/ledger.zig").DRepDelegationChange;
@@ -119,6 +123,8 @@ pub const CertificateEffect = struct {
     pool_owner_changes: []const PoolOwnerMembershipChange,
     future_pool_owner_changes: []const PoolOwnerMembershipChange,
     pool_retirement_changes: []const PoolRetirementChange,
+    genesis_delegation_changes: []const GenesisDelegationChange,
+    future_genesis_delegation_changes: []const FutureGenesisDelegationChange,
     drep_deposit_changes: []const DRepDepositChange,
     stake_pool_delegation_changes: []const StakePoolDelegationChange,
     drep_delegation_changes: []const DRepDelegationChange,
@@ -140,6 +146,8 @@ pub const CertificateEffect = struct {
             .pool_owner_changes = &.{},
             .future_pool_owner_changes = &.{},
             .pool_retirement_changes = &.{},
+            .genesis_delegation_changes = &.{},
+            .future_genesis_delegation_changes = &.{},
             .drep_deposit_changes = &.{},
             .stake_pool_delegation_changes = &.{},
             .drep_delegation_changes = &.{},
@@ -158,6 +166,8 @@ pub const CertificateEffect = struct {
         if (self.pool_owner_changes.len > 0) allocator.free(self.pool_owner_changes);
         if (self.future_pool_owner_changes.len > 0) allocator.free(self.future_pool_owner_changes);
         if (self.pool_retirement_changes.len > 0) allocator.free(self.pool_retirement_changes);
+        if (self.genesis_delegation_changes.len > 0) allocator.free(self.genesis_delegation_changes);
+        if (self.future_genesis_delegation_changes.len > 0) allocator.free(self.future_genesis_delegation_changes);
         if (self.drep_deposit_changes.len > 0) allocator.free(self.drep_deposit_changes);
         if (self.stake_pool_delegation_changes.len > 0) allocator.free(self.stake_pool_delegation_changes);
         if (self.drep_delegation_changes.len > 0) allocator.free(self.drep_delegation_changes);
@@ -338,6 +348,10 @@ pub fn evaluateCertificateEffectWithContext(
     defer future_pool_owner_changes.deinit(allocator);
     var pool_retirement_changes: std.ArrayList(PoolRetirementChange) = .empty;
     defer pool_retirement_changes.deinit(allocator);
+    var genesis_delegation_changes: std.ArrayList(GenesisDelegationChange) = .empty;
+    defer genesis_delegation_changes.deinit(allocator);
+    var future_genesis_delegation_changes: std.ArrayList(FutureGenesisDelegationChange) = .empty;
+    defer future_genesis_delegation_changes.deinit(allocator);
     var drep_changes: std.ArrayList(DRepDepositChange) = .empty;
     defer drep_changes.deinit(allocator);
     var stake_pool_delegation_changes: std.ArrayList(StakePoolDelegationChange) = .empty;
@@ -476,6 +490,38 @@ pub fn evaluateCertificateEffectWithContext(
                     ledger,
                     retirement.pool,
                     retirement.epoch,
+                );
+            },
+            .genesis_delegation => |deleg| {
+                const current = ledger.lookupGenesisDelegation(deleg.genesis) orelse return error.InvalidCertificate;
+                _ = current;
+
+                const stability_window = context.stability_window orelse return error.InvalidCertificate;
+                if (hasConflictingGenesisDelegate(
+                    future_genesis_delegation_changes.items,
+                    ledger,
+                    deleg.genesis,
+                    deleg.delegate,
+                )) return error.InvalidCertificate;
+                if (hasConflictingGenesisVrf(
+                    future_genesis_delegation_changes.items,
+                    ledger,
+                    deleg.genesis,
+                    deleg.vrf,
+                )) return error.InvalidCertificate;
+
+                try setPendingFutureGenesisDelegationNext(
+                    allocator,
+                    &future_genesis_delegation_changes,
+                    ledger,
+                    .{
+                        .slot = context.current_slot + stability_window,
+                        .genesis = deleg.genesis,
+                    },
+                    .{
+                        .delegate = deleg.delegate,
+                        .vrf = deleg.vrf,
+                    },
                 );
             },
             .mir => |mir| {
@@ -707,6 +753,8 @@ pub fn evaluateCertificateEffectWithContext(
         .pool_owner_changes = try pool_owner_changes.toOwnedSlice(allocator),
         .future_pool_owner_changes = try future_pool_owner_changes.toOwnedSlice(allocator),
         .pool_retirement_changes = try pool_retirement_changes.toOwnedSlice(allocator),
+        .genesis_delegation_changes = try genesis_delegation_changes.toOwnedSlice(allocator),
+        .future_genesis_delegation_changes = try future_genesis_delegation_changes.toOwnedSlice(allocator),
         .drep_deposit_changes = try drep_changes.toOwnedSlice(allocator),
         .stake_pool_delegation_changes = try stake_pool_delegation_changes.toOwnedSlice(allocator),
         .drep_delegation_changes = try drep_delegation_changes.toOwnedSlice(allocator),
@@ -1359,6 +1407,82 @@ fn setPendingPoolRetirementNext(
     });
 }
 
+fn findPendingFutureGenesisDelegationNext(
+    changes: []const FutureGenesisDelegationChange,
+    future: FutureGenesisDelegation,
+) ??GenesisDelegation {
+    for (changes) |change| {
+        if (change.future.slot == future.slot and
+            std.mem.eql(u8, &change.future.genesis, &future.genesis))
+        {
+            return change.next;
+        }
+    }
+    return null;
+}
+
+fn setPendingFutureGenesisDelegationNext(
+    allocator: std.mem.Allocator,
+    changes: *std.ArrayList(FutureGenesisDelegationChange),
+    ledger: *const LedgerDB,
+    future: FutureGenesisDelegation,
+    next: ?GenesisDelegation,
+) !void {
+    for (changes.items) |*change| {
+        if (change.future.slot == future.slot and
+            std.mem.eql(u8, &change.future.genesis, &future.genesis))
+        {
+            change.next = next;
+            return;
+        }
+    }
+
+    try changes.append(allocator, .{
+        .future = future,
+        .previous = if (findPendingFutureGenesisDelegationNext(changes.items, future)) |pending|
+            pending
+        else
+            ledger.lookupFutureGenesisDelegation(future),
+        .next = next,
+    });
+}
+
+fn hasConflictingGenesisDelegate(
+    pending_changes: []const FutureGenesisDelegationChange,
+    ledger: *const LedgerDB,
+    genesis: types.KeyHash,
+    delegate: types.KeyHash,
+) bool {
+    if (ledger.hasOtherCurrentGenesisDelegate(genesis, delegate)) return true;
+    if (ledger.hasOtherFutureGenesisDelegate(genesis, delegate)) return true;
+
+    for (pending_changes) |change| {
+        const pending = change.next orelse continue;
+        if (std.mem.eql(u8, &change.future.genesis, &genesis)) continue;
+        if (std.mem.eql(u8, &pending.delegate, &delegate)) return true;
+    }
+
+    return false;
+}
+
+fn hasConflictingGenesisVrf(
+    pending_changes: []const FutureGenesisDelegationChange,
+    ledger: *const LedgerDB,
+    genesis: types.KeyHash,
+    vrf: types.Hash32,
+) bool {
+    if (ledger.hasOtherCurrentGenesisVrf(genesis, vrf)) return true;
+    if (ledger.hasOtherFutureGenesisVrf(genesis, vrf)) return true;
+
+    for (pending_changes) |change| {
+        const pending = change.next orelse continue;
+        if (std.mem.eql(u8, &change.future.genesis, &genesis)) continue;
+        if (std.mem.eql(u8, &pending.vrf, &vrf)) return true;
+    }
+
+    return false;
+}
+
 fn findPendingDRepNext(changes: []const DRepDepositChange, credential: types.Credential) ??Coin {
     for (changes) |change| {
         if (types.Credential.eql(change.credential, credential)) return change.next;
@@ -1792,6 +1916,64 @@ test "rules: pre-Alonzo MIR rejects negative updates" {
             },
         ),
     );
+}
+
+test "rules: genesis delegation stages future adoption at stability window" {
+    const allocator = std.testing.allocator;
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-rules-genesis-delegation");
+    defer ledger.deinit();
+
+    const genesis = [_]u8{0xa0} ** 28;
+    try ledger.importGenesisDelegation(genesis, .{
+        .delegate = [_]u8{0xb0} ** 28,
+        .vrf = [_]u8{0xc0} ** 32,
+    });
+    try ledger.importGenesisDelegation([_]u8{0xa1} ** 28, .{
+        .delegate = [_]u8{0xb1} ** 28,
+        .vrf = [_]u8{0xc1} ** 32,
+    });
+
+    const tx = TxBody{
+        .tx_id = [_]u8{0x72} ** 32,
+        .inputs = &[_]TxIn{},
+        .outputs = &[_]transaction.TxOut{},
+        .certificates = &[_]transaction.Certificate{
+            .{ .genesis_delegation = .{
+                .genesis = genesis,
+                .delegate = [_]u8{0xd0} ** 28,
+                .vrf = [_]u8{0xe0} ** 32,
+            } },
+        },
+        .fee = 0,
+        .withdrawals = &[_]transaction.Withdrawal{},
+        .withdrawal_total = 0,
+        .ttl = null,
+        .validity_start = null,
+        .update = null,
+        .raw_cbor = &[_]u8{},
+    };
+
+    var effect = try evaluateCertificateEffectWithContext(
+        allocator,
+        &tx,
+        &ledger,
+        ProtocolParams.mainnet_defaults,
+        .{
+            .current_slot = 10,
+            .protocol_version_major = 5,
+            .epoch_length = 100,
+            .stability_window = 7,
+        },
+    );
+    defer effect.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), effect.future_genesis_delegation_changes.len);
+    try std.testing.expectEqual(@as(u64, 17), effect.future_genesis_delegation_changes[0].future.slot);
+    try std.testing.expectEqual(genesis, effect.future_genesis_delegation_changes[0].future.genesis);
+    try std.testing.expectEqual(GenesisDelegation{
+        .delegate = [_]u8{0xd0} ** 28,
+        .vrf = [_]u8{0xe0} ** 32,
+    }, effect.future_genesis_delegation_changes[0].next.?);
 }
 
 test "rules: stake delegation requires registered stake key" {

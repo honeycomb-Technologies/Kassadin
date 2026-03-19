@@ -64,6 +64,8 @@ pub const LedgerDiff = struct {
     pool_owner_changes: []const PoolOwnerMembershipChange = &.{},
     future_pool_owner_changes: []const PoolOwnerMembershipChange = &.{},
     pool_retirement_changes: []const PoolRetirementChange = &.{},
+    genesis_delegation_changes: []const GenesisDelegationChange = &.{},
+    future_genesis_delegation_changes: []const FutureGenesisDelegationChange = &.{},
     drep_deposit_changes: []const DRepDepositChange = &.{},
     stake_pool_delegation_changes: []const StakePoolDelegationChange = &.{},
     drep_delegation_changes: []const DRepDelegationChange = &.{},
@@ -134,6 +136,28 @@ pub const PoolRetirementChange = struct {
     pool: KeyHash,
     previous: ?EpochNo,
     next: ?EpochNo,
+};
+
+pub const GenesisDelegation = struct {
+    delegate: KeyHash,
+    vrf: types.Hash32,
+};
+
+pub const FutureGenesisDelegation = struct {
+    slot: SlotNo,
+    genesis: KeyHash,
+};
+
+pub const GenesisDelegationChange = struct {
+    genesis: KeyHash,
+    previous: ?GenesisDelegation,
+    next: ?GenesisDelegation,
+};
+
+pub const FutureGenesisDelegationChange = struct {
+    future: FutureGenesisDelegation,
+    previous: ?GenesisDelegation,
+    next: ?GenesisDelegation,
 };
 
 pub const DRepDepositChange = struct {
@@ -210,6 +234,8 @@ pub const LedgerDB = struct {
     pool_owners: std.AutoHashMap(PoolOwnerMembership, void),
     future_pool_owners: std.AutoHashMap(PoolOwnerMembership, void),
     pool_retirements: std.AutoHashMap(KeyHash, EpochNo),
+    genesis_delegations: std.AutoHashMap(KeyHash, GenesisDelegation),
+    future_genesis_delegations: std.AutoHashMap(FutureGenesisDelegation, GenesisDelegation),
     drep_deposits: std.AutoHashMap(Credential, Coin),
     stake_pool_delegations: std.AutoHashMap(Credential, KeyHash),
     drep_delegations: std.AutoHashMap(Credential, DRep),
@@ -259,6 +285,8 @@ pub const LedgerDB = struct {
             .pool_owners = std.AutoHashMap(PoolOwnerMembership, void).init(allocator),
             .future_pool_owners = std.AutoHashMap(PoolOwnerMembership, void).init(allocator),
             .pool_retirements = std.AutoHashMap(KeyHash, EpochNo).init(allocator),
+            .genesis_delegations = std.AutoHashMap(KeyHash, GenesisDelegation).init(allocator),
+            .future_genesis_delegations = std.AutoHashMap(FutureGenesisDelegation, GenesisDelegation).init(allocator),
             .drep_deposits = std.AutoHashMap(Credential, Coin).init(allocator),
             .stake_pool_delegations = std.AutoHashMap(Credential, KeyHash).init(allocator),
             .drep_delegations = std.AutoHashMap(Credential, DRep).init(allocator),
@@ -292,6 +320,8 @@ pub const LedgerDB = struct {
         self.pool_owners.deinit();
         self.future_pool_owners.deinit();
         self.pool_retirements.deinit();
+        self.genesis_delegations.deinit();
+        self.future_genesis_delegations.deinit();
         self.drep_deposits.deinit();
         self.stake_pool_delegations.deinit();
         self.drep_delegations.deinit();
@@ -313,6 +343,8 @@ pub const LedgerDB = struct {
             freePoolOwnerMembershipChanges(self.allocator, diff.pool_owner_changes);
             freePoolOwnerMembershipChanges(self.allocator, diff.future_pool_owner_changes);
             freePoolRetirementChanges(self.allocator, diff.pool_retirement_changes);
+            freeGenesisDelegationChanges(self.allocator, diff.genesis_delegation_changes);
+            freeFutureGenesisDelegationChanges(self.allocator, diff.future_genesis_delegation_changes);
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, diff.drep_delegation_changes);
@@ -363,6 +395,8 @@ pub const LedgerDB = struct {
         applyPoolOwnerMembershipChanges(&self.pool_owners, diff.pool_owner_changes);
         applyPoolOwnerMembershipChanges(&self.future_pool_owners, diff.future_pool_owner_changes);
         applyPoolRetirementChanges(&self.pool_retirements, diff.pool_retirement_changes);
+        applyGenesisDelegationChanges(&self.genesis_delegations, diff.genesis_delegation_changes);
+        applyFutureGenesisDelegationChanges(&self.future_genesis_delegations, diff.future_genesis_delegation_changes);
         applyDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
         applyStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
         applyDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
@@ -391,6 +425,8 @@ pub const LedgerDB = struct {
             freePoolOwnerMembershipChanges(self.allocator, old.pool_owner_changes);
             freePoolOwnerMembershipChanges(self.allocator, old.future_pool_owner_changes);
             freePoolRetirementChanges(self.allocator, old.pool_retirement_changes);
+            freeGenesisDelegationChanges(self.allocator, old.genesis_delegation_changes);
+            freeFutureGenesisDelegationChanges(self.allocator, old.future_genesis_delegation_changes);
             freeDRepChanges(self.allocator, old.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, old.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, old.drep_delegation_changes);
@@ -451,6 +487,8 @@ pub const LedgerDB = struct {
             rollbackPoolOwnerMembershipChanges(&self.pool_owners, diff.pool_owner_changes);
             rollbackPoolOwnerMembershipChanges(&self.future_pool_owners, diff.future_pool_owner_changes);
             rollbackPoolRetirementChanges(&self.pool_retirements, diff.pool_retirement_changes);
+            rollbackGenesisDelegationChanges(&self.genesis_delegations, diff.genesis_delegation_changes);
+            rollbackFutureGenesisDelegationChanges(&self.future_genesis_delegations, diff.future_genesis_delegation_changes);
             rollbackDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
             rollbackStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
             rollbackDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
@@ -465,6 +503,8 @@ pub const LedgerDB = struct {
             freePoolOwnerMembershipChanges(self.allocator, diff.pool_owner_changes);
             freePoolOwnerMembershipChanges(self.allocator, diff.future_pool_owner_changes);
             freePoolRetirementChanges(self.allocator, diff.pool_retirement_changes);
+            freeGenesisDelegationChanges(self.allocator, diff.genesis_delegation_changes);
+            freeFutureGenesisDelegationChanges(self.allocator, diff.future_genesis_delegation_changes);
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, diff.drep_delegation_changes);
@@ -660,6 +700,22 @@ pub const LedgerDB = struct {
         try self.pool_retirements.put(pool, epoch);
     }
 
+    pub fn importGenesisDelegation(
+        self: *LedgerDB,
+        genesis: KeyHash,
+        delegation: GenesisDelegation,
+    ) !void {
+        try self.genesis_delegations.put(genesis, delegation);
+    }
+
+    pub fn importFutureGenesisDelegation(
+        self: *LedgerDB,
+        future: FutureGenesisDelegation,
+        delegation: GenesisDelegation,
+    ) !void {
+        try self.future_genesis_delegations.put(future, delegation);
+    }
+
     pub fn importStakePoolDelegation(self: *LedgerDB, credential: Credential, pool: KeyHash) !void {
         try self.stake_pool_delegations.put(credential, pool);
         try self.setStakeAccountRegistered(credential, true);
@@ -817,6 +873,73 @@ pub const LedgerDB = struct {
 
     pub fn lookupPoolRetirement(self: *const LedgerDB, pool: KeyHash) ?EpochNo {
         return self.pool_retirements.get(pool);
+    }
+
+    pub fn lookupGenesisDelegation(self: *const LedgerDB, genesis: KeyHash) ?GenesisDelegation {
+        return self.genesis_delegations.get(genesis);
+    }
+
+    pub fn lookupFutureGenesisDelegation(
+        self: *const LedgerDB,
+        future: FutureGenesisDelegation,
+    ) ?GenesisDelegation {
+        return self.future_genesis_delegations.get(future);
+    }
+
+    pub fn hasGenesisDelegations(self: *const LedgerDB) bool {
+        return self.genesis_delegations.count() > 0;
+    }
+
+    pub fn hasOtherCurrentGenesisDelegate(
+        self: *const LedgerDB,
+        genesis: KeyHash,
+        delegate: KeyHash,
+    ) bool {
+        var it = self.genesis_delegations.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, &entry.key_ptr.*, &genesis)) continue;
+            if (std.mem.eql(u8, &entry.value_ptr.delegate, &delegate)) return true;
+        }
+        return false;
+    }
+
+    pub fn hasOtherFutureGenesisDelegate(
+        self: *const LedgerDB,
+        genesis: KeyHash,
+        delegate: KeyHash,
+    ) bool {
+        var it = self.future_genesis_delegations.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, &entry.key_ptr.genesis, &genesis)) continue;
+            if (std.mem.eql(u8, &entry.value_ptr.delegate, &delegate)) return true;
+        }
+        return false;
+    }
+
+    pub fn hasOtherCurrentGenesisVrf(
+        self: *const LedgerDB,
+        genesis: KeyHash,
+        vrf: types.Hash32,
+    ) bool {
+        var it = self.genesis_delegations.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, &entry.key_ptr.*, &genesis)) continue;
+            if (std.mem.eql(u8, &entry.value_ptr.vrf, &vrf)) return true;
+        }
+        return false;
+    }
+
+    pub fn hasOtherFutureGenesisVrf(
+        self: *const LedgerDB,
+        genesis: KeyHash,
+        vrf: types.Hash32,
+    ) bool {
+        var it = self.future_genesis_delegations.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, &entry.key_ptr.genesis, &genesis)) continue;
+            if (std.mem.eql(u8, &entry.value_ptr.vrf, &vrf)) return true;
+        }
+        return false;
     }
 
     pub fn lookupDRepDeposit(self: *const LedgerDB, credential: Credential) ?Coin {
@@ -992,6 +1115,66 @@ pub const LedgerDB = struct {
             .produced = try allocator.alloc(UtxoEntry, 0),
             .previous_epoch_blocks_made_changes = try previous_changes.toOwnedSlice(allocator),
             .current_epoch_blocks_made_changes = try current_changes.toOwnedSlice(allocator),
+        };
+    }
+
+    pub fn buildGenesisDelegationAdoptionDiff(
+        self: *const LedgerDB,
+        allocator: Allocator,
+        slot: SlotNo,
+        block_hash: HeaderHash,
+    ) !?LedgerDiff {
+        if (self.future_genesis_delegations.count() == 0) return null;
+
+        const LatestDelegation = struct {
+            slot: SlotNo,
+            delegation: GenesisDelegation,
+        };
+
+        var due_changes: std.ArrayList(FutureGenesisDelegationChange) = .empty;
+        defer due_changes.deinit(allocator);
+        var latest_per_genesis = std.AutoHashMap(KeyHash, LatestDelegation).init(allocator);
+        defer latest_per_genesis.deinit();
+
+        var future_it = self.future_genesis_delegations.iterator();
+        while (future_it.next()) |entry| {
+            if (entry.key_ptr.slot > slot) continue;
+
+            try due_changes.append(allocator, .{
+                .future = entry.key_ptr.*,
+                .previous = entry.value_ptr.*,
+                .next = null,
+            });
+
+            const existing = latest_per_genesis.get(entry.key_ptr.genesis);
+            if (existing == null or existing.?.slot <= entry.key_ptr.slot) {
+                try latest_per_genesis.put(entry.key_ptr.genesis, .{
+                    .slot = entry.key_ptr.slot,
+                    .delegation = entry.value_ptr.*,
+                });
+            }
+        }
+
+        if (due_changes.items.len == 0) return null;
+
+        var current_changes: std.ArrayList(GenesisDelegationChange) = .empty;
+        defer current_changes.deinit(allocator);
+        var latest_it = latest_per_genesis.iterator();
+        while (latest_it.next()) |entry| {
+            try current_changes.append(allocator, .{
+                .genesis = entry.key_ptr.*,
+                .previous = self.lookupGenesisDelegation(entry.key_ptr.*),
+                .next = entry.value_ptr.delegation,
+            });
+        }
+
+        return .{
+            .slot = slot,
+            .block_hash = block_hash,
+            .consumed = try allocator.alloc(UtxoEntry, 0),
+            .produced = try allocator.alloc(UtxoEntry, 0),
+            .genesis_delegation_changes = try current_changes.toOwnedSlice(allocator),
+            .future_genesis_delegation_changes = try due_changes.toOwnedSlice(allocator),
         };
     }
 
@@ -1524,7 +1707,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 9, .big);
+        std.mem.writeInt(u32, buf[0..4], 10, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1746,6 +1929,28 @@ pub const LedgerDB = struct {
         // Section 23: Deposited pot (`utxosDeposited`)
         std.mem.writeInt(u64, &buf, self.deposited_balance, .big);
         try file.writeAll(&buf);
+
+        // Section 24: Current genesis delegations
+        std.mem.writeInt(u64, &buf, @intCast(self.genesis_delegations.count()), .big);
+        try file.writeAll(&buf);
+        var genesis_it = self.genesis_delegations.iterator();
+        while (genesis_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            try file.writeAll(&entry.value_ptr.delegate);
+            try file.writeAll(&entry.value_ptr.vrf);
+        }
+
+        // Section 25: Future genesis delegations
+        std.mem.writeInt(u64, &buf, @intCast(self.future_genesis_delegations.count()), .big);
+        try file.writeAll(&buf);
+        var future_genesis_it = self.future_genesis_delegations.iterator();
+        while (future_genesis_it.next()) |entry| {
+            std.mem.writeInt(u64, &buf, entry.key_ptr.slot, .big);
+            try file.writeAll(&buf);
+            try file.writeAll(&entry.key_ptr.genesis);
+            try file.writeAll(&entry.value_ptr.delegate);
+            try file.writeAll(&entry.value_ptr.vrf);
+        }
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -1769,7 +1974,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9 and version != 10) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -2091,6 +2296,49 @@ pub const LedgerDB = struct {
             self.deposited_balance = self.computeDepositBalanceFromMaps();
         }
 
+        if (version >= 10) {
+            _ = try file.readAll(&buf);
+            const genesis_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < genesis_count) : (i += 1) {
+                var entry_buf: [28 + 28 + 32]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                var genesis: KeyHash = undefined;
+                @memcpy(&genesis, entry_buf[0..28]);
+                var delegate: KeyHash = undefined;
+                @memcpy(&delegate, entry_buf[28..56]);
+                var vrf: types.Hash32 = undefined;
+                @memcpy(&vrf, entry_buf[56..88]);
+                try self.genesis_delegations.put(genesis, .{
+                    .delegate = delegate,
+                    .vrf = vrf,
+                });
+            }
+
+            _ = try file.readAll(&buf);
+            const future_genesis_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < future_genesis_count) : (i += 1) {
+                _ = try file.readAll(&buf);
+                const activation_slot = std.mem.readInt(u64, &buf, .big);
+                var entry_buf: [28 + 28 + 32]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                var genesis: KeyHash = undefined;
+                @memcpy(&genesis, entry_buf[0..28]);
+                var delegate: KeyHash = undefined;
+                @memcpy(&delegate, entry_buf[28..56]);
+                var vrf: types.Hash32 = undefined;
+                @memcpy(&vrf, entry_buf[56..88]);
+                try self.future_genesis_delegations.put(.{
+                    .slot = activation_slot,
+                    .genesis = genesis,
+                }, .{
+                    .delegate = delegate,
+                    .vrf = vrf,
+                });
+            }
+        }
+
         try self.rebuildStakeAccounts();
         return true;
     }
@@ -2120,6 +2368,8 @@ pub const LedgerDB = struct {
         self.pool_owners.clearRetainingCapacity();
         self.future_pool_owners.clearRetainingCapacity();
         self.pool_retirements.clearRetainingCapacity();
+        self.genesis_delegations.clearRetainingCapacity();
+        self.future_genesis_delegations.clearRetainingCapacity();
         self.drep_deposits.clearRetainingCapacity();
         self.stake_pool_delegations.clearRetainingCapacity();
         self.drep_delegations.clearRetainingCapacity();
@@ -2374,6 +2624,14 @@ fn freePoolOwnerMembershipChanges(allocator: Allocator, changes: []const PoolOwn
 }
 
 fn freePoolRetirementChanges(allocator: Allocator, changes: []const PoolRetirementChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freeGenesisDelegationChanges(allocator: Allocator, changes: []const GenesisDelegationChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freeFutureGenesisDelegationChanges(allocator: Allocator, changes: []const FutureGenesisDelegationChange) void {
     if (changes.len > 0) allocator.free(changes);
 }
 
@@ -2688,6 +2946,64 @@ fn rollbackPoolRetirementChanges(
             map.put(change.pool, epoch) catch unreachable;
         } else {
             _ = map.remove(change.pool);
+        }
+    }
+}
+
+fn applyGenesisDelegationChanges(
+    map: *std.AutoHashMap(KeyHash, GenesisDelegation),
+    changes: []const GenesisDelegationChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |delegation| {
+            map.put(change.genesis, delegation) catch unreachable;
+        } else {
+            _ = map.remove(change.genesis);
+        }
+    }
+}
+
+fn rollbackGenesisDelegationChanges(
+    map: *std.AutoHashMap(KeyHash, GenesisDelegation),
+    changes: []const GenesisDelegationChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |delegation| {
+            map.put(change.genesis, delegation) catch unreachable;
+        } else {
+            _ = map.remove(change.genesis);
+        }
+    }
+}
+
+fn applyFutureGenesisDelegationChanges(
+    map: *std.AutoHashMap(FutureGenesisDelegation, GenesisDelegation),
+    changes: []const FutureGenesisDelegationChange,
+) void {
+    for (changes) |change| {
+        if (change.next) |delegation| {
+            map.put(change.future, delegation) catch unreachable;
+        } else {
+            _ = map.remove(change.future);
+        }
+    }
+}
+
+fn rollbackFutureGenesisDelegationChanges(
+    map: *std.AutoHashMap(FutureGenesisDelegation, GenesisDelegation),
+    changes: []const FutureGenesisDelegationChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (change.previous) |delegation| {
+            map.put(change.future, delegation) catch unreachable;
+        } else {
+            _ = map.remove(change.future);
         }
     }
 }
@@ -3491,6 +3807,17 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try db.importPoolOwnerMembership(pool, [_]u8{0xbd} ** 28);
         try db.importFuturePoolOwnerMembership(pool, [_]u8{0xbe} ** 28);
         try db.importPoolRetirement(pool, 10);
+        try db.importGenesisDelegation([_]u8{0xcf} ** 28, .{
+            .delegate = [_]u8{0xd0} ** 28,
+            .vrf = [_]u8{0xd1} ** 32,
+        });
+        try db.importFutureGenesisDelegation(.{
+            .slot = 13000,
+            .genesis = [_]u8{0xcf} ** 28,
+        }, .{
+            .delegate = [_]u8{0xd2} ** 28,
+            .vrf = [_]u8{0xd3} ** 32,
+        });
         try db.importStakePoolDelegation(account.credential, pool);
         try db.importPreviousEpochBlocksMade(pool, 7);
         try db.importCurrentEpochBlocksMade(pool, 3);
@@ -3556,6 +3883,17 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try std.testing.expect(db2.isPoolOwner(pool, [_]u8{0xbd} ** 28));
         try std.testing.expect(db2.isFuturePoolOwner(pool, [_]u8{0xbe} ** 28));
         try std.testing.expectEqual(@as(?EpochNo, 10), db2.lookupPoolRetirement(pool));
+        try std.testing.expectEqual(GenesisDelegation{
+            .delegate = [_]u8{0xd0} ** 28,
+            .vrf = [_]u8{0xd1} ** 32,
+        }, db2.lookupGenesisDelegation([_]u8{0xcf} ** 28).?);
+        try std.testing.expectEqual(GenesisDelegation{
+            .delegate = [_]u8{0xd2} ** 28,
+            .vrf = [_]u8{0xd3} ** 32,
+        }, db2.lookupFutureGenesisDelegation(.{
+            .slot = 13000,
+            .genesis = [_]u8{0xcf} ** 28,
+        }).?);
         try std.testing.expectEqual(@as(?KeyHash, pool), db2.lookupStakePoolDelegation(account.credential));
         try std.testing.expectEqual(@as(?u64, 7), db2.lookupPreviousEpochBlocksMade(pool));
         try std.testing.expectEqual(@as(?u64, 3), db2.lookupCurrentEpochBlocksMade(pool));
@@ -3577,6 +3915,72 @@ test "ledgerdb: checkpoint not found returns false" {
 
     const loaded = try db.loadCheckpoint("/tmp/kassadin-test-ledger-no-ckpt-does-not-exist");
     try std.testing.expect(!loaded);
+}
+
+test "ledgerdb: genesis delegation adoption applies latest due entry per genesis key" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-genesis-adopt");
+    defer db.deinit();
+
+    const genesis_a = [_]u8{0xa1} ** 28;
+    const genesis_b = [_]u8{0xa2} ** 28;
+    try db.importGenesisDelegation(genesis_a, .{
+        .delegate = [_]u8{0xb1} ** 28,
+        .vrf = [_]u8{0xc1} ** 32,
+    });
+    try db.importGenesisDelegation(genesis_b, .{
+        .delegate = [_]u8{0xb2} ** 28,
+        .vrf = [_]u8{0xc2} ** 32,
+    });
+    try db.importFutureGenesisDelegation(.{
+        .slot = 15,
+        .genesis = genesis_a,
+    }, .{
+        .delegate = [_]u8{0xd1} ** 28,
+        .vrf = [_]u8{0xe1} ** 32,
+    });
+    try db.importFutureGenesisDelegation(.{
+        .slot = 18,
+        .genesis = genesis_a,
+    }, .{
+        .delegate = [_]u8{0xd2} ** 28,
+        .vrf = [_]u8{0xe2} ** 32,
+    });
+    try db.importFutureGenesisDelegation(.{
+        .slot = 17,
+        .genesis = genesis_b,
+    }, .{
+        .delegate = [_]u8{0xd3} ** 28,
+        .vrf = [_]u8{0xe3} ** 32,
+    });
+
+    const diff = (try db.buildGenesisDelegationAdoptionDiff(allocator, 18, [_]u8{0xf1} ** 32)).?;
+    try db.applyDiff(diff);
+
+    try std.testing.expectEqual(GenesisDelegation{
+        .delegate = [_]u8{0xd2} ** 28,
+        .vrf = [_]u8{0xe2} ** 32,
+    }, db.lookupGenesisDelegation(genesis_a).?);
+    try std.testing.expectEqual(GenesisDelegation{
+        .delegate = [_]u8{0xd3} ** 28,
+        .vrf = [_]u8{0xe3} ** 32,
+    }, db.lookupGenesisDelegation(genesis_b).?);
+    try std.testing.expect(db.lookupFutureGenesisDelegation(.{ .slot = 15, .genesis = genesis_a }) == null);
+    try std.testing.expect(db.lookupFutureGenesisDelegation(.{ .slot = 18, .genesis = genesis_a }) == null);
+    try std.testing.expect(db.lookupFutureGenesisDelegation(.{ .slot = 17, .genesis = genesis_b }) == null);
+
+    try db.rollback(1);
+    try std.testing.expectEqual(GenesisDelegation{
+        .delegate = [_]u8{0xb1} ** 28,
+        .vrf = [_]u8{0xc1} ** 32,
+    }, db.lookupGenesisDelegation(genesis_a).?);
+    try std.testing.expectEqual(GenesisDelegation{
+        .delegate = [_]u8{0xb2} ** 28,
+        .vrf = [_]u8{0xc2} ** 32,
+    }, db.lookupGenesisDelegation(genesis_b).?);
+    try std.testing.expect(db.lookupFutureGenesisDelegation(.{ .slot = 15, .genesis = genesis_a }) != null);
+    try std.testing.expect(db.lookupFutureGenesisDelegation(.{ .slot = 18, .genesis = genesis_a }) != null);
+    try std.testing.expect(db.lookupFutureGenesisDelegation(.{ .slot = 17, .genesis = genesis_b }) != null);
 }
 
 test "ledgerdb: epoch reward diff excludes owners from member rewards" {

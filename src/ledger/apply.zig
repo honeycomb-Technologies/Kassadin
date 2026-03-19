@@ -123,6 +123,8 @@ fn buildDiff(
         .pool_owner_changes = cert_effect.pool_owner_changes,
         .future_pool_owner_changes = cert_effect.future_pool_owner_changes,
         .pool_retirement_changes = cert_effect.pool_retirement_changes,
+        .genesis_delegation_changes = cert_effect.genesis_delegation_changes,
+        .future_genesis_delegation_changes = cert_effect.future_genesis_delegation_changes,
         .drep_deposit_changes = cert_effect.drep_deposit_changes,
         .stake_pool_delegation_changes = cert_effect.stake_pool_delegation_changes,
         .drep_delegation_changes = cert_effect.drep_delegation_changes,
