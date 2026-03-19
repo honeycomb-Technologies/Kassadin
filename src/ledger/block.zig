@@ -36,8 +36,14 @@ pub const BlockHeader = struct {
     prev_hash: ?HeaderHash, // null for genesis
     issuer_vkey: [32]u8,
     vrf_vkey: [32]u8,
+    vrf_result_raw: []const u8 = empty_cbor_list,
+    leader_vrf_raw: ?[]const u8 = null,
     block_body_size: u64,
     block_body_hash: Hash32,
+    opcert_hot_vkey: ?[32]u8 = null,
+    opcert_sequence_no: ?u64 = null,
+    opcert_kes_period: ?u64 = null,
+    opcert_sigma: ?[64]u8 = null,
     protocol_version_major: u64,
     protocol_version_minor: u64,
 
@@ -197,9 +203,10 @@ fn parseDirectHeader(data: []const u8) !BlockHeader {
     var vrf_vkey: [32]u8 = undefined;
     @memcpy(&vrf_vkey, vrf_vkey_bytes);
 
-    try hb_dec.skipValue(); // VRF result 1
+    const vrf_result_raw = try hb_dec.sliceOfNextValue();
+    var leader_vrf_raw: ?[]const u8 = null;
     if (hb_len >= 15) {
-        try hb_dec.skipValue(); // VRF result 2 (pre-Babbage only)
+        leader_vrf_raw = try hb_dec.sliceOfNextValue(); // pre-Babbage leader VRF cert
     }
 
     const body_size = try hb_dec.decodeUint();
@@ -209,13 +216,23 @@ fn parseDirectHeader(data: []const u8) !BlockHeader {
     var body_hash: Hash32 = undefined;
     @memcpy(&body_hash, body_hash_bytes);
 
+    var opcert_hot_vkey: ?[32]u8 = null;
+    var opcert_sequence_no: ?u64 = null;
+    var opcert_kes_period: ?u64 = null;
+    var opcert_sigma: ?[64]u8 = null;
     if (hb_len <= 10) {
-        try hb_dec.skipValue(); // Babbage+: opcert array
+        if (try parseOperationalCertArray(&hb_dec)) |opcert| {
+            opcert_hot_vkey = opcert.hot_vkey;
+            opcert_sequence_no = opcert.sequence_no;
+            opcert_kes_period = opcert.kes_period;
+            opcert_sigma = opcert.sigma;
+        }
     } else {
-        try hb_dec.skipValue(); // hot_vkey
-        try hb_dec.skipValue(); // seq_no
-        try hb_dec.skipValue(); // kes_period
-        try hb_dec.skipValue(); // cold_sig
+        const opcert = try parseOperationalCertTuple(&hb_dec);
+        opcert_hot_vkey = opcert.hot_vkey;
+        opcert_sequence_no = opcert.sequence_no;
+        opcert_kes_period = opcert.kes_period;
+        opcert_sigma = opcert.sigma;
     }
 
     var pv_major: u64 = 0;
@@ -240,12 +257,58 @@ fn parseDirectHeader(data: []const u8) !BlockHeader {
         .prev_hash = prev_hash,
         .issuer_vkey = issuer_vkey,
         .vrf_vkey = vrf_vkey,
+        .vrf_result_raw = vrf_result_raw,
+        .leader_vrf_raw = leader_vrf_raw,
         .block_body_size = body_size,
         .block_body_hash = body_hash,
+        .opcert_hot_vkey = opcert_hot_vkey,
+        .opcert_sequence_no = opcert_sequence_no,
+        .opcert_kes_period = opcert_kes_period,
+        .opcert_sigma = opcert_sigma,
         .protocol_version_major = pv_major,
         .protocol_version_minor = pv_minor,
         .header_body_raw = header_body_raw,
         .kes_signature_raw = kes_sig_raw,
+    };
+}
+
+const OperationalCert = struct {
+    hot_vkey: [32]u8,
+    sequence_no: u64,
+    kes_period: u64,
+    sigma: [64]u8,
+};
+
+fn parseOperationalCertArray(dec: *Decoder) !?OperationalCert {
+    const len = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    if (len == 0) return null;
+    if (len != 4) return error.InvalidCbor;
+    return try parseOperationalCertFields(dec);
+}
+
+fn parseOperationalCertTuple(dec: *Decoder) !OperationalCert {
+    return parseOperationalCertFields(dec);
+}
+
+fn parseOperationalCertFields(dec: *Decoder) !OperationalCert {
+    const hot_vkey_bytes = try dec.decodeBytes();
+    if (hot_vkey_bytes.len != 32) return error.InvalidCbor;
+    var hot_vkey: [32]u8 = undefined;
+    @memcpy(&hot_vkey, hot_vkey_bytes);
+
+    const sequence_no = try dec.decodeUint();
+    const kes_period = try dec.decodeUint();
+
+    const sigma_bytes = try dec.decodeBytes();
+    if (sigma_bytes.len != 64) return error.InvalidCbor;
+    var sigma: [64]u8 = undefined;
+    @memcpy(&sigma, sigma_bytes);
+
+    return .{
+        .hot_vkey = hot_vkey,
+        .sequence_no = sequence_no,
+        .kes_period = kes_period,
+        .sigma = sigma,
     };
 }
 
@@ -568,6 +631,12 @@ test "block: parse real Alonzo golden block" {
     try std.testing.expect(block.header.prev_hash != null);
     try std.testing.expectEqual(@as(usize, 32), block.header.issuer_vkey.len);
     try std.testing.expectEqual(@as(usize, 32), block.header.vrf_vkey.len);
+    try std.testing.expect(block.header.vrf_result_raw.len > 0);
+    try std.testing.expect(block.header.leader_vrf_raw != null);
+    try std.testing.expect(block.header.opcert_hot_vkey != null);
+    try std.testing.expect(block.header.opcert_sequence_no != null);
+    try std.testing.expect(block.header.opcert_kes_period != null);
+    try std.testing.expect(block.header.opcert_sigma != null);
 
     // Verify components are present
     try std.testing.expect(block.tx_bodies_raw.len > 0);
@@ -716,6 +785,11 @@ test "block: parse N2N golden blocks from ouroboros-consensus" {
         // Verify basic header fields are populated
         try std.testing.expect(block.header.issuer_vkey.len == 32);
         try std.testing.expect(block.header.vrf_vkey.len == 32);
+        try std.testing.expect(block.header.vrf_result_raw.len > 0);
+        try std.testing.expect(block.header.opcert_hot_vkey != null);
+        try std.testing.expect(block.header.opcert_sequence_no != null);
+        try std.testing.expect(block.header.opcert_kes_period != null);
+        try std.testing.expect(block.header.opcert_sigma != null);
         try std.testing.expect(block.tx_bodies_raw.len > 0);
         try std.testing.expect(block.tx_witnesses_raw.len > 0);
     }

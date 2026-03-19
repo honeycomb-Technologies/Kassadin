@@ -328,6 +328,7 @@ DO NOT mark Phase 3 fully complete until these are validated in Phase 7/8.
 - [x] Body hash validation
 - [x] Pool key hash computation (Blake2b-224)
 - [x] Golden Alonzo block structural validation
+- [x] Retain Shelley+ VRF cert payloads and structured operational-cert fields in parsed headers for later VRF/KES/OCert validation
 - [ ] VRF proof verification (needs epoch nonce from chain state — Phase 7)
 - [ ] KES signature verification (needs KES period calculation — can do now)
 - [ ] OCert counter validation (needs counter map from chain state — Phase 7)
