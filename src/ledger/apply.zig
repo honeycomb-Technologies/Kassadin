@@ -54,6 +54,7 @@ fn buildDiff(
         try consumed_list.append(allocator, .{
             .tx_in = input,
             .value = entry.value,
+            .stake_credential = entry.stake_credential,
             .raw_cbor = try allocator.dupe(u8, entry.raw_cbor),
         });
     }
@@ -65,6 +66,7 @@ fn buildDiff(
         try produced_list.append(allocator, .{
             .tx_in = .{ .tx_id = tx.tx_id, .tx_ix = @intCast(ix) },
             .value = out.value,
+            .stake_credential = types.stakeCredentialFromAddressBytes(out.address_raw) catch null,
             .raw_cbor = try allocator.dupe(u8, out.raw_cbor),
         });
     }

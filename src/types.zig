@@ -197,6 +197,18 @@ pub const Address = union(enum) {
     }
 };
 
+pub fn stakeCredentialFromAddressBytes(bytes: []const u8) !?Credential {
+    const address = try Address.fromBytes(bytes);
+    return switch (address) {
+        .bootstrap => null,
+        .shelley => |shelley| switch (shelley.stake) {
+            .base => |credential| credential,
+            .pointer => null,
+            .null => null,
+        },
+    };
+}
+
 pub const ShelleyAddress = struct {
     network: Network,
     payment: Credential,
@@ -475,6 +487,25 @@ test "reward account: round-trip" {
     const decoded = try RewardAccount.fromBytes(bytes);
     try std.testing.expectEqual(ra.network, decoded.network);
     try std.testing.expect(ra.credential.eql(decoded.credential));
+}
+
+test "address: extract base stake credential" {
+    var addr_bytes: [57]u8 = undefined;
+    addr_bytes[0] = 0x01; // base key/key, mainnet
+    @memset(addr_bytes[1..29], 0xaa); // payment
+    @memset(addr_bytes[29..57], 0xbb); // stake
+
+    const credential = (try stakeCredentialFromAddressBytes(&addr_bytes)).?;
+    try std.testing.expectEqual(CredentialType.key_hash, credential.cred_type);
+    try std.testing.expectEqualSlices(u8, addr_bytes[29..57], &credential.hash);
+}
+
+test "address: extract enterprise stake credential is null" {
+    var addr_bytes: [29]u8 = undefined;
+    addr_bytes[0] = 0x61; // enterprise key, mainnet
+    @memset(addr_bytes[1..29], 0xab);
+
+    try std.testing.expect((try stakeCredentialFromAddressBytes(&addr_bytes)) == null);
 }
 
 test "asset name: from slice round-trip" {

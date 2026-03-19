@@ -138,8 +138,8 @@ pub fn loadSnapshotIntoLedger(
             try readExactly(reader, value_buf.items);
 
             const tx_in = try parsePackedTxIn(&key_buf);
-            const coin = try parsePackedTxOutCoin(value_buf.items);
-            try ledger.importUtxo(tx_in, coin);
+            const output = try parsePackedTxOutInfo(value_buf.items);
+            try ledger.importUtxo(tx_in, output.coin, output.stake_credential);
             loaded += 1;
 
             if (!builtin.is_test and loaded % 100_000 == 0) {
@@ -157,8 +157,8 @@ pub fn loadSnapshotIntoLedger(
         try readExactly(reader, value_buf.items);
 
         const tx_in = try parsePackedTxIn(&key_buf);
-        const coin = try parsePackedTxOutCoin(value_buf.items);
-        try ledger.importUtxo(tx_in, coin);
+        const output = try parsePackedTxOutInfo(value_buf.items);
+        try ledger.importUtxo(tx_in, output.coin, output.stake_credential);
         loaded += 1;
 
         if (!builtin.is_test and loaded % 100_000 == 0) {
@@ -1655,18 +1655,33 @@ fn parsePackedTxIn(bytes: *const [34]u8) !TxIn {
 }
 
 fn parsePackedTxOutCoin(bytes: []const u8) !Coin {
+    return (try parsePackedTxOutInfo(bytes)).coin;
+}
+
+const PackedTxOutInfo = struct {
+    coin: Coin,
+    stake_credential: ?Credential,
+};
+
+fn parsePackedTxOutInfo(bytes: []const u8) !PackedTxOutInfo {
     var pos: usize = 0;
     const tag = try readPackedByte(bytes, &pos);
 
     switch (tag) {
         0, 1, 4, 5 => {
-            try skipPackedShortBytes(bytes, &pos);
-            return readPackedCompactValueCoin(bytes, &pos);
+            const address_raw = try readPackedShortBytes(bytes, &pos);
+            return .{
+                .coin = try readPackedCompactValueCoin(bytes, &pos),
+                .stake_credential = types.stakeCredentialFromAddressBytes(address_raw) catch null,
+            };
         },
         2, 3 => {
-            try skipPackedCredential(bytes, &pos);
+            const stake_credential = try readPackedCredential(bytes, &pos);
             try skipPackedFixed(bytes, &pos, 32); // Addr28Extra
-            return readPackedCompactCoin(bytes, &pos);
+            return .{
+                .coin = try readPackedCompactCoin(bytes, &pos),
+                .stake_credential = stake_credential,
+            };
         },
         else => return error.UnsupportedPackedTxOut,
     }
@@ -1687,14 +1702,26 @@ fn readPackedCompactCoin(bytes: []const u8, pos: *usize) !Coin {
     return readPackedVarLen(bytes, pos);
 }
 
-fn skipPackedShortBytes(bytes: []const u8, pos: *usize) !void {
+fn readPackedShortBytes(bytes: []const u8, pos: *usize) ![]const u8 {
     const len = try readPackedVarLen(bytes, pos);
+    const start = pos.*;
     try skipPackedFixed(bytes, pos, @intCast(len));
+    return bytes[start..pos.*];
 }
 
-fn skipPackedCredential(bytes: []const u8, pos: *usize) !void {
-    _ = try readPackedByte(bytes, pos); // key hash vs script hash
+fn readPackedCredential(bytes: []const u8, pos: *usize) !Credential {
+    const tag = try readPackedByte(bytes, pos);
+    const cred_type: types.CredentialType = switch (tag) {
+        0 => .script_hash,
+        1 => .key_hash,
+        else => return error.InvalidPackedTxOut,
+    };
+    const start = pos.*;
     try skipPackedFixed(bytes, pos, 28);
+    return .{
+        .cred_type = cred_type,
+        .hash = bytes[start..pos.*][0..28].*,
+    };
 }
 
 fn skipPackedFixed(bytes: []const u8, pos: *usize, len: usize) !void {
@@ -1815,6 +1842,8 @@ test "ledger_snapshot: parse packed tag-2 txout coin from real ancillary sample"
         0xf2, 0x1b, 0x74, 0xb6, 0x12, 0xef, 0x01, 0x00, 0x00, 0x00, 0x5b, 0xc2,
         0x2e, 0x4c, 0x00, 0x81, 0x8a, 0x83, 0x17,
     };
-    const coin = try parsePackedTxOutCoin(&value);
-    try std.testing.expectEqual(@as(Coin, 2_261_399), coin);
+    const output = try parsePackedTxOutInfo(&value);
+    try std.testing.expectEqual(@as(Coin, 2_261_399), output.coin);
+    const credential = output.stake_credential.?;
+    try std.testing.expectEqual(types.CredentialType.key_hash, credential.cred_type);
 }

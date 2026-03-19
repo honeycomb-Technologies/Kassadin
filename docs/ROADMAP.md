@@ -515,6 +515,7 @@ headers from ouroboros-consensus golden data.
 - [x] Hydrate pool reward accounts and scheduled retirements from ancillary snapshot state, then reap retiring pools rollback-safely at epoch boundaries during immutable replay and forward sync
 - [x] Hydrate treasury/reserves/current-fee/snapshot-fee pots from ancillary snapshot state, accumulate block fees locally, and route unclaimed pool-retirement refunds to treasury
 - [x] Import modern Haskell `SnapShots` / `StakePoolSnapShot` ancillary state as the primary path, retain credential-level active stake in mark/set/go, and handle observed 9-field pool entries compatibly
+- [x] Carry stake credentials through live/snapshot UTxO entries and rebuild epoch mark stake from Haskell-style instant stake plus reward balances instead of approximating it from reward balances plus deposits
 - [x] Hydrate current + future pool params from ancillary snapshot state, track them rollback-safely in `LedgerDB`, and activate staged pool re-registration params at epoch processing
 - [x] Credit delegator reward accounts as well as pool reward accounts from `go`-snapshot stake during epoch reward distribution (current follower reward model)
 - [x] Import/rotate Haskell-shaped `BlocksMade` (`nesBprev` / `nesBcur`) and use real block production plus Shelley `activeSlotsCoeff` in the follower reward path
@@ -522,6 +523,8 @@ headers from ouroboros-consensus golden data.
 - [x] Filter epoch reward payouts against the current registered account set and route unclaimable rewards to treasury during replay/live epoch processing
 - [x] Reject stake-key deregistration refunds while tracked reward balances remain unless the same transaction drains the reward account
 - [ ] Maintain full reward-account and deposit state across epoch reward/stake updates during long-running sync
+- [ ] Replace heuristic reward-account registration checks with first-class Haskell-style `Accounts` / `DState` follower state
+- [ ] Track pre-Conway pointer stake references in instant-stake accounting and snapshot rotation
 
 ### 7.3 Full Integration
 - [x] Shelley genesis config parsing (real mainnet genesis verified)

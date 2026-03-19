@@ -25,6 +25,7 @@ pub const StakeDistribution = stake_mod.StakeDistribution;
 pub const UtxoEntry = struct {
     tx_in: TxIn,
     value: Coin,
+    stake_credential: ?Credential = null,
     raw_cbor: []const u8, // original CBOR bytes for byte-preserving hashing
 };
 
@@ -305,6 +306,7 @@ pub const LedgerDB = struct {
             try self.utxo_set.put(entry.tx_in, .{
                 .tx_in = entry.tx_in,
                 .value = entry.value,
+                .stake_credential = entry.stake_credential,
                 .raw_cbor = owned_cbor,
             });
         }
@@ -458,12 +460,13 @@ pub const LedgerDB = struct {
 
     /// Insert a UTxO entry loaded from an external snapshot.
     /// Snapshot imports use empty raw bytes to keep memory usage down.
-    pub fn importUtxo(self: *LedgerDB, tx_in: TxIn, value: Coin) !void {
+    pub fn importUtxo(self: *LedgerDB, tx_in: TxIn, value: Coin, stake_credential: ?Credential) !void {
         if (self.utxo_set.contains(tx_in)) return;
 
         try self.utxo_set.put(tx_in, .{
             .tx_in = tx_in,
             .value = value,
+            .stake_credential = stake_credential,
             .raw_cbor = try self.allocator.alloc(u8, 0),
         });
     }
@@ -1017,20 +1020,34 @@ pub const LedgerDB = struct {
     }
 
     /// Rotate stake snapshots at an epoch boundary and build the new mark
-    /// distribution from currently tracked delegations and reward balances.
+    /// distribution from current instant stake (UTxO) plus reward balances.
     pub fn rotateStakeSnapshots(self: *LedgerDB, new_epoch: EpochNo) void {
         self.stake_snapshots.onEpochBoundary(new_epoch);
 
-        // Populate the new mark snapshot from current delegations.
+        // Populate the new mark snapshot from current delegations using the
+        // Haskell-shaped instant-stake inputs: delegated UTxO stake plus
+        // reward-account balances, not registration deposits.
         if (self.stake_snapshots.mark) |*mark| {
+            var credential_stake = std.AutoHashMap(Credential, Coin).init(self.allocator);
+            defer credential_stake.deinit();
+
+            var utxo_it = self.utxo_set.valueIterator();
+            while (utxo_it.next()) |entry| {
+                const credential = entry.stake_credential orelse continue;
+                accumulateCredentialStake(&credential_stake, credential, entry.value) catch continue;
+            }
+
+            var reward_it = self.reward_balances.iterator();
+            while (reward_it.next()) |entry| {
+                if (entry.key_ptr.network != self.reward_account_network) continue;
+                accumulateCredentialStake(&credential_stake, entry.key_ptr.credential, entry.value_ptr.*) catch continue;
+            }
+
             var it = self.stake_pool_delegations.iterator();
             while (it.next()) |entry| {
                 const cred = entry.key_ptr.*;
                 const pool = entry.value_ptr.*;
-                const acct = RewardAccount{ .network = self.reward_account_network, .credential = cred };
-                const balance = self.reward_balances.get(acct) orelse 0;
-                const deposit = self.stake_deposits.get(cred) orelse 0;
-                const delegated = balance + deposit;
+                const delegated = credential_stake.get(cred) orelse 0;
                 if (delegated == 0) continue;
 
                 const is_owner = cred.cred_type == .key_hash and self.isPoolOwner(pool, cred.hash);
@@ -1863,6 +1880,16 @@ pub const LedgerDB = struct {
             .network = self.reward_account_network,
             .credential = credential,
         });
+    }
+
+    fn accumulateCredentialStake(
+        stakes: *std.AutoHashMap(Credential, Coin),
+        credential: Credential,
+        amount: Coin,
+    ) !void {
+        if (amount == 0) return;
+        const previous = stakes.get(credential) orelse 0;
+        try stakes.put(credential, previous + amount);
     }
 
     /// Total number of UTxOs in the set.
@@ -3392,6 +3419,20 @@ test "ledgerdb: rotate stake snapshots builds mark from delegations" {
     try db.importPoolOwnerMembership(pool, cred.hash);
     try db.importStakePoolDelegation(cred, pool);
 
+    const produced = try allocator.alloc(UtxoEntry, 1);
+    produced[0] = .{
+        .tx_in = makeTxIn(0x03, 0),
+        .value = 2_000_000,
+        .stake_credential = cred,
+        .raw_cbor = try allocator.dupe(u8, "stake-utxo"),
+    };
+    try db.applyDiff(.{
+        .slot = 1,
+        .block_hash = [_]u8{0xab} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = produced,
+    });
+
     db.rotateStakeSnapshots(1);
 
     // mark should exist and contain our pool
@@ -3400,7 +3441,7 @@ test "ledgerdb: rotate stake snapshots builds mark from delegations" {
     try std.testing.expectEqual(@as(usize, 1), mark.poolCount());
     try std.testing.expectEqual(@as(usize, 1), mark.delegatorCount());
     const ps = mark.getPool(pool).?;
-    try std.testing.expectEqual(@as(Coin, 7_000_000), ps.active_stake); // reward + deposit
+    try std.testing.expectEqual(@as(Coin, 7_000_000), ps.active_stake); // reward + UTxO
     try std.testing.expectEqual(@as(Coin, 7_000_000), ps.self_delegated_owner_stake);
     try std.testing.expect(mark.isPoolOwner(pool, cred.hash));
     const delegated = mark.getDelegatedStake(cred).?;

@@ -171,6 +171,7 @@ pub const Client = struct {
                     try result.append(allocator, .{
                         .tx_in = output.tx_in,
                         .value = output.value,
+                        .stake_credential = output.stake_credential,
                         .raw_cbor = try allocator.dupe(u8, output.raw_cbor),
                     });
                     break;
@@ -552,6 +553,7 @@ fn decodeAnyUtxoData(allocator: Allocator, data: []const u8) !?UtxoEntry {
     return .{
         .tx_in = txo_ref.?,
         .value = tx_out.value,
+        .stake_credential = types.stakeCredentialFromAddressBytes(tx_out.address_raw) catch null,
         .raw_cbor = try allocator.dupe(u8, raw_cbor.?),
     };
 }
@@ -593,6 +595,7 @@ fn buildEntriesFromTxBody(allocator: Allocator, tx: *const tx_mod.TxBody) ![]Utx
                 .tx_ix = @intCast(ix),
             },
             .value = out.value,
+            .stake_credential = types.stakeCredentialFromAddressBytes(out.address_raw) catch null,
             .raw_cbor = try allocator.dupe(u8, out.raw_cbor),
         });
     }
@@ -613,6 +616,7 @@ fn decodeCardanoTxOutputs(allocator: Allocator, tx_id: Hash32, data: []const u8)
                 try outputs.append(allocator, .{
                     .tx_in = .{ .tx_id = tx_id, .tx_ix = index },
                     .value = parsed.value,
+                    .stake_credential = parsed.stake_credential,
                     .raw_cbor = parsed.raw_cbor,
                 });
                 index +%= 1;
@@ -624,7 +628,7 @@ fn decodeCardanoTxOutputs(allocator: Allocator, tx_id: Hash32, data: []const u8)
     return outputs.toOwnedSlice(allocator);
 }
 
-fn decodeCardanoTxOutput(allocator: Allocator, data: []const u8) !struct { value: u64, raw_cbor: []u8 } {
+fn decodeCardanoTxOutput(allocator: Allocator, data: []const u8) !struct { value: u64, stake_credential: ?types.Credential, raw_cbor: []u8 } {
     var address: []const u8 = &.{};
     var coin: u64 = 0;
 
@@ -640,6 +644,7 @@ fn decodeCardanoTxOutput(allocator: Allocator, data: []const u8) !struct { value
     if (address.len == 0) return error.InvalidProto;
     return .{
         .value = coin,
+        .stake_credential = types.stakeCredentialFromAddressBytes(address) catch null,
         .raw_cbor = try encodeMinimalTxOut(allocator, address, coin),
     };
 }
@@ -726,6 +731,7 @@ test "dolos_grpc_client: decode read-utxos response item" {
 
     try std.testing.expectEqual(txin.tx_ix, entry.tx_in.tx_ix);
     try std.testing.expectEqual(@as(u64, 1_500_000), entry.value);
+    try std.testing.expect(entry.stake_credential == null);
     try std.testing.expectEqualSlices(u8, tx_out.items, entry.raw_cbor);
 }
 
