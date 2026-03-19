@@ -517,6 +517,7 @@ headers from ouroboros-consensus golden data.
 - [x] Import modern Haskell `SnapShots` / `StakePoolSnapShot` ancillary state as the primary path, retain credential-level active stake in mark/set/go, and handle observed 9-field pool entries compatibly
 - [x] Carry stake credentials through live/snapshot UTxO entries and rebuild epoch mark stake from Haskell-style instant stake plus reward balances instead of approximating it from reward balances plus deposits
 - [x] Track explicit per-credential stake-account registration state locally, rebuild it from checkpoint/live reward-deposit-delegation maps, and preserve UTxO staking credentials across rollbacks so follower registration/instant-stake logic no longer depends purely on reward/deposit map presence
+- [x] Route ancillary snapshot account import through one explicit stake-account path so registered empty accounts survive snapshot hydration instead of being dropped when reward/deposit/delegation fields are all zero
 - [x] Hydrate current + future pool params from ancillary snapshot state, track them rollback-safely in `LedgerDB`, and activate staged pool re-registration params at epoch processing
 - [x] Credit delegator reward accounts as well as pool reward accounts from `go`-snapshot stake during epoch reward distribution (current follower reward model)
 - [x] Import/rotate Haskell-shaped `BlocksMade` (`nesBprev` / `nesBcur`) and use real block production plus Shelley `activeSlotsCoeff` in the follower reward path

@@ -485,6 +485,42 @@ pub const LedgerDB = struct {
         });
     }
 
+    pub fn importStakeAccount(
+        self: *LedgerDB,
+        account: RewardAccount,
+        state: StakeAccountState,
+    ) !void {
+        try self.setStakeAccountRegistered(account.credential, state.registered);
+        try self.setStakeAccountRewardBalance(account.credential, state.reward_balance);
+        try self.setStakeAccountDeposit(account.credential, state.deposit);
+        try self.setStakeAccountPoolDelegation(account.credential, state.stake_pool_delegation);
+        try self.setStakeAccountDRepDelegation(account.credential, state.drep_delegation);
+
+        if (state.registered or state.reward_balance > 0) {
+            try self.reward_balances.put(account, state.reward_balance);
+        } else {
+            _ = self.reward_balances.remove(account);
+        }
+
+        if (state.registered or state.deposit > 0) {
+            try self.stake_deposits.put(account.credential, state.deposit);
+        } else {
+            _ = self.stake_deposits.remove(account.credential);
+        }
+
+        if (state.stake_pool_delegation) |pool| {
+            try self.stake_pool_delegations.put(account.credential, pool);
+        } else {
+            _ = self.stake_pool_delegations.remove(account.credential);
+        }
+
+        if (state.drep_delegation) |drep| {
+            try self.drep_delegations.put(account.credential, drep);
+        } else {
+            _ = self.drep_delegations.remove(account.credential);
+        }
+    }
+
     pub fn importStakeDeposit(self: *LedgerDB, credential: Credential, deposit: Coin) !void {
         try self.stake_deposits.put(credential, deposit);
         try self.setStakeAccountRegistered(credential, true);

@@ -1377,26 +1377,23 @@ fn importAccountEntry(
 ) !void {
     const credential = try parseCredential(dec);
     const account = try parseAccountState(dec, active_era);
+    try ledger.importStakeAccount(.{
+        .network = network,
+        .credential = credential,
+    }, .{
+        .registered = true,
+        .reward_balance = account.balance,
+        .deposit = account.deposit,
+        .stake_pool_delegation = account.stake_pool,
+        .drep_delegation = account.drep,
+    });
 
     if (account.balance > 0) {
-        try ledger.importRewardBalance(.{
-            .network = network,
-            .credential = credential,
-        }, account.balance);
         parse_import_result.reward_accounts_loaded += 1;
     }
 
     if (account.deposit > 0) {
-        try ledger.importStakeDeposit(credential, account.deposit);
         parse_import_result.stake_deposits_loaded += 1;
-    }
-
-    if (account.stake_pool) |pool| {
-        try ledger.importStakePoolDelegation(credential, pool);
-    }
-
-    if (account.drep) |drep| {
-        try ledger.importDRepDelegation(credential, drep);
     }
 }
 
