@@ -5,6 +5,7 @@ const stake_mod = @import("stake.zig");
 
 pub const KeyHash = types.KeyHash;
 pub const Coin = types.Coin;
+pub const DeltaCoin = types.DeltaCoin;
 pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
 pub const UnitInterval = types.UnitInterval;
@@ -30,10 +31,29 @@ pub const RewardParams = struct {
 
 /// Reward pot calculation for an epoch.
 pub const EpochRewards = struct {
+    expansion: Coin, // eta * rho * reserves
     total_rewards: Coin, // monetary expansion + fees
     treasury_cut: Coin, // tau * total_rewards
     pool_rewards: Coin, // total_rewards - treasury_cut
     fees_collected: Coin, // transaction fees from this epoch
+};
+
+/// Haskell-shaped epoch balance-sheet update.
+pub const RewardUpdate = struct {
+    deltaT: DeltaCoin,
+    deltaR: DeltaCoin,
+    deltaF: DeltaCoin,
+    distributed_rewards: Coin,
+
+    pub fn isBalanced(self: RewardUpdate) bool {
+        const distributed = std.math.cast(DeltaCoin, self.distributed_rewards) orelse return false;
+        const total: i128 =
+            @as(i128, self.deltaT) +
+            @as(i128, self.deltaR) +
+            @as(i128, distributed) +
+            @as(i128, self.deltaF);
+        return total == 0;
+    }
 };
 
 pub const PoolRewardSplit = struct {
@@ -128,6 +148,26 @@ pub fn calculateExpectedBlocks(
     return @intCast((@as(u128, slots_per_epoch) * active_slot_coeff.numerator) / active_slot_coeff.denominator);
 }
 
+fn calculateEta(
+    active_slot_coeff: UnitInterval,
+    blocks_made: u64,
+    blocks_total: u64,
+) Rational {
+    const d = Rational.fromUnitInterval(active_slot_coeff);
+    const threshold = Rational.init(4, 5);
+    if (Rational.compare(d, threshold) != .lt) {
+        return Rational.init(1, 1);
+    }
+    if (blocks_made == 0 or blocks_total == 0) {
+        return Rational.init(0, 1);
+    }
+    return Rational.init(@min(blocks_made, blocks_total), blocks_total);
+}
+
+fn coinToDeltaCoin(value: Coin) !DeltaCoin {
+    return std.math.cast(DeltaCoin, value) orelse error.InvalidRewardAccounting;
+}
+
 fn calculateApparentPerformance(
     active_slot_coeff: UnitInterval,
     pool_active_stake: Coin,
@@ -158,11 +198,16 @@ pub fn calculateEpochRewards(
     reserve: Coin,
     fees: Coin,
     params: RewardParams,
+    blocks_made: u64,
+    blocks_total: u64,
 ) EpochRewards {
-    // Monetary expansion: rho * reserve
-    const expansion = @as(Coin, @intCast(
-        (@as(u128, reserve) * params.rho.numerator) / params.rho.denominator,
-    ));
+    const eta = calculateEta(params.active_slot_coeff, blocks_made, blocks_total);
+    const expansion_factor = Rational.mul(eta, Rational.fromUnitInterval(params.rho));
+    const expansion = floorRationalProduct(
+        reserve,
+        expansion_factor.numerator,
+        expansion_factor.denominator,
+    );
 
     const total = expansion + fees;
 
@@ -172,10 +217,30 @@ pub fn calculateEpochRewards(
     ));
 
     return .{
+        .expansion = expansion,
         .total_rewards = total,
         .treasury_cut = treasury,
         .pool_rewards = total - treasury,
         .fees_collected = fees,
+    };
+}
+
+pub fn calculateRewardUpdate(
+    epoch_rewards: EpochRewards,
+    distributed_rewards: Coin,
+) !RewardUpdate {
+    if (distributed_rewards > epoch_rewards.pool_rewards) {
+        return error.InvalidRewardAccounting;
+    }
+
+    const delta_r1 = try coinToDeltaCoin(epoch_rewards.expansion);
+    const delta_r2 = try coinToDeltaCoin(epoch_rewards.pool_rewards - distributed_rewards);
+
+    return .{
+        .deltaT = try coinToDeltaCoin(epoch_rewards.treasury_cut),
+        .deltaR = -delta_r1 + delta_r2,
+        .deltaF = -(try coinToDeltaCoin(epoch_rewards.fees_collected)),
+        .distributed_rewards = distributed_rewards,
     };
 }
 
@@ -292,14 +357,16 @@ pub fn calculatePoolMemberReward(
 
 test "rewards: epoch reward calculation" {
     const params = RewardParams.mainnet_defaults;
+    const blocks_total = calculateExpectedBlocks(432_000, params.active_slot_coeff);
 
     // Reserve: 14 billion ADA (in lovelace)
     const reserve: Coin = 14_000_000_000_000_000;
     const fees: Coin = 50_000_000_000; // 50,000 ADA in fees
 
-    const result = calculateEpochRewards(reserve, fees, params);
+    const result = calculateEpochRewards(reserve, fees, params, blocks_total, blocks_total);
 
     // Expansion: 0.003 * 14B ADA = 42M ADA
+    try std.testing.expect(result.expansion > 0);
     try std.testing.expect(result.total_rewards > 0);
     try std.testing.expect(result.treasury_cut > 0);
     try std.testing.expect(result.pool_rewards > 0);
@@ -314,10 +381,64 @@ test "rewards: zero reserve produces only fee rewards" {
     const params = RewardParams.mainnet_defaults;
     const fees: Coin = 10_000_000; // 10 ADA
 
-    const result = calculateEpochRewards(0, fees, params);
+    const result = calculateEpochRewards(
+        0,
+        fees,
+        params,
+        0,
+        calculateExpectedBlocks(432_000, params.active_slot_coeff),
+    );
 
     try std.testing.expectEqual(fees, result.total_rewards);
     try std.testing.expect(result.treasury_cut > 0);
+}
+
+test "rewards: no blocks means no reserve expansion when d < 0.8" {
+    const params = RewardParams.mainnet_defaults;
+    const result = calculateEpochRewards(
+        14_000_000_000_000_000,
+        10_000_000,
+        params,
+        0,
+        calculateExpectedBlocks(432_000, params.active_slot_coeff),
+    );
+
+    try std.testing.expectEqual(@as(Coin, 0), result.expansion);
+    try std.testing.expectEqual(@as(Coin, 10_000_000), result.total_rewards);
+}
+
+test "rewards: reward update preserves balance sheet" {
+    const params = RewardParams.mainnet_defaults;
+    const blocks_total = calculateExpectedBlocks(432_000, params.active_slot_coeff);
+    const epoch_rewards = calculateEpochRewards(
+        14_000_000_000_000_000,
+        50_000_000_000,
+        params,
+        blocks_total,
+        blocks_total,
+    );
+
+    const update = try calculateRewardUpdate(epoch_rewards, epoch_rewards.pool_rewards - 123_456);
+
+    try std.testing.expect(update.isBalanced());
+    try std.testing.expectEqual(-@as(DeltaCoin, @intCast(epoch_rewards.fees_collected)), update.deltaF);
+}
+
+test "rewards: undistributed fee pot returns to reserves" {
+    const params = RewardParams.mainnet_defaults;
+    const epoch_rewards = calculateEpochRewards(
+        0,
+        10_000_000,
+        params,
+        0,
+        calculateExpectedBlocks(432_000, params.active_slot_coeff),
+    );
+    const update = try calculateRewardUpdate(epoch_rewards, 0);
+
+    try std.testing.expect(update.isBalanced());
+    try std.testing.expectEqual(@as(DeltaCoin, 2_000_000), update.deltaT);
+    try std.testing.expectEqual(@as(DeltaCoin, 8_000_000), update.deltaR);
+    try std.testing.expectEqual(@as(DeltaCoin, -10_000_000), update.deltaF);
 }
 
 test "rewards: pool reward calculation" {

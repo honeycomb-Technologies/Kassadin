@@ -1247,18 +1247,25 @@ pub const LedgerDB = struct {
         const go_dist = self.stake_snapshots.go orelse return null;
         if (go_dist.total_stake == 0) return null;
 
+        const blocks_total = rewards_mod.calculateExpectedBlocks(slots_per_epoch, params.active_slot_coeff);
+        var total_blocks_made: u64 = 0;
+        var blocks_it = self.blocks_made_previous_epoch.valueIterator();
+        while (blocks_it.next()) |blocks| {
+            total_blocks_made += blocks.*;
+        }
+
         const epoch_rewards = rewards_mod.calculateEpochRewards(
             self.reserves_balance,
             self.snapshot_fees,
             params,
+            total_blocks_made,
+            blocks_total,
         );
-        if (epoch_rewards.pool_rewards == 0) return null;
 
         var reward_changes: std.ArrayList(RewardBalanceChange) = .empty;
         defer reward_changes.deinit(allocator);
 
         const total_stake = params.total_lovelace -| self.reserves_balance;
-        const blocks_total = rewards_mod.calculateExpectedBlocks(slots_per_epoch, params.active_slot_coeff);
 
         var total_registered_distributed: Coin = 0;
         var total_unregistered_distributed: Coin = 0;
@@ -1338,7 +1345,22 @@ pub const LedgerDB = struct {
             }
         }
 
-        if (total_registered_distributed == 0 and total_unregistered_distributed == 0) return null;
+        const total_distributed = total_registered_distributed + total_unregistered_distributed;
+        const reward_update = try rewards_mod.calculateRewardUpdate(epoch_rewards, total_distributed);
+        if (!reward_update.isBalanced()) return error.InvalidRewardAccounting;
+
+        const treasury_after_update = addDeltaCoinChecked(self.treasury_balance, reward_update.deltaT) orelse return error.InvalidRewardAccounting;
+        const treasury_next = treasury_after_update + total_unregistered_distributed;
+        const reserves_next = addDeltaCoinChecked(self.reserves_balance, reward_update.deltaR) orelse return error.InvalidRewardAccounting;
+        const snapshot_fees_next = addDeltaCoinChecked(self.snapshot_fees, reward_update.deltaF) orelse return error.InvalidRewardAccounting;
+
+        if (reward_changes.items.len == 0 and
+            treasury_next == self.treasury_balance and
+            reserves_next == self.reserves_balance and
+            snapshot_fees_next == self.snapshot_fees)
+        {
+            return null;
+        }
 
         return .{
             .slot = slot,
@@ -1347,15 +1369,15 @@ pub const LedgerDB = struct {
             .produced = try allocator.alloc(UtxoEntry, 0),
             .treasury_balance_change = .{
                 .previous = self.treasury_balance,
-                .next = self.treasury_balance + epoch_rewards.treasury_cut + total_unregistered_distributed,
+                .next = treasury_next,
             },
             .reserves_balance_change = .{
                 .previous = self.reserves_balance,
-                .next = self.reserves_balance -| (total_registered_distributed + total_unregistered_distributed + epoch_rewards.treasury_cut),
+                .next = reserves_next,
             },
             .snapshot_fees_change = .{
                 .previous = self.snapshot_fees,
-                .next = 0,
+                .next = snapshot_fees_next,
             },
             .reward_balance_changes = try reward_changes.toOwnedSlice(allocator),
         };
@@ -3550,6 +3572,14 @@ test "ledgerdb: epoch reward diff excludes owners from member rewards" {
     snapshots.go = go;
     db.replaceStakeSnapshots(snapshots);
 
+    const total_before =
+        db.getTreasuryBalance() +
+        db.getReservesBalance() +
+        db.getSnapshotFees() +
+        (db.lookupRewardBalance(reward_account) orelse 0) +
+        (db.lookupRewardBalance(owner_account) orelse 0) +
+        (db.lookupRewardBalance(delegator_account) orelse 0);
+
     const diff = try db.buildEpochRewardDiff(
         allocator,
         100,
@@ -3571,6 +3601,14 @@ test "ledgerdb: epoch reward diff excludes owners from member rewards" {
     try std.testing.expect(db.getTreasuryBalance() > 0);
     // Snapshot fees should be reset to 0
     try std.testing.expectEqual(@as(Coin, 0), db.getSnapshotFees());
+    const total_after =
+        db.getTreasuryBalance() +
+        db.getReservesBalance() +
+        db.getSnapshotFees() +
+        (db.lookupRewardBalance(reward_account) orelse 0) +
+        (db.lookupRewardBalance(owner_account) orelse 0) +
+        (db.lookupRewardBalance(delegator_account) orelse 0);
+    try std.testing.expectEqual(total_before, total_after);
 
     // Rollback restores original state
     try db.rollback(1);
@@ -3670,14 +3708,68 @@ test "ledgerdb: epoch reward diff requires owner pledge stake" {
     snapshots.go = go;
     db.replaceStakeSnapshots(snapshots);
 
-    const diff = try db.buildEpochRewardDiff(
+    const diff = (try db.buildEpochRewardDiff(
         allocator,
         100,
         [_]u8{0x98} ** 32,
         rewards_mod.RewardParams.mainnet_defaults,
         432_000,
+    )).?;
+    try std.testing.expectEqual(@as(usize, 0), diff.reward_balance_changes.len);
+
+    try db.applyDiff(diff);
+    try std.testing.expect(db.lookupRewardBalance(reward_account) == null);
+    try std.testing.expectEqual(@as(Coin, 0), db.getSnapshotFees());
+}
+
+test "ledgerdb: epoch reward diff preserves fee pot with no distributed rewards" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-epoch-reward-fees-only");
+    defer db.deinit();
+
+    const pool = [_]u8{0x9a} ** 28;
+    const reward_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x9b} ** 28 },
+    };
+
+    try db.importPoolRewardAccount(pool, reward_account);
+    db.setRewardAccountNetwork(.testnet);
+    db.importTreasuryBalance(100);
+    db.importReservesBalance(1_000_000);
+    db.importSnapshotFees(10_000_000);
+
+    var go = stake_mod.StakeDistribution.init(allocator, 0);
+    try go.setPoolStake(
+        pool,
+        1_000_000_000_000,
+        500_000_000_000,
+        500_000_000_000,
+        340_000_000,
+        .{ .numerator = 0, .denominator = 1 },
+        reward_account,
     );
-    try std.testing.expect(diff == null);
+    go.finalize();
+
+    var snapshots = StakeSnapshots.init(allocator);
+    snapshots.go = go;
+    db.replaceStakeSnapshots(snapshots);
+
+    const diff = (try db.buildEpochRewardDiff(
+        allocator,
+        100,
+        [_]u8{0x9c} ** 32,
+        rewards_mod.RewardParams.mainnet_defaults,
+        432_000,
+    )).?;
+
+    try std.testing.expectEqual(@as(Coin, 100), diff.treasury_balance_change.?.previous);
+    try std.testing.expectEqual(@as(Coin, 2_000_100), diff.treasury_balance_change.?.next);
+    try std.testing.expectEqual(@as(Coin, 1_000_000), diff.reserves_balance_change.?.previous);
+    try std.testing.expectEqual(@as(Coin, 9_000_000), diff.reserves_balance_change.?.next);
+    try std.testing.expectEqual(@as(Coin, 10_000_000), diff.snapshot_fees_change.?.previous);
+    try std.testing.expectEqual(@as(Coin, 0), diff.snapshot_fees_change.?.next);
+    try std.testing.expectEqual(@as(usize, 0), diff.reward_balance_changes.len);
 }
 
 test "ledgerdb: epoch MIR diff credits registered accounts and clears pending state" {
