@@ -4,7 +4,8 @@ pub const crypto = struct {
     pub const hash = @import("crypto/hash.zig");
     pub const ed25519 = @import("crypto/ed25519.zig");
     pub const vrf = @import("crypto/vrf.zig");
-    pub const kes = @import("crypto/kes.zig");
+    pub const kes = @import("crypto/kes_sum.zig");
+    pub const compact_kes = @import("crypto/kes.zig");
     pub const opcert = @import("crypto/opcert.zig");
     pub const bech32 = @import("crypto/bech32.zig");
 };

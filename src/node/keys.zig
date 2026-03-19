@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ed25519 = @import("../crypto/ed25519.zig").Ed25519;
-const KES = @import("../crypto/kes.zig").KES;
+const KES = @import("../crypto/kes_sum.zig").KES;
 const VRF = @import("../crypto/vrf.zig").VRF;
 
 /// Cardano key file format (TextEnvelope JSON).

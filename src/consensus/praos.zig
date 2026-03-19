@@ -1,7 +1,6 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const VRF = @import("../crypto/vrf.zig").VRF;
-const KES = @import("../crypto/kes.zig").KES;
 const Ed25519 = @import("../crypto/ed25519.zig").Ed25519;
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
 

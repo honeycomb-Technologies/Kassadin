@@ -1,6 +1,6 @@
 const std = @import("std");
 const Ed25519 = @import("ed25519.zig").Ed25519;
-const KES = @import("kes.zig").KES;
+const KES = @import("kes_sum.zig").KES;
 
 /// Operational Certificate — binds a pool's cold key to a KES hot key.
 pub const OperationalCert = struct {

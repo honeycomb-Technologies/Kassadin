@@ -1,4 +1,5 @@
 const std = @import("std");
+const Decoder = @import("../cbor/decoder.zig").Decoder;
 const types = @import("../types.zig");
 const VRF = @import("../crypto/vrf.zig").VRF;
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
@@ -7,15 +8,72 @@ const praos = @import("praos.zig");
 pub const SlotNo = types.SlotNo;
 pub const Nonce = types.Nonce;
 
-/// VRF input for leader election: epochNonce(32) || slotNumber(8 big-endian)
-pub fn makeVRFInput(epoch_nonce: Nonce, slot: SlotNo) [40]u8 {
+pub const CertifiedVrf = struct {
+    output: VRF.Output,
+    proof: VRF.Proof,
+};
+
+fn nonceFromNumber(value: u64) Nonce {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .big);
+    return .{ .hash = Blake2b256.hash(&buf) };
+}
+
+pub fn seedEta() Nonce {
+    return nonceFromNumber(0);
+}
+
+pub fn seedL() Nonce {
+    return nonceFromNumber(1);
+}
+
+/// Haskell-aligned VRF seed construction:
+/// Seed = Blake2b256(slotNumber(8 BE) || epochNonce) XOR universalConstantNonce
+pub fn makeSeed(universal_constant_nonce: Nonce, slot: SlotNo, epoch_nonce: Nonce) [32]u8 {
     var input: [40]u8 = undefined;
+    std.mem.writeInt(u64, input[0..8], slot, .big);
     switch (epoch_nonce) {
-        .neutral => @memset(input[0..32], 0),
-        .hash => |h| @memcpy(input[0..32], &h),
+        .neutral => @memset(input[8..40], 0),
+        .hash => |h| @memcpy(input[8..40], &h),
     }
-    std.mem.writeInt(u64, input[32..40], slot, .big);
-    return input;
+
+    var seed = Blake2b256.hash(&input);
+    switch (universal_constant_nonce) {
+        .neutral => {},
+        .hash => |h| {
+            for (&seed, h) |*dst, src| dst.* ^= src;
+        },
+    }
+    return seed;
+}
+
+/// VRF input for leader election uses the leader universal constant.
+pub fn makeVRFInput(epoch_nonce: Nonce, slot: SlotNo) [32]u8 {
+    return makeSeed(seedL(), slot, epoch_nonce);
+}
+
+pub fn parseCertifiedVrf(raw: []const u8) !CertifiedVrf {
+    var dec = Decoder.init(raw);
+    const len = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+    if (len != 2) return error.InvalidCbor;
+
+    const output_bytes = try dec.decodeBytes();
+    if (output_bytes.len != VRF.output_length) return error.InvalidCbor;
+
+    const proof_bytes = try dec.decodeBytes();
+    if (proof_bytes.len != VRF.proof_length) return error.InvalidCbor;
+
+    var certified: CertifiedVrf = undefined;
+    @memcpy(&certified.output, output_bytes);
+    @memcpy(&certified.proof, proof_bytes);
+    return certified;
+}
+
+pub fn verifyCertifiedVrfRaw(raw: []const u8, vk: VRF.VerKey, seed: [32]u8) ?VRF.Output {
+    const certified = parseCertifiedVrf(raw) catch return null;
+    const output = VRF.verifyProof(&seed, vk, certified.proof) orelse return null;
+    if (!std.mem.eql(u8, &output, &certified.output)) return null;
+    return output;
 }
 
 /// Check if a VRF output meets the leader threshold for a given relative stake.
@@ -85,20 +143,27 @@ pub fn checkLeaderVRF(
 test "leader: VRF input construction" {
     const nonce = Nonce{ .hash = [_]u8{0xab} ** 32 };
     const input = makeVRFInput(nonce, 42);
-
-    // First 32 bytes: nonce hash
-    try std.testing.expectEqual(@as(u8, 0xab), input[0]);
-    try std.testing.expectEqual(@as(u8, 0xab), input[31]);
-
-    // Last 8 bytes: slot 42 in big-endian
-    try std.testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, input[32..40], .big));
+    const expected = makeSeed(seedL(), 42, nonce);
+    try std.testing.expectEqualSlices(u8, &expected, &input);
 }
 
-test "leader: neutral nonce produces zero prefix" {
-    const input = makeVRFInput(.neutral, 100);
-    for (input[0..32]) |b| {
-        try std.testing.expectEqual(@as(u8, 0), b);
-    }
+test "leader: seed construction matches Haskell slot||nonce hash xor constant" {
+    const epoch_nonce = Nonce{ .hash = [_]u8{0x11} ** 32 };
+    const universal = seedEta();
+    const seed = makeSeed(universal, 7, epoch_nonce);
+
+    var input: [40]u8 = undefined;
+    std.mem.writeInt(u64, input[0..8], 7, .big);
+    @memcpy(input[8..40], &([_]u8{0x11} ** 32));
+    const hashed = Blake2b256.hash(&input);
+    const universal_hash = switch (universal) {
+        .neutral => [_]u8{0} ** 32,
+        .hash => |h| h,
+    };
+
+    var expected = hashed;
+    for (&expected, universal_hash) |*dst, src| dst.* ^= src;
+    try std.testing.expectEqualSlices(u8, &expected, &seed);
 }
 
 test "leader: threshold check with 100% stake always passes" {
@@ -162,4 +227,48 @@ test "leader: full VRF leader check — deterministic" {
         }
     }
     try std.testing.expect(found_leader);
+}
+
+test "leader: verify certified VRF raw round-trip" {
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+    const allocator = std.testing.allocator;
+    const key_seed = [_]u8{0x44} ** 32;
+    const kp = try VRF.keyFromSeed(key_seed);
+    const epoch_nonce = Nonce{ .hash = [_]u8{0x55} ** 32 };
+    const seed = makeSeed(seedEta(), 99, epoch_nonce);
+    const result = try VRF.prove(&seed, kp.sk);
+
+    var enc = Encoder.init(allocator);
+    defer enc.deinit();
+    try enc.encodeArrayLen(2);
+    try enc.encodeBytes(&result.output);
+    try enc.encodeBytes(&result.proof);
+    const raw = try enc.toOwnedSlice();
+    defer allocator.free(raw);
+
+    const verified = verifyCertifiedVrfRaw(raw, kp.vk, seed);
+    try std.testing.expect(verified != null);
+    try std.testing.expectEqualSlices(u8, &result.output, &verified.?);
+}
+
+test "leader: certified VRF rejects mismatched output" {
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+    const allocator = std.testing.allocator;
+    const key_seed = [_]u8{0x66} ** 32;
+    const kp = try VRF.keyFromSeed(key_seed);
+    const seed = makeSeed(seedL(), 101, .neutral);
+    const result = try VRF.prove(&seed, kp.sk);
+
+    var bad_output = result.output;
+    bad_output[0] ^= 0xff;
+
+    var enc = Encoder.init(allocator);
+    defer enc.deinit();
+    try enc.encodeArrayLen(2);
+    try enc.encodeBytes(&bad_output);
+    try enc.encodeBytes(&result.proof);
+    const raw = try enc.toOwnedSlice();
+    defer allocator.free(raw);
+
+    try std.testing.expect(verifyCertifiedVrfRaw(raw, kp.vk, seed) == null);
 }
