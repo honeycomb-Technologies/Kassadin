@@ -46,6 +46,7 @@ pub const LedgerDiff = struct {
     block_hash: HeaderHash,
     consumed: []const UtxoEntry, // UTxOs consumed (full entries for rollback)
     produced: []const UtxoEntry, // UTxOs produced (outputs)
+    deposited_balance_change: ?CoinStateChange = null,
     treasury_balance_change: ?CoinStateChange = null,
     reserves_balance_change: ?CoinStateChange = null,
     fees_balance_change: ?CoinStateChange = null,
@@ -191,6 +192,7 @@ pub const LedgerDB = struct {
     reward_balances_tracked: bool,
     reward_account_network: types.Network,
     pointer_instant_stake_enabled: bool,
+    deposited_balance: Coin,
     treasury_balance: Coin,
     reserves_balance: Coin,
     fees_balance: Coin,
@@ -239,6 +241,7 @@ pub const LedgerDB = struct {
             .reward_balances_tracked = false,
             .reward_account_network = .testnet,
             .pointer_instant_stake_enabled = true,
+            .deposited_balance = 0,
             .treasury_balance = 0,
             .reserves_balance = 0,
             .fees_balance = 0,
@@ -342,6 +345,7 @@ pub const LedgerDB = struct {
             });
         }
 
+        applyCoinStateChange(&self.deposited_balance, diff.deposited_balance_change);
         applyCoinStateChange(&self.treasury_balance, diff.treasury_balance_change);
         applyCoinStateChange(&self.reserves_balance, diff.reserves_balance_change);
         applyCoinStateChange(&self.fees_balance, diff.fees_balance_change);
@@ -426,6 +430,7 @@ pub const LedgerDB = struct {
             // Free diff-owned slices
             freeEntries(self.allocator, diff.consumed);
             freeEntries(self.allocator, diff.produced);
+            rollbackCoinStateChange(&self.deposited_balance, diff.deposited_balance_change);
             rollbackCoinStateChange(&self.treasury_balance, diff.treasury_balance_change);
             rollbackCoinStateChange(&self.reserves_balance, diff.reserves_balance_change);
             rollbackCoinStateChange(&self.fees_balance, diff.fees_balance_change);
@@ -590,6 +595,10 @@ pub const LedgerDB = struct {
         self.reserves_balance = amount;
     }
 
+    pub fn importDepositedBalance(self: *LedgerDB, amount: Coin) void {
+        self.deposited_balance = amount;
+    }
+
     pub fn importFeesBalance(self: *LedgerDB, amount: Coin) void {
         self.fees_balance = amount;
     }
@@ -732,6 +741,10 @@ pub const LedgerDB = struct {
 
     pub fn getReservesBalance(self: *const LedgerDB) Coin {
         return self.reserves_balance;
+    }
+
+    pub fn getDepositedBalance(self: *const LedgerDB) Coin {
+        return self.deposited_balance;
     }
 
     pub fn getFeesBalance(self: *const LedgerDB) Coin {
@@ -1018,6 +1031,7 @@ pub const LedgerDB = struct {
         var stake_pool_delegation_changes: std.ArrayList(StakePoolDelegationChange) = .empty;
         defer stake_pool_delegation_changes.deinit(allocator);
         var treasury_delta: Coin = 0;
+        var reaped_deposits: Coin = 0;
 
         var future_params = self.future_pool_params.iterator();
         while (future_params.next()) |entry| {
@@ -1071,6 +1085,7 @@ pub const LedgerDB = struct {
 
         for (retired_pools.items) |pool| {
             if (self.lookupPoolDeposit(pool)) |deposit| {
+                reaped_deposits += deposit;
                 try pool_changes.append(allocator, .{
                     .pool = pool,
                     .previous = deposit,
@@ -1149,6 +1164,10 @@ pub const LedgerDB = struct {
             .block_hash = block_hash,
             .consumed = try allocator.alloc(UtxoEntry, 0),
             .produced = try allocator.alloc(UtxoEntry, 0),
+            .deposited_balance_change = if (reaped_deposits > 0) .{
+                .previous = self.deposited_balance,
+                .next = self.deposited_balance -| reaped_deposits,
+            } else null,
             .treasury_balance_change = if (treasury_delta > 0) .{
                 .previous = self.treasury_balance,
                 .next = self.treasury_balance + treasury_delta,
@@ -1505,7 +1524,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 8, .big);
+        std.mem.writeInt(u32, buf[0..4], 9, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1723,6 +1742,10 @@ pub const LedgerDB = struct {
 
         // Section 22: Instant-stake pointer resolution enabled
         try file.writeAll(&[_]u8{if (self.pointer_instant_stake_enabled) 1 else 0});
+
+        // Section 23: Deposited pot (`utxosDeposited`)
+        std.mem.writeInt(u64, &buf, self.deposited_balance, .big);
+        try file.writeAll(&buf);
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -1746,7 +1769,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -2061,6 +2084,13 @@ pub const LedgerDB = struct {
             self.pointer_instant_stake_enabled = enabled_buf[0] != 0;
         }
 
+        if (version >= 9) {
+            _ = try file.readAll(&buf);
+            self.deposited_balance = std.mem.readInt(u64, &buf, .big);
+        } else {
+            self.deposited_balance = self.computeDepositBalanceFromMaps();
+        }
+
         try self.rebuildStakeAccounts();
         return true;
     }
@@ -2069,6 +2099,7 @@ pub const LedgerDB = struct {
         self.tip_slot = null;
         self.treasury_balance = 0;
         self.reserves_balance = 0;
+        self.deposited_balance = 0;
         self.fees_balance = 0;
         self.snapshot_fees = 0;
         self.mir_delta_reserves = 0;
@@ -2096,6 +2127,21 @@ pub const LedgerDB = struct {
         self.blocks_made_current_epoch.clearRetainingCapacity();
         self.stake_snapshots.deinit();
         self.stake_snapshots = StakeSnapshots.init(self.allocator);
+    }
+
+    fn computeDepositBalanceFromMaps(self: *const LedgerDB) Coin {
+        var total: Coin = 0;
+
+        var stake_it = self.stake_deposits.valueIterator();
+        while (stake_it.next()) |amount| total += amount.*;
+
+        var pool_it = self.pool_deposits.valueIterator();
+        while (pool_it.next()) |amount| total += amount.*;
+
+        var drep_it = self.drep_deposits.valueIterator();
+        while (drep_it.next()) |amount| total += amount.*;
+
+        return total;
     }
 
     fn isRegisteredRewardCredential(self: *const LedgerDB, credential: Credential) bool {
@@ -2852,6 +2898,10 @@ test "ledgerdb: apply diff tracks and rolls back stake deposits" {
         .block_hash = [_]u8{0x11} ** 32,
         .consumed = try allocator.alloc(UtxoEntry, 0),
         .produced = try allocator.alloc(UtxoEntry, 0),
+        .deposited_balance_change = .{
+            .previous = 0,
+            .next = 2_000_000,
+        },
         .stake_deposit_changes = try allocator.dupe(StakeDepositChange, &[_]StakeDepositChange{
             .{
                 .credential = cred,
@@ -2862,9 +2912,11 @@ test "ledgerdb: apply diff tracks and rolls back stake deposits" {
     });
 
     try std.testing.expectEqual(@as(?Coin, 2_000_000), db.lookupStakeDeposit(cred));
+    try std.testing.expectEqual(@as(Coin, 2_000_000), db.getDepositedBalance());
 
     try db.rollback(1);
     try std.testing.expect(db.lookupStakeDeposit(cred) == null);
+    try std.testing.expectEqual(@as(Coin, 0), db.getDepositedBalance());
 }
 
 test "ledgerdb: apply diff tracks and rolls back reward balances" {
@@ -3188,6 +3240,7 @@ test "ledgerdb: pool reap routes unclaimed refunds to treasury" {
     };
 
     db.importTreasuryBalance(500);
+    db.importDepositedBalance(2_000_000);
     try db.importPoolDeposit(pool, 2_000_000);
     try db.importPoolConfig(pool, .{
         .pledge = 500_000_000,
@@ -3201,6 +3254,7 @@ test "ledgerdb: pool reap routes unclaimed refunds to treasury" {
     try db.applyDiff(diff);
 
     try std.testing.expectEqual(@as(Coin, 2_000_500), db.getTreasuryBalance());
+    try std.testing.expectEqual(@as(Coin, 0), db.getDepositedBalance());
     try std.testing.expect(db.lookupRewardBalance(reward_account) == null);
     try std.testing.expect(db.lookupPoolDeposit(pool) == null);
     try std.testing.expect(db.lookupPoolConfig(pool) == null);
@@ -3209,6 +3263,7 @@ test "ledgerdb: pool reap routes unclaimed refunds to treasury" {
 
     try db.rollback(1);
     try std.testing.expectEqual(@as(Coin, 500), db.getTreasuryBalance());
+    try std.testing.expectEqual(@as(Coin, 2_000_000), db.getDepositedBalance());
     try std.testing.expectEqual(@as(?Coin, 2_000_000), db.lookupPoolDeposit(pool));
     try std.testing.expectEqual(PoolConfig{
         .pledge = 500_000_000,
@@ -3400,6 +3455,7 @@ test "ledgerdb: checkpoint save and load round-trip" {
 
         db.importTreasuryBalance(42_000);
         db.importReservesBalance(99_000);
+        db.importDepositedBalance(333_000_000);
         db.importFeesBalance(500);
         db.importSnapshotFees(100);
         db.setRewardBalancesTracked(true);
@@ -3463,6 +3519,7 @@ test "ledgerdb: checkpoint save and load round-trip" {
 
         try std.testing.expectEqual(@as(Coin, 42_000), db2.getTreasuryBalance());
         try std.testing.expectEqual(@as(Coin, 99_000), db2.getReservesBalance());
+        try std.testing.expectEqual(@as(Coin, 333_000_000), db2.getDepositedBalance());
         try std.testing.expectEqual(@as(Coin, 500), db2.getFeesBalance());
         try std.testing.expectEqual(@as(Coin, 100), db2.getSnapshotFees());
         try std.testing.expect(db2.areRewardBalancesTracked());

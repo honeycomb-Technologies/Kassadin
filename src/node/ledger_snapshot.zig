@@ -622,7 +622,7 @@ fn parseUtxoState(
     }
 
     try dec.skipValue(); // utxosUtxo
-    try dec.skipValue(); // utxosDeposited
+    ledger.importDepositedBalance(try dec.decodeUint());
     ledger.importFeesBalance(try dec.decodeUint());
 
     var i: u64 = 3;

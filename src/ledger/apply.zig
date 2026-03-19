@@ -9,6 +9,7 @@ const rules = @import("rules.zig");
 const LedgerDB = @import("../storage/ledger.zig").LedgerDB;
 const UtxoEntry = @import("../storage/ledger.zig").UtxoEntry;
 const LedgerDiff = @import("../storage/ledger.zig").LedgerDiff;
+const CoinStateChange = @import("../storage/ledger.zig").CoinStateChange;
 const Decoder = @import("../cbor/decoder.zig").Decoder;
 
 pub const SlotNo = types.SlotNo;
@@ -85,11 +86,30 @@ fn buildDiff(
     var cert_effect = try rules.evaluateCertificateEffectWithContext(allocator, tx, ledger, pp, validation_context);
     errdefer cert_effect.deinit(allocator);
 
+    const deposited_balance_change: ?CoinStateChange = blk: {
+        if (cert_effect.deposits == 0 and cert_effect.refunds == 0) break :blk null;
+
+        const previous = ledger.getDepositedBalance();
+        const next_i128 =
+            @as(i128, previous) +
+            @as(i128, cert_effect.deposits) -
+            @as(i128, cert_effect.refunds);
+        if (next_i128 < 0 or next_i128 > std.math.maxInt(Coin)) {
+            return error.InvalidCertificate;
+        }
+
+        break :blk .{
+            .previous = previous,
+            .next = @intCast(next_i128),
+        };
+    };
+
     return .{
         .slot = block.header.slot,
         .block_hash = block.hash(),
         .consumed = consumed,
         .produced = produced,
+        .deposited_balance_change = deposited_balance_change,
         .mir_delta_reserves_change = cert_effect.mir_delta_reserves_change,
         .mir_delta_treasury_change = cert_effect.mir_delta_treasury_change,
         .reward_balance_changes = withdrawal_effect.reward_balance_changes,
