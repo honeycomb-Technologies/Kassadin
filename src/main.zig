@@ -90,6 +90,10 @@ pub fn main() !void {
         var config_file_path: ?[]const u8 = null;
         var topology_path: ?[]const u8 = null;
         var db_path_override: ?[]const u8 = null;
+        var parsed_topology: ?node.topology.Topology = null;
+        defer {
+            if (parsed_topology) |*topology| topology.deinit(std.heap.page_allocator);
+        }
 
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
@@ -183,18 +187,11 @@ pub fn main() !void {
         }
 
         if (topology_path) |path| {
-            var topology = node.topology.parseTopology(std.heap.page_allocator, path) catch |err| {
+            parsed_topology = node.topology.parseTopology(std.heap.page_allocator, path) catch |err| {
                 std.debug.print("Topology parse failed: {}\n", .{err});
                 return;
             };
-            defer topology.deinit(std.heap.page_allocator);
-
-            const peer = node.topology.firstPeer(topology);
-            config.peer_host = std.heap.page_allocator.dupe(u8, peer.host) catch {
-                std.debug.print("Failed to copy topology peer host\n", .{});
-                return;
-            };
-            config.peer_port = peer.port;
+            config.peer_endpoints = parsed_topology.?.peers;
         }
 
         if (db_path_override) |path| {
@@ -281,9 +278,13 @@ pub fn main() !void {
         var config_file_path: ?[]const u8 = null;
         var topology_path: ?[]const u8 = null;
         var max_blocks: u64 = 0;
-        var peer_host: []const u8 = "preprod-node.play.dev.cardano.org";
-        var peer_port: u16 = 3001;
+        const peer_host: []const u8 = "preprod-node.play.dev.cardano.org";
+        const peer_port: u16 = 3001;
         var db_path: []const u8 = "db/preprod";
+        var parsed_topology: ?node.topology.Topology = null;
+        defer {
+            if (parsed_topology) |*topology| topology.deinit(std.heap.page_allocator);
+        }
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--validate-dolos")) {
@@ -355,18 +356,10 @@ pub fn main() !void {
         }
 
         if (topology_path) |path| {
-            var topology = node.topology.parseTopology(std.heap.page_allocator, path) catch |err| {
+            parsed_topology = node.topology.parseTopology(std.heap.page_allocator, path) catch |err| {
                 std.debug.print("Topology parse failed: {}\n", .{err});
                 return;
             };
-            defer topology.deinit(std.heap.page_allocator);
-
-            const peer = node.topology.firstPeer(topology);
-            peer_host = std.heap.page_allocator.dupe(u8, peer.host) catch {
-                std.debug.print("Failed to copy topology peer host\n", .{});
-                return;
-            };
-            peer_port = peer.port;
         }
         node.runtime_control.resetStopRequested();
         node.runtime_control.installSignalHandlers();
@@ -376,6 +369,7 @@ pub fn main() !void {
             db_path,
             peer_host,
             peer_port,
+            if (parsed_topology) |topology| topology.peers else null,
             network.protocol.NetworkMagic.preprod,
             max_blocks,
             shelley_genesis_path,

@@ -14,8 +14,14 @@ const genesis_mod = @import("genesis.zig");
 const ledger_snapshot = @import("ledger_snapshot.zig");
 const runtime_control = @import("runtime_control.zig");
 const snapshot_restore = @import("snapshot_restore.zig");
+const topology_mod = @import("topology.zig");
 const ChainDB = @import("../storage/chaindb.zig").ChainDB;
 const Decoder = @import("../cbor/decoder.zig").Decoder;
+
+const PeerEndpoint = struct {
+    host: []const u8,
+    port: u16,
+};
 
 /// Result of a bootstrap sync operation.
 pub const BootstrapSyncResult = struct {
@@ -52,6 +58,7 @@ pub fn bootstrapSync(
     db_path: []const u8,
     peer_host: []const u8,
     peer_port: u16,
+    peer_endpoints: ?[]const topology_mod.Peer,
     network_magic: u32,
     max_blocks: u64,
     shelley_genesis_path: ?[]const u8,
@@ -229,11 +236,20 @@ pub fn bootstrapSync(
 
         // Step 3: Connect to peer
         if (reconnect_count > 0) {
-            std.debug.print("Reconnecting ({}/{})...\n", .{ reconnect_count, max_reconnects });
+            const reconnect_peer = endpointForAttempt(peer_host, peer_port, peer_endpoints, reconnect_count);
+            std.debug.print(
+                "Reconnecting ({}/{}) via {s}:{}...\n",
+                .{ reconnect_count, max_reconnects, reconnect_peer.host, reconnect_peer.port },
+            );
             std.Thread.sleep(2 * std.time.ns_per_s);
         }
-        std.debug.print("Connecting to {s}:{}...\n", .{ peer_host, peer_port });
-        var peer = peer_mod.Peer.connect(allocator, peer_host, peer_port, network_magic) catch |err| {
+        const endpoint = endpointForAttempt(peer_host, peer_port, peer_endpoints, reconnect_count);
+        if (reconnect_count == 0 and peerListCount(peer_endpoints) > 1) {
+            std.debug.print("Connecting via topology peer {s}:{}...\n", .{ endpoint.host, endpoint.port });
+        } else {
+            std.debug.print("Connecting to {s}:{}...\n", .{ endpoint.host, endpoint.port });
+        }
+        var peer = peer_mod.Peer.connect(allocator, endpoint.host, endpoint.port, network_magic) catch |err| {
             std.debug.print("Connection failed: {}\n", .{err});
             reconnect_count += 1;
             continue :reconnect;
@@ -310,97 +326,97 @@ pub fn bootstrapSync(
                 continue :reconnect;
             };
 
-        switch (msg) {
-            .roll_forward => |rf| {
-                synced += 1;
-                result.headers_synced_forward = synced;
-                result.network_tip_slot = rf.tip.slot;
-                result.network_tip_block = rf.tip.block_no;
+            switch (msg) {
+                .roll_forward => |rf| {
+                    synced += 1;
+                    result.headers_synced_forward = synced;
+                    result.network_tip_slot = rf.tip.slot;
+                    result.network_tip_block = rf.tip.block_no;
 
-                const point = block_mod.pointFromHeader(rf.header_raw) catch {
-                    std.debug.print("  Header {}: failed to derive point\n", .{synced});
-                    continue;
-                };
+                    const point = block_mod.pointFromHeader(rf.header_raw) catch {
+                        std.debug.print("  Header {}: failed to derive point\n", .{synced});
+                        continue;
+                    };
 
-                const block_raw = peer.blockFetchSingle(point) catch |err| {
-                    std.debug.print("  Block fetch error after {} blocks: {} — will reconnect\n", .{ synced, err });
-                    peer.close();
-                    reconnect_count += 1;
-                    continue :reconnect;
-                } orelse {
-                    std.debug.print("  Header {}: no block returned for slot {}\n", .{ synced, point.slot });
-                    continue;
-                };
-                defer allocator.free(block_raw);
+                    const block_raw = peer.blockFetchSingle(point) catch |err| {
+                        std.debug.print("  Block fetch error after {} blocks: {} — will reconnect\n", .{ synced, err });
+                        peer.close();
+                        reconnect_count += 1;
+                        continue :reconnect;
+                    } orelse {
+                        std.debug.print("  Header {}: no block returned for slot {}\n", .{ synced, point.slot });
+                        continue;
+                    };
+                    defer allocator.free(block_raw);
 
-                const block = block_mod.parseBlock(block_raw) catch |err| {
-                    std.debug.print("  Header {}: block parse failed: {}\n", .{ synced, err });
-                    continue;
-                };
+                    const block = block_mod.parseBlock(block_raw) catch |err| {
+                        std.debug.print("  Header {}: block parse failed: {}\n", .{ synced, err });
+                        continue;
+                    };
 
-                result.blocks_parsed += 1;
-                if (validation_client) |*client| {
-                    const primed = try hydrateMissingSnapshotInputs(allocator, client, &chain_db, &block);
-                    result.base_utxos_primed += primed;
-                }
+                    result.blocks_parsed += 1;
+                    if (validation_client) |*client| {
+                        const primed = try hydrateMissingSnapshotInputs(allocator, client, &chain_db, &block);
+                        result.base_utxos_primed += primed;
+                    }
 
-                const add_result = try chain_db.addBlock(
-                    block.hash(),
-                    block_raw,
-                    block.header.slot,
-                    block.header.block_no,
-                    block.header.prev_hash,
-                );
-                switch (add_result) {
-                    .added_to_current_chain => {
-                        result.blocks_added_to_chain += 1;
-                    },
-                    .invalid => {
-                        result.invalid_blocks += 1;
-                        std.debug.print("  Block {}: invalid under current ledger rules\n", .{synced});
-                        break;
-                    },
-                    else => {},
-                }
-
-                var tx_dec = Decoder.init(block.tx_bodies_raw);
-                const num_txs = (tx_dec.decodeArrayLen() catch null) orelse 0;
-                result.txs_parsed += num_txs;
-
-                if (synced <= 5 or synced % 100 == 0) {
-                    std.debug.print("  Block {}: slot={} block={} txs={}\n", .{
-                        synced,
+                    const add_result = try chain_db.addBlock(
+                        block.hash(),
+                        block_raw,
                         block.header.slot,
                         block.header.block_no,
-                        num_txs,
-                    });
-                }
-            },
-            .await_reply => {
-                if (runtime_control.stopRequested()) {
-                    result.stopped_by_signal = true;
+                        block.header.prev_hash,
+                    );
+                    switch (add_result) {
+                        .added_to_current_chain => {
+                            result.blocks_added_to_chain += 1;
+                        },
+                        .invalid => {
+                            result.invalid_blocks += 1;
+                            std.debug.print("  Block {}: invalid under current ledger rules\n", .{synced});
+                            break;
+                        },
+                        else => {},
+                    }
+
+                    var tx_dec = Decoder.init(block.tx_bodies_raw);
+                    const num_txs = (tx_dec.decodeArrayLen() catch null) orelse 0;
+                    result.txs_parsed += num_txs;
+
+                    if (synced <= 5 or synced % 100 == 0) {
+                        std.debug.print("  Block {}: slot={} block={} txs={}\n", .{
+                            synced,
+                            block.header.slot,
+                            block.header.block_no,
+                            num_txs,
+                        });
+                    }
+                },
+                .await_reply => {
+                    if (runtime_control.stopRequested()) {
+                        result.stopped_by_signal = true;
+                        peer.close();
+                        break :reconnect;
+                    }
+                    std.debug.print("At tip! Synced {} blocks forward.\n", .{synced});
+                    const cookie: u16 = @truncate(synced);
+                    _ = peer.keepAlivePing(cookie) catch {};
+                    std.Thread.sleep(1 * std.time.ns_per_s);
+                },
+                .roll_backward => |rb| {
+                    result.rollbacks += 1;
+                    _ = chain_db.rollbackToPoint(rb.point) catch 0;
+                    std.debug.print("  Rollback\n", .{});
+                },
+                else => {
                     peer.close();
                     break :reconnect;
-                }
-                std.debug.print("At tip! Synced {} blocks forward.\n", .{synced});
-                const cookie: u16 = @truncate(synced);
-                _ = peer.keepAlivePing(cookie) catch {};
-                std.Thread.sleep(1 * std.time.ns_per_s);
-            },
-            .roll_backward => |rb| {
-                result.rollbacks += 1;
-                _ = chain_db.rollbackToPoint(rb.point) catch 0;
-                std.debug.print("  Rollback\n", .{});
-            },
-            else => {
-                peer.close();
-                break :reconnect;
-            },
+                },
+            }
         }
-    }
-    // Inner loop finished normally (hit max) — exit outer loop too
-    peer.close();
-    break;
+        // Inner loop finished normally (hit max) — exit outer loop too
+        peer.close();
+        break;
     }
 
     return result;
@@ -468,4 +484,33 @@ fn hydrateMissingSnapshotInputs(
 
 fn networkFromMagic(network_magic: u32) types.Network {
     return if (network_magic == protocol.NetworkMagic.mainnet) .mainnet else .testnet;
+}
+
+fn peerListCount(peer_endpoints: ?[]const topology_mod.Peer) usize {
+    if (peer_endpoints) |peers| {
+        if (peers.len > 0) return peers.len;
+    }
+    return 1;
+}
+
+fn endpointForAttempt(
+    peer_host: []const u8,
+    peer_port: u16,
+    peer_endpoints: ?[]const topology_mod.Peer,
+    attempt: usize,
+) PeerEndpoint {
+    if (peer_endpoints) |peers| {
+        if (peers.len > 0) {
+            const peer = peers[attempt % peers.len];
+            return .{
+                .host = peer.host,
+                .port = peer.port,
+            };
+        }
+    }
+
+    return .{
+        .host = peer_host,
+        .port = peer_port,
+    };
 }

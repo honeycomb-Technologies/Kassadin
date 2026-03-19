@@ -499,7 +499,7 @@ headers from ouroboros-consensus golden data.
 - [x] `bootstrap-sync --validate-dolos` remains available for comparison/fallback
 - [x] Load runtime ledger state from restored snapshot during normal `sync`
 - [x] Load Shelley genesis protocol params into bootstrap/runtime validation paths
-- [x] CLI topology parser loads relay peers from legacy `Producers` and modern `bootstrapPeers` / `accessPoints` files
+- [x] CLI topology parser loads relay peers from legacy `Producers` and modern `bootstrapPeers` / `accessPoints` files, and runtime `sync` / `bootstrap-sync` now rotate through the full resolved relay list on connect/reconnect instead of pinning the first peer
 - [x] `sync` and `bootstrap-sync` can run until stopped, with bounded `--max-headers` / `--max-blocks` still available for tests
 - [x] Load runtime ledger state from genesis during normal `sync` for Byron initial UTxO state
 - [x] Empty-chain runtime path seeds Byron genesis UTxOs and enables local validation before `FindIntersectGenesis`
@@ -526,7 +526,7 @@ headers from ouroboros-consensus golden data.
 ### 7.3 Full Integration
 - [x] Shelley genesis config parsing (real mainnet genesis verified)
 - [x] CLI with sync and bootstrap commands
-- [ ] P2P topology configuration
+- [x] P2P topology configuration
 - [ ] Logging system
 - [ ] Graceful shutdown (clean signal exit now works; final shutdown snapshot/checkpoint persistence still pending)
 

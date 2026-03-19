@@ -7,6 +7,7 @@ const chunk_reader_mod = @import("chunk_reader.zig");
 const ledger_snapshot = @import("ledger_snapshot.zig");
 const runtime_control = @import("runtime_control.zig");
 const snapshot_restore = @import("snapshot_restore.zig");
+const topology_mod = @import("topology.zig");
 const block_mod = @import("../ledger/block.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
 const rewards_mod = @import("../ledger/rewards.zig");
@@ -25,6 +26,9 @@ pub const RunConfig = struct {
     /// Peer to sync from (hostname:port for N2N, or socket path for N2C).
     peer_host: []const u8,
     peer_port: u16,
+    /// Optional relay list from topology JSON. When present, runtime rotates
+    /// through these peers on connect/reconnect instead of pinning one relay.
+    peer_endpoints: ?[]const topology_mod.Peer = null,
     /// Database path for chain storage.
     db_path: []const u8,
     /// Genesis configuration file paths.
@@ -90,6 +94,11 @@ const RuntimeSnapshot = struct {
     fn deinit(self: *RuntimeSnapshot, allocator: Allocator) void {
         self.layout.deinit(allocator);
     }
+};
+
+const PeerEndpoint = struct {
+    host: []const u8,
+    port: u16,
 };
 
 fn checkpointPath(allocator: Allocator, db_path: []const u8) ![]u8 {
@@ -186,6 +195,111 @@ fn newestFirstPoints(allocator: Allocator, points: []const Point) ![]Point {
         reversed[points.len - 1 - idx] = point;
     }
     return reversed;
+}
+
+fn peerCount(config: RunConfig) usize {
+    if (config.peer_endpoints) |peers| {
+        if (peers.len > 0) return peers.len;
+    }
+    return 1;
+}
+
+fn peerForAttempt(config: RunConfig, attempt: usize) PeerEndpoint {
+    if (config.peer_endpoints) |peers| {
+        if (peers.len > 0) {
+            const peer = peers[attempt % peers.len];
+            return .{
+                .host = peer.host,
+                .port = peer.port,
+            };
+        }
+    }
+
+    return .{
+        .host = config.peer_host,
+        .port = config.peer_port,
+    };
+}
+
+fn currentTipPoint(chain_db: *const ChainDB) ?Point {
+    const tip = chain_db.getTip();
+    if (tip.slot == 0 and tip.block_no == 0) return null;
+    return .{
+        .slot = tip.slot,
+        .hash = tip.hash,
+    };
+}
+
+fn performInitialIntersect(
+    allocator: Allocator,
+    client: *sync_mod.SyncClient,
+    runtime_snapshot: ?RuntimeSnapshot,
+    resume_points: *std.ArrayList(Point),
+    db_path: []const u8,
+    result: *RunResult,
+) !void {
+    if (runtime_snapshot) |snapshot| {
+        const intersect = try client.findIntersect(&[_]Point{snapshot.point});
+
+        switch (intersect) {
+            .intersect_found => {
+                result.resumed_from_snapshot = true;
+            },
+            .intersect_not_found => {
+                result.errors += 1;
+                return error.IntersectNotFound;
+            },
+            else => return error.UnexpectedMessage,
+        }
+        return;
+    }
+
+    if (resume_points.items.len > 0) {
+        const candidates = try newestFirstPoints(allocator, resume_points.items);
+        defer allocator.free(candidates);
+
+        const intersect = client.findIntersect(candidates) catch {
+            result.errors += 1;
+            resume_points.clearRetainingCapacity();
+            saveResumePoints(allocator, db_path, resume_points.items) catch {};
+            _ = try client.findIntersectGenesis();
+            return;
+        };
+
+        switch (intersect) {
+            .intersect_found => {
+                result.resumed_from_checkpoint = true;
+            },
+            .intersect_not_found => {
+                resume_points.clearRetainingCapacity();
+                saveResumePoints(allocator, db_path, resume_points.items) catch {};
+                _ = try client.findIntersectGenesis();
+            },
+            else => {
+                _ = try client.findIntersectGenesis();
+            },
+        }
+        return;
+    }
+
+    _ = try client.findIntersectGenesis();
+}
+
+fn performReconnectIntersect(
+    client: *sync_mod.SyncClient,
+    chain_db: *const ChainDB,
+) !void {
+    if (currentTipPoint(chain_db)) |point| {
+        const intersect = try client.findIntersect(&[_]Point{point});
+        switch (intersect) {
+            .intersect_found => {},
+            .intersect_not_found => return error.IntersectNotFound,
+            else => return error.UnexpectedMessage,
+        }
+        return;
+    }
+
+    _ = try client.findIntersectGenesis();
 }
 
 fn discoverRuntimeSnapshot(allocator: Allocator, db_path: []const u8) !?RuntimeSnapshot {
@@ -435,179 +549,209 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     defer resume_points.deinit(allocator);
     try resume_points.appendSlice(allocator, loaded_points);
 
-    // Connect to peer
-    var client = try sync_mod.SyncClient.connect(
-        allocator,
-        config.peer_host,
-        config.peer_port,
-        config.network_magic,
-    );
-    defer client.close();
-
-    // Prefer a restored snapshot anchor when present. Otherwise resume from a
-    // recent checkpoint if available, else start from genesis.
-    if (runtime_snapshot) |snapshot| {
-        const intersect = client.findIntersect(&[_]Point{snapshot.point}) catch {
-            result.errors += 1;
-            return error.IntersectFailed;
-        };
-
-        switch (intersect) {
-            .intersect_found => {
-                result.resumed_from_snapshot = true;
-            },
-            .intersect_not_found => {
-                result.errors += 1;
-                return error.IntersectNotFound;
-            },
-            else => return error.UnexpectedMessage,
-        }
-    } else if (resume_points.items.len > 0) {
-        const candidates = try newestFirstPoints(allocator, resume_points.items);
-        defer allocator.free(candidates);
-
-        const intersect = client.findIntersect(candidates) catch blk: {
-            result.errors += 1;
-            resume_points.clearRetainingCapacity();
-            saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
-            break :blk try client.findIntersectGenesis();
-        };
-
-        switch (intersect) {
-            .intersect_found => {
-                result.resumed_from_checkpoint = true;
-            },
-            .intersect_not_found => {
-                resume_points.clearRetainingCapacity();
-                saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
-                _ = try client.findIntersectGenesis();
-            },
-            else => {
-                _ = try client.findIntersectGenesis();
-            },
-        }
-    } else {
-        _ = try client.findIntersectGenesis();
-    }
-
-    // Sync loop
     const max = if (config.max_headers == 0) std.math.maxInt(u64) else config.max_headers;
 
-    var last_keepalive = std.time.timestamp();
+    var initial_intersect_done = false;
+    var reconnect_count: u32 = 0;
+    const max_reconnects: u32 = 50;
 
-    while (result.headers_synced < max) {
+    reconnect: while (reconnect_count <= max_reconnects and result.headers_synced < max) {
         if (runtime_control.stopRequested()) {
             result.stopped_by_signal = true;
             break;
         }
 
-        // Send keep-alive every ~30s to prevent relay timeout (Haskell StServer = 60s)
-        const now = std.time.timestamp();
-        if (now - last_keepalive >= 30) {
-            client.keepAlive() catch {};
-            last_keepalive = now;
+        const endpoint = peerForAttempt(config, reconnect_count);
+        if (reconnect_count > 0) {
+            std.debug.print(
+                "Reconnecting ({}/{}) via {s}:{}...\n",
+                .{ reconnect_count, max_reconnects, endpoint.host, endpoint.port },
+            );
+            std.Thread.sleep(2 * std.time.ns_per_s);
+        } else if (peerCount(config) > 1) {
+            std.debug.print("Connecting via topology peer {s}:{}...\n", .{ endpoint.host, endpoint.port });
         }
 
-        const msg = client.requestNext() catch {
+        var client = sync_mod.SyncClient.connect(
+            allocator,
+            endpoint.host,
+            endpoint.port,
+            config.network_magic,
+        ) catch |err| {
             result.errors += 1;
-            break;
+            std.debug.print("Connection failed to {s}:{}: {}\n", .{ endpoint.host, endpoint.port, err });
+            reconnect_count += 1;
+            continue :reconnect;
         };
+        var client_closed = false;
+        defer if (!client_closed) client.close();
 
-        switch (msg) {
-            .roll_forward => |rf| {
-                result.headers_synced += 1;
-
-                const point = block_mod.pointFromHeader(rf.header_raw) catch {
+        if (!initial_intersect_done) {
+            performInitialIntersect(
+                allocator,
+                &client,
+                runtime_snapshot,
+                &resume_points,
+                config.db_path,
+                &result,
+            ) catch |err| switch (err) {
+                error.IntersectNotFound => {
                     result.errors += 1;
-                    continue;
-                };
-
-                const block_raw = client.fetchBlock(point) catch {
+                    return err;
+                },
+                else => {
                     result.errors += 1;
-                    continue;
-                } orelse {
-                    result.errors += 1;
-                    continue;
-                };
-                defer allocator.free(block_raw);
-                result.blocks_fetched += 1;
+                    client.close();
+                    client_closed = true;
+                    reconnect_count += 1;
+                    continue :reconnect;
+                },
+            };
+            initial_intersect_done = true;
+        } else {
+            performReconnectIntersect(&client, &chain_db) catch |err| {
+                result.errors += 1;
+                std.debug.print("Reconnect intersect failed via {s}:{}: {}\n", .{ endpoint.host, endpoint.port, err });
+                client.close();
+                client_closed = true;
+                reconnect_count += 1;
+                continue :reconnect;
+            };
+        }
 
-                const block = block_mod.parseBlock(block_raw) catch {
-                    result.errors += 1;
-                    continue;
-                };
+        var last_keepalive = std.time.timestamp();
 
-                var switched_shelley_params = false;
-                const previous_protocol_params = chain_db.getProtocolParams();
-                if (pending_shelley_protocol_switch and block.era != .byron) {
-                    if (deferred_shelley_protocol_params) |protocol_params| {
-                        chain_db.setProtocolParams(protocol_params);
-                        switched_shelley_params = true;
+        while (result.headers_synced < max) {
+            if (runtime_control.stopRequested()) {
+                result.stopped_by_signal = true;
+                break :reconnect;
+            }
+
+            // Send keep-alive every ~30s to prevent relay timeout (Haskell StServer = 60s)
+            const now = std.time.timestamp();
+            if (now - last_keepalive >= 30) {
+                client.keepAlive() catch {};
+                last_keepalive = now;
+            }
+
+            const msg = client.requestNext() catch |err| {
+                result.errors += 1;
+                std.debug.print("Sync error via {s}:{}: {} — rotating peer\n", .{ endpoint.host, endpoint.port, err });
+                client.close();
+                client_closed = true;
+                reconnect_count += 1;
+                continue :reconnect;
+            };
+
+            switch (msg) {
+                .roll_forward => |rf| {
+                    result.headers_synced += 1;
+
+                    const point = block_mod.pointFromHeader(rf.header_raw) catch {
+                        result.errors += 1;
+                        continue;
+                    };
+
+                    const block_raw = client.fetchBlock(point) catch |err| {
+                        result.errors += 1;
+                        std.debug.print("Block fetch error via {s}:{}: {} — rotating peer\n", .{ endpoint.host, endpoint.port, err });
+                        client.close();
+                        client_closed = true;
+                        reconnect_count += 1;
+                        continue :reconnect;
+                    } orelse {
+                        result.errors += 1;
+                        continue;
+                    };
+                    defer allocator.free(block_raw);
+                    result.blocks_fetched += 1;
+
+                    const block = block_mod.parseBlock(block_raw) catch {
+                        result.errors += 1;
+                        continue;
+                    };
+
+                    var switched_shelley_params = false;
+                    const previous_protocol_params = chain_db.getProtocolParams();
+                    if (pending_shelley_protocol_switch and block.era != .byron) {
+                        if (deferred_shelley_protocol_params) |protocol_params| {
+                            chain_db.setProtocolParams(protocol_params);
+                            switched_shelley_params = true;
+                        }
+                        pending_shelley_protocol_switch = false;
                     }
-                    pending_shelley_protocol_switch = false;
-                }
 
-                const add_result = chain_db.addBlock(
-                    block.hash(),
-                    block_raw,
-                    block.header.slot,
-                    block.header.block_no,
-                    block.header.prev_hash,
-                ) catch {
-                    if (switched_shelley_params) {
-                        chain_db.setProtocolParams(previous_protocol_params);
-                        pending_shelley_protocol_switch = true;
-                    }
-                    result.errors += 1;
-                    continue;
-                };
-
-                switch (add_result) {
-                    .added_to_current_chain => {
-                        result.blocks_added_to_chain += 1;
-                        try pushResumePoint(&resume_points, allocator, point);
-                        saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
-                    },
-                    .invalid => {
+                    const add_result = chain_db.addBlock(
+                        block.hash(),
+                        block_raw,
+                        block.header.slot,
+                        block.header.block_no,
+                        block.header.prev_hash,
+                    ) catch {
                         if (switched_shelley_params) {
                             chain_db.setProtocolParams(previous_protocol_params);
                             pending_shelley_protocol_switch = true;
                         }
-                        result.invalid_blocks += 1;
                         result.errors += 1;
-                        break;
-                    },
-                    else => {},
-                }
+                        continue;
+                    };
 
-                const tip = chain_db.getTip();
-                result.tip_slot = tip.slot;
-                result.tip_block_no = tip.block_no;
-            },
-            .await_reply => {
-                if (runtime_control.stopRequested()) {
-                    result.stopped_by_signal = true;
-                    break;
-                }
-                // At tip — send keep-alive and wait
-                client.keepAlive() catch {};
-                std.Thread.sleep(1 * std.time.ns_per_s);
-            },
-            .roll_backward => |rb| {
-                result.rollbacks += 1;
-                _ = chain_db.rollbackToPoint(rb.point) catch blk: {
-                    result.errors += 1;
-                    break :blk 0;
-                };
-                truncateResumePoints(&resume_points, rb.point);
-                saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
+                    switch (add_result) {
+                        .added_to_current_chain => {
+                            result.blocks_added_to_chain += 1;
+                            try pushResumePoint(&resume_points, allocator, point);
+                            saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
+                        },
+                        .invalid => {
+                            if (switched_shelley_params) {
+                                chain_db.setProtocolParams(previous_protocol_params);
+                                pending_shelley_protocol_switch = true;
+                            }
+                            result.invalid_blocks += 1;
+                            result.errors += 1;
+                            break :reconnect;
+                        },
+                        else => {},
+                    }
 
-                const tip = chain_db.getTip();
-                result.tip_slot = tip.slot;
-                result.tip_block_no = tip.block_no;
-            },
-            else => break,
+                    const tip = chain_db.getTip();
+                    result.tip_slot = tip.slot;
+                    result.tip_block_no = tip.block_no;
+                },
+                .await_reply => {
+                    if (runtime_control.stopRequested()) {
+                        result.stopped_by_signal = true;
+                        break :reconnect;
+                    }
+                    // At tip — send keep-alive and wait
+                    client.keepAlive() catch {};
+                    std.Thread.sleep(1 * std.time.ns_per_s);
+                },
+                .roll_backward => |rb| {
+                    result.rollbacks += 1;
+                    _ = chain_db.rollbackToPoint(rb.point) catch blk: {
+                        result.errors += 1;
+                        break :blk 0;
+                    };
+                    truncateResumePoints(&resume_points, rb.point);
+                    saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
+
+                    const tip = chain_db.getTip();
+                    result.tip_slot = tip.slot;
+                    result.tip_block_no = tip.block_no;
+                },
+                else => {
+                    client.close();
+                    client_closed = true;
+                    reconnect_count += 1;
+                    continue :reconnect;
+                },
+            }
         }
+
+        client.close();
+        client_closed = true;
+        break;
     }
 
     return result;
@@ -719,4 +863,34 @@ test "runner: resume checkpoint round-trip" {
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
     try std.testing.expectEqual(points[0].slot, loaded[0].slot);
     try std.testing.expectEqualSlices(u8, &points[1].hash, &loaded[1].hash);
+}
+
+test "runner: topology peers rotate by reconnect attempt" {
+    var host_a = [_]u8{'a'};
+    var host_b = [_]u8{'b'};
+    const peers = [_]topology_mod.Peer{
+        .{ .host = host_a[0..], .port = 1111, .source = .bootstrap_peer },
+        .{ .host = host_b[0..], .port = 2222, .source = .public_root },
+    };
+    const config = RunConfig{
+        .network_magic = protocol.NetworkMagic.preprod,
+        .peer_host = "fallback.example",
+        .peer_port = 3001,
+        .peer_endpoints = peers[0..],
+        .db_path = "/tmp/kassadin-runner-peer-rotation",
+        .byron_genesis_path = null,
+        .shelley_genesis_path = null,
+        .max_headers = 0,
+    };
+
+    const first = peerForAttempt(config, 0);
+    const second = peerForAttempt(config, 1);
+    const third = peerForAttempt(config, 2);
+
+    try std.testing.expectEqualStrings("a", first.host);
+    try std.testing.expectEqual(@as(u16, 1111), first.port);
+    try std.testing.expectEqualStrings("b", second.host);
+    try std.testing.expectEqual(@as(u16, 2222), second.port);
+    try std.testing.expectEqualStrings("a", third.host);
+    try std.testing.expectEqual(@as(usize, 2), peerCount(config));
 }
