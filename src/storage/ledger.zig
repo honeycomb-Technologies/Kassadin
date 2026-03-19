@@ -210,6 +210,9 @@ pub const LedgerDB = struct {
 
     /// Current UTxO set (in-memory for now — LMDB for production).
     utxo_set: std.AutoHashMap(TxIn, UtxoEntry),
+    // Canonical follower-side account view for validation and stake snapshot logic.
+    // Legacy split maps are still persisted and used by some epoch helpers, but
+    // account-local lookups should flow through this map.
     stake_accounts: std.AutoHashMap(Credential, StakeAccountState),
     stake_account_pointers: std.AutoHashMap(Credential, Pointer),
     stake_credentials_by_pointer: std.AutoHashMap(Pointer, Credential),
@@ -386,9 +389,11 @@ pub const LedgerDB = struct {
         applyDeltaCoinStateChange(&self.mir_delta_reserves, diff.mir_delta_reserves_change);
         applyDeltaCoinStateChange(&self.mir_delta_treasury, diff.mir_delta_treasury_change);
         applyRewardBalanceChanges(&self.reward_balances, diff.reward_balance_changes);
+        try self.syncStakeAccountRewardBalanceChanges(diff.reward_balance_changes, false);
         applyMIRRewardChanges(&self.mir_reserves, diff.mir_reserves_changes);
         applyMIRRewardChanges(&self.mir_treasury, diff.mir_treasury_changes);
         applyStakeDepositChanges(&self.stake_deposits, diff.stake_deposit_changes);
+        try self.syncStakeAccountDepositChanges(diff.stake_deposit_changes, false);
         applyPoolDepositChanges(&self.pool_deposits, diff.pool_deposit_changes);
         applyPoolConfigChanges(&self.pool_configs, diff.pool_config_changes);
         applyFuturePoolParamChanges(&self.future_pool_params, diff.future_pool_param_changes);
@@ -400,11 +405,13 @@ pub const LedgerDB = struct {
         applyFutureGenesisDelegationChanges(&self.future_genesis_delegations, diff.future_genesis_delegation_changes);
         applyDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
         applyStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
+        try self.syncStakeAccountPoolDelegationChanges(diff.stake_pool_delegation_changes, false);
         applyDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
+        try self.syncStakeAccountDRepDelegationChanges(diff.drep_delegation_changes, false);
         applyStakePointerChanges(&self.stake_account_pointers, &self.stake_credentials_by_pointer, diff.stake_pointer_changes);
+        try self.syncStakeAccountPointerChanges(diff.stake_pointer_changes, false);
         applyBlocksMadeChanges(&self.blocks_made_previous_epoch, diff.previous_epoch_blocks_made_changes);
         applyBlocksMadeChanges(&self.blocks_made_current_epoch, diff.current_epoch_blocks_made_changes);
-        try self.rebuildStakeAccounts();
 
         // Store diff for rollback (we take ownership of consumed/produced slices)
         try self.diffs.append(self.allocator, diff);
@@ -475,12 +482,14 @@ pub const LedgerDB = struct {
             rollbackDeltaCoinStateChange(&self.mir_delta_reserves, diff.mir_delta_reserves_change);
             rollbackDeltaCoinStateChange(&self.mir_delta_treasury, diff.mir_delta_treasury_change);
             rollbackRewardBalanceChanges(&self.reward_balances, diff.reward_balance_changes);
+            try self.syncStakeAccountRewardBalanceChanges(diff.reward_balance_changes, true);
             rollbackMIRRewardChanges(&self.mir_reserves, diff.mir_reserves_changes);
             rollbackMIRRewardChanges(&self.mir_treasury, diff.mir_treasury_changes);
             freeRewardChanges(self.allocator, diff.reward_balance_changes);
             freeMIRRewardChanges(self.allocator, diff.mir_reserves_changes);
             freeMIRRewardChanges(self.allocator, diff.mir_treasury_changes);
             rollbackStakeDepositChanges(&self.stake_deposits, diff.stake_deposit_changes);
+            try self.syncStakeAccountDepositChanges(diff.stake_deposit_changes, true);
             rollbackPoolDepositChanges(&self.pool_deposits, diff.pool_deposit_changes);
             rollbackPoolConfigChanges(&self.pool_configs, diff.pool_config_changes);
             rollbackFuturePoolParamChanges(&self.future_pool_params, diff.future_pool_param_changes);
@@ -492,8 +501,11 @@ pub const LedgerDB = struct {
             rollbackFutureGenesisDelegationChanges(&self.future_genesis_delegations, diff.future_genesis_delegation_changes);
             rollbackDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
             rollbackStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
+            try self.syncStakeAccountPoolDelegationChanges(diff.stake_pool_delegation_changes, true);
             rollbackDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
+            try self.syncStakeAccountDRepDelegationChanges(diff.drep_delegation_changes, true);
             rollbackStakePointerChanges(&self.stake_account_pointers, &self.stake_credentials_by_pointer, diff.stake_pointer_changes);
+            try self.syncStakeAccountPointerChanges(diff.stake_pointer_changes, true);
             rollbackBlocksMadeChanges(&self.blocks_made_previous_epoch, diff.previous_epoch_blocks_made_changes);
             rollbackBlocksMadeChanges(&self.blocks_made_current_epoch, diff.current_epoch_blocks_made_changes);
             freeStakeChanges(self.allocator, diff.stake_deposit_changes);
@@ -609,6 +621,8 @@ pub const LedgerDB = struct {
                 _ = self.stake_credentials_by_pointer.remove(removed.value);
             }
         }
+
+        self.pruneStakeAccountIfDormant(account.credential);
     }
 
     pub fn importStakeDeposit(self: *LedgerDB, credential: Credential, deposit: Coin) !void {
@@ -624,8 +638,10 @@ pub const LedgerDB = struct {
 
     pub fn importRewardBalance(self: *LedgerDB, account: RewardAccount, amount: Coin) !void {
         try self.reward_balances.put(account, amount);
-        try self.setStakeAccountRegistered(account.credential, true);
-        try self.setStakeAccountRewardBalance(account.credential, amount);
+        if (account.network == self.reward_account_network) {
+            try self.setStakeAccountRegistered(account.credential, true);
+            try self.setStakeAccountRewardBalance(account.credential, amount);
+        }
     }
 
     pub fn importTreasuryBalance(self: *LedgerDB, amount: Coin) void {
@@ -756,29 +772,30 @@ pub const LedgerDB = struct {
     }
 
     pub fn lookupStakeDeposit(self: *const LedgerDB, credential: Credential) ?Coin {
-        if (self.stake_accounts.get(credential)) |state| {
-            if (!state.registered) return null;
-            return state.deposit;
-        }
-        return self.stake_deposits.get(credential);
+        const state = self.stake_accounts.get(credential) orelse return null;
+        if (!state.registered) return null;
+        return state.deposit;
     }
 
     pub fn lookupRewardBalance(self: *const LedgerDB, account: RewardAccount) ?Coin {
         if (account.network != self.reward_account_network) return self.reward_balances.get(account);
-        if (self.stake_accounts.get(account.credential)) |state| {
-            if (!state.registered) return null;
-            return state.reward_balance;
-        }
-        return self.reward_balances.get(account);
+        const state = self.stake_accounts.get(account.credential) orelse return null;
+        if (!state.registered) return null;
+        return state.reward_balance;
     }
 
     pub fn lookupStakePointer(self: *const LedgerDB, credential: Credential) ?Pointer {
         if (self.stake_accounts.get(credential)) |state| return state.pointer;
-        return self.stake_account_pointers.get(credential);
+        return null;
     }
 
     pub fn resolveStakePointer(self: *const LedgerDB, pointer: Pointer) ?Credential {
-        return self.stake_credentials_by_pointer.get(pointer);
+        const credential = self.stake_credentials_by_pointer.get(pointer) orelse return null;
+        const state = self.stake_accounts.get(credential) orelse return null;
+        if (!state.registered) return null;
+        const account_pointer = state.pointer orelse return null;
+        if (!std.meta.eql(account_pointer, pointer)) return null;
+        return credential;
     }
 
     pub fn lookupMirReward(
@@ -963,17 +980,13 @@ pub const LedgerDB = struct {
     }
 
     pub fn lookupStakePoolDelegation(self: *const LedgerDB, credential: Credential) ?KeyHash {
-        if (self.stake_accounts.get(credential)) |state| {
-            return state.stake_pool_delegation;
-        }
-        return self.stake_pool_delegations.get(credential);
+        if (self.stake_accounts.get(credential)) |state| return state.stake_pool_delegation;
+        return null;
     }
 
     pub fn lookupDRepDelegation(self: *const LedgerDB, credential: Credential) ?DRep {
-        if (self.stake_accounts.get(credential)) |state| {
-            return state.drep_delegation;
-        }
-        return self.drep_delegations.get(credential);
+        if (self.stake_accounts.get(credential)) |state| return state.drep_delegation;
+        return null;
     }
 
     pub fn lookupPreviousEpochBlocksMade(self: *const LedgerDB, pool: KeyHash) ?u64 {
@@ -1006,8 +1019,10 @@ pub const LedgerDB = struct {
 
     pub fn setRewardBalance(self: *LedgerDB, account: RewardAccount, amount: Coin) !void {
         try self.reward_balances.put(account, amount);
-        try self.setStakeAccountRegistered(account.credential, true);
-        try self.setStakeAccountRewardBalance(account.credential, amount);
+        if (account.network == self.reward_account_network) {
+            try self.setStakeAccountRegistered(account.credential, true);
+            try self.setStakeAccountRewardBalance(account.credential, amount);
+        }
     }
 
     pub fn isStakeCredentialRegistered(self: *const LedgerDB, credential: Credential) bool {
@@ -2481,40 +2496,180 @@ pub const LedgerDB = struct {
         return @intFromEnum(self.reward_account_network);
     }
 
-    fn setStakeAccountRegistered(self: *LedgerDB, credential: Credential, registered: bool) !void {
-        var entry = try self.stake_accounts.getOrPut(credential);
+    fn ensureStakeAccount(self: *LedgerDB, credential: Credential) !*StakeAccountState {
+        const entry = try self.stake_accounts.getOrPut(credential);
         if (!entry.found_existing) entry.value_ptr.* = .{};
-        entry.value_ptr.registered = registered;
+        return entry.value_ptr;
+    }
+
+    fn pruneStakeAccountIfDormant(self: *LedgerDB, credential: Credential) void {
+        const state = self.stake_accounts.get(credential) orelse return;
+        if (state.registered) return;
+        if (state.reward_balance != 0) return;
+        if (state.deposit != 0) return;
+        if (state.stake_pool_delegation != null) return;
+        if (state.drep_delegation != null) return;
+        if (state.pointer != null) return;
+        _ = self.stake_accounts.remove(credential);
+    }
+
+    fn setStakeAccountRegistered(self: *LedgerDB, credential: Credential, registered: bool) !void {
+        const state = try self.ensureStakeAccount(credential);
+        state.registered = registered;
+        self.pruneStakeAccountIfDormant(credential);
     }
 
     fn setStakeAccountRewardBalance(self: *LedgerDB, credential: Credential, amount: Coin) !void {
-        var entry = try self.stake_accounts.getOrPut(credential);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
-        entry.value_ptr.reward_balance = amount;
+        const state = try self.ensureStakeAccount(credential);
+        state.reward_balance = amount;
+        self.pruneStakeAccountIfDormant(credential);
     }
 
     fn setStakeAccountDeposit(self: *LedgerDB, credential: Credential, deposit: Coin) !void {
-        var entry = try self.stake_accounts.getOrPut(credential);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
-        entry.value_ptr.deposit = deposit;
+        const state = try self.ensureStakeAccount(credential);
+        state.deposit = deposit;
+        self.pruneStakeAccountIfDormant(credential);
     }
 
     fn setStakeAccountPoolDelegation(self: *LedgerDB, credential: Credential, pool: ?KeyHash) !void {
-        var entry = try self.stake_accounts.getOrPut(credential);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
-        entry.value_ptr.stake_pool_delegation = pool;
+        const state = try self.ensureStakeAccount(credential);
+        state.stake_pool_delegation = pool;
+        self.pruneStakeAccountIfDormant(credential);
     }
 
     fn setStakeAccountDRepDelegation(self: *LedgerDB, credential: Credential, drep: ?DRep) !void {
-        var entry = try self.stake_accounts.getOrPut(credential);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
-        entry.value_ptr.drep_delegation = drep;
+        const state = try self.ensureStakeAccount(credential);
+        state.drep_delegation = drep;
+        self.pruneStakeAccountIfDormant(credential);
     }
 
     fn setStakeAccountPointer(self: *LedgerDB, credential: Credential, pointer: ?Pointer) !void {
-        var entry = try self.stake_accounts.getOrPut(credential);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
-        entry.value_ptr.pointer = pointer;
+        const state = try self.ensureStakeAccount(credential);
+        state.pointer = pointer;
+        self.pruneStakeAccountIfDormant(credential);
+    }
+
+    fn syncStakeAccountRewardBalance(self: *LedgerDB, account: RewardAccount, balance: ?Coin) !void {
+        if (account.network != self.reward_account_network) return;
+
+        if (balance) |amount| {
+            const state = try self.ensureStakeAccount(account.credential);
+            state.registered = true;
+            state.reward_balance = amount;
+        } else if (self.stake_accounts.getPtr(account.credential)) |state| {
+            state.reward_balance = 0;
+            self.pruneStakeAccountIfDormant(account.credential);
+        }
+    }
+
+    fn syncStakeAccountDeposit(self: *LedgerDB, credential: Credential, deposit: ?Coin) !void {
+        if (deposit) |amount| {
+            const state = try self.ensureStakeAccount(credential);
+            state.registered = true;
+            state.deposit = amount;
+        } else if (self.stake_accounts.getPtr(credential)) |state| {
+            state.registered = false;
+            state.deposit = 0;
+            self.pruneStakeAccountIfDormant(credential);
+        }
+    }
+
+    fn syncStakeAccountPoolDelegation(self: *LedgerDB, credential: Credential, pool: ?KeyHash) !void {
+        if (pool) |next_pool| {
+            const state = try self.ensureStakeAccount(credential);
+            state.registered = true;
+            state.stake_pool_delegation = next_pool;
+        } else if (self.stake_accounts.getPtr(credential)) |state| {
+            state.stake_pool_delegation = null;
+            self.pruneStakeAccountIfDormant(credential);
+        }
+    }
+
+    fn syncStakeAccountDRepDelegation(self: *LedgerDB, credential: Credential, drep: ?DRep) !void {
+        if (drep) |next_drep| {
+            const state = try self.ensureStakeAccount(credential);
+            state.registered = true;
+            state.drep_delegation = next_drep;
+        } else if (self.stake_accounts.getPtr(credential)) |state| {
+            state.drep_delegation = null;
+            self.pruneStakeAccountIfDormant(credential);
+        }
+    }
+
+    fn syncStakeAccountPointer(self: *LedgerDB, credential: Credential, pointer: ?Pointer) !void {
+        if (pointer) |next_pointer| {
+            const state = try self.ensureStakeAccount(credential);
+            state.registered = true;
+            state.pointer = next_pointer;
+        } else if (self.stake_accounts.getPtr(credential)) |state| {
+            state.pointer = null;
+            self.pruneStakeAccountIfDormant(credential);
+        }
+    }
+
+    fn syncStakeAccountRewardBalanceChanges(
+        self: *LedgerDB,
+        changes: []const RewardBalanceChange,
+        use_previous: bool,
+    ) !void {
+        for (changes) |change| {
+            try self.syncStakeAccountRewardBalance(
+                change.account,
+                if (use_previous) change.previous else change.next,
+            );
+        }
+    }
+
+    fn syncStakeAccountDepositChanges(
+        self: *LedgerDB,
+        changes: []const StakeDepositChange,
+        use_previous: bool,
+    ) !void {
+        for (changes) |change| {
+            try self.syncStakeAccountDeposit(
+                change.credential,
+                if (use_previous) change.previous else change.next,
+            );
+        }
+    }
+
+    fn syncStakeAccountPoolDelegationChanges(
+        self: *LedgerDB,
+        changes: []const StakePoolDelegationChange,
+        use_previous: bool,
+    ) !void {
+        for (changes) |change| {
+            try self.syncStakeAccountPoolDelegation(
+                change.credential,
+                if (use_previous) change.previous else change.next,
+            );
+        }
+    }
+
+    fn syncStakeAccountDRepDelegationChanges(
+        self: *LedgerDB,
+        changes: []const DRepDelegationChange,
+        use_previous: bool,
+    ) !void {
+        for (changes) |change| {
+            try self.syncStakeAccountDRepDelegation(
+                change.credential,
+                if (use_previous) change.previous else change.next,
+            );
+        }
+    }
+
+    fn syncStakeAccountPointerChanges(
+        self: *LedgerDB,
+        changes: []const StakePointerChange,
+        use_previous: bool,
+    ) !void {
+        for (changes) |change| {
+            try self.syncStakeAccountPointer(
+                change.credential,
+                if (use_previous) change.previous else change.next,
+            );
+        }
     }
 
     fn rebuildStakeAccounts(self: *LedgerDB) !void {
@@ -3473,6 +3628,87 @@ test "ledgerdb: registered stake account keeps zero reward balance" {
     try db.rollback(1);
     try std.testing.expect(!db.isStakeCredentialRegistered(cred));
     try std.testing.expect(db.lookupRewardBalance(account) == null);
+}
+
+test "ledgerdb: unrelated diffs keep canonical-only stake accounts intact" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-canonical-stake-accounts");
+    defer db.deinit();
+
+    const account = RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0xdf} ** 28,
+        },
+    };
+
+    try db.importStakeAccount(account, .{
+        .registered = true,
+        .reward_balance = 0,
+        .deposit = 0,
+        .stake_pool_delegation = null,
+        .drep_delegation = null,
+        .pointer = null,
+    });
+    _ = db.reward_balances.remove(account);
+
+    try std.testing.expect(db.isStakeCredentialRegistered(account.credential));
+    try std.testing.expectEqual(@as(?Coin, 0), db.lookupRewardBalance(account));
+    try std.testing.expectEqual(@as(usize, 1), db.stake_accounts.count());
+
+    try db.applyDiff(.{
+        .slot = 10,
+        .block_hash = [_]u8{0x2f} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = try allocator.alloc(UtxoEntry, 0),
+        .fees_balance_change = .{
+            .previous = 0,
+            .next = 1,
+        },
+    });
+
+    try std.testing.expect(db.isStakeCredentialRegistered(account.credential));
+    try std.testing.expectEqual(@as(?Coin, 0), db.lookupRewardBalance(account));
+    try std.testing.expectEqual(@as(usize, 1), db.stake_accounts.count());
+
+    try db.rollback(1);
+    try std.testing.expect(db.isStakeCredentialRegistered(account.credential));
+    try std.testing.expectEqual(@as(?Coin, 0), db.lookupRewardBalance(account));
+    try std.testing.expectEqual(@as(usize, 1), db.stake_accounts.count());
+}
+
+test "ledgerdb: account-local lookups ignore split-map drift without canonical state" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-account-lookups-canonical");
+    defer db.deinit();
+
+    const cred = Credential{
+        .cred_type = .key_hash,
+        .hash = [_]u8{0xe1} ** 28,
+    };
+    const account = RewardAccount{
+        .network = .testnet,
+        .credential = cred,
+    };
+    const pool = [_]u8{0xe2} ** 28;
+    const drep = DRep{ .always_abstain = {} };
+    const pointer = Pointer{ .slot = 42, .tx_ix = 1, .cert_ix = 0 };
+
+    try db.reward_balances.put(account, 7_000);
+    try db.stake_deposits.put(cred, 2_000_000);
+    try db.stake_pool_delegations.put(cred, pool);
+    try db.drep_delegations.put(cred, drep);
+    try db.stake_account_pointers.put(cred, pointer);
+    try db.stake_credentials_by_pointer.put(pointer, cred);
+
+    try std.testing.expect(!db.isStakeCredentialRegistered(cred));
+    try std.testing.expect(db.lookupRewardBalance(account) == null);
+    try std.testing.expect(db.lookupStakeDeposit(cred) == null);
+    try std.testing.expect(db.lookupStakePoolDelegation(cred) == null);
+    try std.testing.expect(db.lookupDRepDelegation(cred) == null);
+    try std.testing.expect(db.lookupStakePointer(cred) == null);
+    try std.testing.expect(db.resolveStakePointer(pointer) == null);
 }
 
 test "ledgerdb: apply diff tracks and rolls back accounting pots" {

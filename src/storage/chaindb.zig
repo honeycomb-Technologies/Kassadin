@@ -41,6 +41,12 @@ pub const ChainDB = struct {
         block_no: BlockNo,
         ledger_diffs_applied: u32,
         governance_snapshot: ?protocol_update.GovernanceSnapshot,
+        ocert_counter_change: ?OCertCounterChange = null,
+    };
+
+    const OCertCounterChange = struct {
+        issuer: types.KeyHash,
+        previous: ?u64,
     };
 
     allocator: Allocator,
@@ -48,6 +54,7 @@ pub const ChainDB = struct {
     @"volatile": VolatileDB,
     ledger: LedgerDB,
     current_chain: std.ArrayList(CurrentChainEntry),
+    ocert_counters: std.AutoHashMap(types.KeyHash, u64),
 
     /// Current chain tip (from volatile or immutable).
     tip_slot: SlotNo,
@@ -72,12 +79,19 @@ pub const ChainDB = struct {
         const ledger_path = try std.fmt.allocPrint(allocator, "{s}/ledger", .{db_path});
         errdefer allocator.free(ledger_path);
 
+        var immutable = try ImmutableDB.open(allocator, imm_path);
+        errdefer immutable.close();
+
+        var ledger = try LedgerDB.init(allocator, ledger_path);
+        errdefer ledger.deinit();
+
         var db = ChainDB{
             .allocator = allocator,
-            .immutable = try ImmutableDB.open(allocator, imm_path),
+            .immutable = immutable,
             .@"volatile" = VolatileDB.init(allocator),
-            .ledger = try LedgerDB.init(allocator, ledger_path),
+            .ledger = ledger,
             .current_chain = .empty,
+            .ocert_counters = std.AutoHashMap(types.KeyHash, u64).init(allocator),
             .tip_slot = 0,
             .tip_hash = [_]u8{0} ** 32,
             .tip_block_no = 0,
@@ -115,6 +129,7 @@ pub const ChainDB = struct {
         self.ledger.deinit();
         self.allocator.free(self.ledger.snapshot_path);
         self.current_chain.deinit(self.allocator);
+        self.ocert_counters.deinit();
         self.governance_state.deinit(self.allocator);
         if (self.shelley_governance_config) |*config| {
             config.deinit(self.allocator);
@@ -204,6 +219,8 @@ pub const ChainDB = struct {
         const expected_vrf_key_hash = self.ledger.lookupIssuerVrfKeyHash(issuer) orelse {
             return error.VRFKeyUnknown;
         };
+        const current_counter = self.ocert_counters.get(issuer) orelse 0;
+        const next_counter = block.header.opcert_sequence_no orelse return error.OCertInvalidSignature;
         try header_validation.validateExpectedVRFKeyHash(&block.header, expected_vrf_key_hash);
         try header_validation.validateOperationalCertificateAndKes(
             &block.header,
@@ -211,6 +228,7 @@ pub const ChainDB = struct {
             self.slots_per_kes_period,
             self.max_kes_evolutions,
         );
+        try header_validation.validateOperationalCertificateCounter(current_counter, next_counter);
     }
 
     /// Add a block to the chain database.
@@ -262,6 +280,7 @@ pub const ChainDB = struct {
         }
 
         var ledger_diffs_applied: u32 = 0;
+        var ocert_counter_change: ?OCertCounterChange = null;
         var apply_result: ?ledger_apply.ApplyResult = null;
         defer {
             if (apply_result) |*result| result.deinit(self.allocator);
@@ -393,6 +412,22 @@ pub const ChainDB = struct {
         }
 
         try self.@"volatile".putBlock(hash, block_data, slot, block_no, prev_hash);
+        errdefer if (ocert_counter_change) |change| self.restoreOcertCounter(change);
+
+        if (self.ledger_validation_enabled) {
+            if (parsed_block) |*block| {
+                if (block.era != .byron) {
+                    const issuer = header_validation.poolKeyHash(block.header.issuer_vkey);
+                    const sequence_no = block.header.opcert_sequence_no orelse unreachable;
+                    const previous = self.ocert_counters.get(issuer);
+                    try self.ocert_counters.put(issuer, sequence_no);
+                    ocert_counter_change = .{
+                        .issuer = issuer,
+                        .previous = previous,
+                    };
+                }
+            }
+        }
         self.tip_slot = slot;
         self.tip_hash = hash;
         self.tip_block_no = block_no;
@@ -401,6 +436,7 @@ pub const ChainDB = struct {
             .block_no = block_no,
             .ledger_diffs_applied = ledger_diffs_applied,
             .governance_snapshot = governance_snapshot,
+            .ocert_counter_change = ocert_counter_change,
         });
         governance_snapshot = null;
 
@@ -479,6 +515,9 @@ pub const ChainDB = struct {
                 try self.ledger.rollback(removed.ledger_diffs_applied);
             }
             var mutable_removed = removed;
+            if (mutable_removed.ocert_counter_change) |change| {
+                self.restoreOcertCounter(change);
+            }
             if (mutable_removed.governance_snapshot) |*snapshot| {
                 try self.governance_state.restoreSnapshot(self.allocator, snapshot);
                 self.protocol_params = snapshot.active_params;
@@ -513,9 +552,18 @@ pub const ChainDB = struct {
         self.tip_block_no = 0;
         if (point == null) {
             self.base_tip = null;
+            self.ocert_counters.clearRetainingCapacity();
         }
         self.ledger_ready = self.ledger_validation_enabled and point == null and self.base_tip == null;
         return rolled_back;
+    }
+
+    fn restoreOcertCounter(self: *ChainDB, change: OCertCounterChange) void {
+        if (change.previous) |previous| {
+            self.ocert_counters.put(change.issuer, previous) catch unreachable;
+        } else {
+            _ = self.ocert_counters.remove(change.issuer);
+        }
     }
 
     /// Total blocks across volatile + immutable.
@@ -668,23 +716,89 @@ test "chaindb: rollback rewinds current chain tip" {
 test "chaindb: promote finalized uses ordered current-chain prefix" {
     const allocator = std.testing.allocator;
     const path = "/tmp/kassadin-test-chaindb-promote";
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
 
     std.fs.cwd().deleteTree(path) catch {};
     defer std.fs.cwd().deleteTree(path) catch {};
 
-    const hash0 = Blake2b256.hash("main-0");
-    const hash1 = Blake2b256.hash("main-1");
-    const hash2 = Blake2b256.hash("main-2");
-    const fork_hash = Blake2b256.hash("fork-1");
+    var tx_array_enc = Encoder.init(allocator);
+    defer tx_array_enc.deinit();
+    try tx_array_enc.encodeArrayLen(0);
+    const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
+    defer allocator.free(tx_bodies_raw);
+
+    const block0_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        0,
+        0,
+        null,
+        [_]u8{0x31} ** 32,
+        [_]u8{0x32} ** 32,
+        [_]u8{0x33} ** 32,
+        0,
+        [_]u8{0x34} ** 32,
+    );
+    defer allocator.free(block0_data);
+    const block0 = try block_mod.parseBlock(block0_data);
+    const hash0 = block0.hash();
+
+    const block1_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        1,
+        10,
+        hash0,
+        [_]u8{0x41} ** 32,
+        [_]u8{0x42} ** 32,
+        [_]u8{0x43} ** 32,
+        0,
+        [_]u8{0x44} ** 32,
+    );
+    defer allocator.free(block1_data);
+    const block1 = try block_mod.parseBlock(block1_data);
+    const hash1 = block1.hash();
+
+    const fork_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        1,
+        11,
+        hash0,
+        [_]u8{0x51} ** 32,
+        [_]u8{0x52} ** 32,
+        [_]u8{0x53} ** 32,
+        0,
+        [_]u8{0x54} ** 32,
+    );
+    defer allocator.free(fork_data);
+    const fork_block = try block_mod.parseBlock(fork_data);
+    const fork_hash = fork_block.hash();
+
+    const block2_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        2,
+        20,
+        hash1,
+        [_]u8{0x61} ** 32,
+        [_]u8{0x62} ** 32,
+        [_]u8{0x63} ** 32,
+        0,
+        [_]u8{0x64} ** 32,
+    );
+    defer allocator.free(block2_data);
+    const block2 = try block_mod.parseBlock(block2_data);
+    const hash2 = block2.hash();
 
     {
         var db = try ChainDB.open(allocator, path, 1);
         defer db.close();
 
-        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash0, "main-0", 0, 0, null));
-        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash1, "main-1", 10, 1, hash0));
-        try std.testing.expectEqual(AddBlockResult.added_to_fork, try db.addBlock(fork_hash, "fork-1", 11, 1, hash0));
-        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash2, "main-2", 20, 2, hash1));
+        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash0, block0_data, block0.header.slot, block0.header.block_no, block0.header.prev_hash));
+        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash1, block1_data, block1.header.slot, block1.header.block_no, block1.header.prev_hash));
+        try std.testing.expectEqual(AddBlockResult.added_to_fork, try db.addBlock(fork_hash, fork_data, fork_block.header.slot, fork_block.header.block_no, fork_block.header.prev_hash));
+        try std.testing.expectEqual(AddBlockResult.added_to_current_chain, try db.addBlock(hash2, block2_data, block2.header.slot, block2.header.block_no, block2.header.prev_hash));
 
         const promoted = try db.promoteFinalized();
         try std.testing.expectEqual(@as(u32, 2), promoted);
@@ -698,8 +812,8 @@ test "chaindb: promote finalized uses ordered current-chain prefix" {
         defer allocator.free(promoted0);
         const promoted1 = (try db.immutable.getBlock(hash1)).?;
         defer allocator.free(promoted1);
-        try std.testing.expectEqualStrings("main-0", promoted0);
-        try std.testing.expectEqualStrings("main-1", promoted1);
+        try std.testing.expectEqualSlices(u8, block0_data, promoted0);
+        try std.testing.expectEqualSlices(u8, block1_data, promoted1);
         try std.testing.expect((try db.immutable.getBlock(fork_hash)) == null);
     }
 
@@ -735,6 +849,7 @@ fn buildSignedShelleyTestBlock(
     issuer_seed: [32]u8,
     kes_seed: [32]u8,
     vrf_vkey: [32]u8,
+    opcert_sequence_no: u64,
     body_hash: [32]u8,
 ) ![]u8 {
     const Encoder = @import("../cbor/encoder.zig").Encoder;
@@ -747,7 +862,7 @@ fn buildSignedShelleyTestBlock(
     const current_kes_period: u32 = @intCast(slot / types.mainnet.slots_per_kes_period);
     const opcert = try opcert_mod.OperationalCert.create(
         kes_kp.vk,
-        0,
+        opcert_sequence_no,
         current_kes_period,
         cold_kp.sk,
     );
@@ -841,6 +956,7 @@ test "chaindb: ledger validation applies a real block" {
         [_]u8{0x22} ** 32,
         [_]u8{0x23} ** 32,
         [_]u8{0x33} ** 32,
+        0,
         [_]u8{0x44} ** 32,
     );
     defer allocator.free(block_data);
@@ -890,6 +1006,168 @@ test "chaindb: ledger validation applies a real block" {
     try std.testing.expectEqual(@as(types.Coin, 200_000), db.ledger.getFeesBalance());
 }
 
+test "chaindb: ocert counter rejects stale sequence numbers" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-ocert-stale") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-ocert-stale") catch {};
+
+    var tx_array_enc = Encoder.init(allocator);
+    defer tx_array_enc.deinit();
+    try tx_array_enc.encodeArrayLen(0);
+    const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
+    defer allocator.free(tx_bodies_raw);
+
+    const issuer_seed = [_]u8{0x91} ** 32;
+    const vrf_vkey = [_]u8{0x93} ** 32;
+
+    const block1_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        1,
+        42,
+        null,
+        issuer_seed,
+        [_]u8{0x92} ** 32,
+        vrf_vkey,
+        1,
+        [_]u8{0x94} ** 32,
+    );
+    defer allocator.free(block1_data);
+    const block1 = try block_mod.parseBlock(block1_data);
+
+    const block2_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        2,
+        43,
+        block1.hash(),
+        issuer_seed,
+        [_]u8{0x95} ** 32,
+        vrf_vkey,
+        0,
+        [_]u8{0x96} ** 32,
+    );
+    defer allocator.free(block2_data);
+    const block2 = try block_mod.parseBlock(block2_data);
+
+    var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-ocert-stale", 2160);
+    defer db.close();
+
+    const issuer_pool = header_validation.poolKeyHash(block1.header.issuer_vkey);
+    const vrf_hash = Blake2b256.hash(&block1.header.vrf_vkey);
+    try db.ledger.importPoolConfig(issuer_pool, .{
+        .vrf_keyhash = vrf_hash,
+        .pledge = 0,
+        .cost = 0,
+        .margin = .{ .numerator = 0, .denominator = 1 },
+    });
+    try db.enableLedgerValidation();
+
+    try std.testing.expectEqual(
+        AddBlockResult.added_to_current_chain,
+        try db.addBlock(block1.hash(), block1_data, block1.header.slot, block1.header.block_no, block1.header.prev_hash),
+    );
+    try std.testing.expectEqual(
+        AddBlockResult.invalid,
+        try db.addBlock(block2.hash(), block2_data, block2.header.slot, block2.header.block_no, block2.header.prev_hash),
+    );
+    try std.testing.expectEqual(@as(BlockNo, 1), db.getTip().block_no);
+    try std.testing.expectEqual(@as(usize, 1), db.current_chain.items.len);
+}
+
+test "chaindb: rollback restores ocert counter state" {
+    const allocator = std.testing.allocator;
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-ocert-rollback") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-chaindb-ocert-rollback") catch {};
+
+    var tx_array_enc = Encoder.init(allocator);
+    defer tx_array_enc.deinit();
+    try tx_array_enc.encodeArrayLen(0);
+    const tx_bodies_raw = try tx_array_enc.toOwnedSlice();
+    defer allocator.free(tx_bodies_raw);
+
+    const issuer_seed = [_]u8{0xa1} ** 32;
+    const vrf_vkey = [_]u8{0xa2} ** 32;
+
+    const block1_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        1,
+        42,
+        null,
+        issuer_seed,
+        [_]u8{0xa3} ** 32,
+        vrf_vkey,
+        1,
+        [_]u8{0xa4} ** 32,
+    );
+    defer allocator.free(block1_data);
+    const block1 = try block_mod.parseBlock(block1_data);
+    const hash1 = block1.hash();
+
+    const block2_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        2,
+        43,
+        hash1,
+        issuer_seed,
+        [_]u8{0xa5} ** 32,
+        vrf_vkey,
+        2,
+        [_]u8{0xa6} ** 32,
+    );
+    defer allocator.free(block2_data);
+    const block2 = try block_mod.parseBlock(block2_data);
+
+    const block3_data = try buildSignedShelleyTestBlock(
+        allocator,
+        tx_bodies_raw,
+        2,
+        44,
+        hash1,
+        issuer_seed,
+        [_]u8{0xa7} ** 32,
+        vrf_vkey,
+        1,
+        [_]u8{0xa8} ** 32,
+    );
+    defer allocator.free(block3_data);
+    const block3 = try block_mod.parseBlock(block3_data);
+
+    var db = try ChainDB.open(allocator, "/tmp/kassadin-test-chaindb-ocert-rollback", 2160);
+    defer db.close();
+
+    const issuer_pool = header_validation.poolKeyHash(block1.header.issuer_vkey);
+    const vrf_hash = Blake2b256.hash(&block1.header.vrf_vkey);
+    try db.ledger.importPoolConfig(issuer_pool, .{
+        .vrf_keyhash = vrf_hash,
+        .pledge = 0,
+        .cost = 0,
+        .margin = .{ .numerator = 0, .denominator = 1 },
+    });
+    try db.enableLedgerValidation();
+
+    try std.testing.expectEqual(
+        AddBlockResult.added_to_current_chain,
+        try db.addBlock(hash1, block1_data, block1.header.slot, block1.header.block_no, block1.header.prev_hash),
+    );
+    try std.testing.expectEqual(
+        AddBlockResult.added_to_current_chain,
+        try db.addBlock(block2.hash(), block2_data, block2.header.slot, block2.header.block_no, block2.header.prev_hash),
+    );
+    try std.testing.expectEqual(@as(u32, 1), try db.rollbackToPoint(.{ .slot = block1.header.slot, .hash = hash1 }));
+    try std.testing.expectEqual(
+        AddBlockResult.added_to_current_chain,
+        try db.addBlock(block3.hash(), block3_data, block3.header.slot, block3.header.block_no, block3.header.prev_hash),
+    );
+    try std.testing.expectEqual(@as(BlockNo, 2), db.getTip().block_no);
+}
+
 test "chaindb: epoch boundary reaps retiring pool" {
     const allocator = std.testing.allocator;
     const Encoder = @import("../cbor/encoder.zig").Encoder;
@@ -912,6 +1190,7 @@ test "chaindb: epoch boundary reaps retiring pool" {
         [_]u8{0x72} ** 32,
         [_]u8{0x73} ** 32,
         [_]u8{0x74} ** 32,
+        0,
         [_]u8{0x75} ** 32,
     );
     defer allocator.free(block_data);
@@ -997,6 +1276,7 @@ test "chaindb: epoch boundary sends unclaimed pool refunds to treasury" {
         [_]u8{0x81} ** 32,
         [_]u8{0x82} ** 32,
         [_]u8{0x83} ** 32,
+        0,
         [_]u8{0x84} ** 32,
     );
     defer allocator.free(block_data);

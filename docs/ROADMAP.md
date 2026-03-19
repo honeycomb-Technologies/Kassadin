@@ -331,13 +331,13 @@ DO NOT mark Phase 3 fully complete until these are validated in Phase 7/8.
 - [x] Retain Shelley+ VRF cert payloads and structured operational-cert fields in parsed headers for later VRF/KES/OCert validation
 - [ ] VRF proof verification (needs epoch nonce from chain state — Phase 7)
 - [x] KES signature verification on Shelley+ headers using relative KES periods and Haskell-aligned `Sum6KES`
-- [ ] OCert counter validation (needs counter map from chain state — Phase 7)
+- [x] OCert counter validation during active sync using rollback-safe live issue-number state
 
 ### 4.5 Protocol State (PraosState)
 - [x] Track nonces (evolving, candidate, epoch, previous, lab)
 - [x] onBlock: update nonces and LAB
 - [x] onEpochBoundary: rotate nonces
-- [ ] OCert counter tracking (Phase 7)
+- [x] OCert counter tracking during active sync (restart persistence still pending)
 
 ### Testing Gate 4 — PARTIAL
 **Proven:**
@@ -350,7 +350,7 @@ DO NOT mark Phase 3 fully complete until these are validated in Phase 7/8.
 - [ ] VRF leader check against 10,000 real slots with real stake distribution
 - [ ] VRF proof verification on real headers (needs epoch nonce)
 - [x] KES signature verification on real preprod headers
-- [ ] OCert counter validation against real counter map
+- [x] OCert counter validation on real preprod headers during active sync
 - [ ] Full chain sync maintaining tip within 2160 slots
 
 ---

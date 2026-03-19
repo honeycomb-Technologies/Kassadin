@@ -114,6 +114,15 @@ pub fn validateOperationalCertificate(
     }
 }
 
+pub fn validateOperationalCertificateCounter(
+    current_counter: u64,
+    next_counter: u64,
+) ValidationError!void {
+    if (current_counter > next_counter) {
+        return error.OCertCounterTooSmall;
+    }
+}
+
 pub fn validateKesSignature(
     header: *const block_mod.BlockHeader,
     current_kes_period: u32,
