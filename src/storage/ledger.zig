@@ -12,6 +12,7 @@ pub const DeltaCoin = types.DeltaCoin;
 pub const HeaderHash = types.HeaderHash;
 pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
+pub const Pointer = types.Pointer;
 pub const KeyHash = types.KeyHash;
 pub const RewardAccount = types.RewardAccount;
 pub const UnitInterval = types.UnitInterval;
@@ -26,6 +27,7 @@ pub const UtxoEntry = struct {
     tx_in: TxIn,
     value: Coin,
     stake_credential: ?Credential = null,
+    stake_pointer: ?Pointer = null,
     raw_cbor: []const u8, // original CBOR bytes for byte-preserving hashing
 };
 
@@ -35,6 +37,7 @@ pub const StakeAccountState = struct {
     deposit: Coin = 0,
     stake_pool_delegation: ?KeyHash = null,
     drep_delegation: ?DRep = null,
+    pointer: ?Pointer = null,
 };
 
 /// A ledger state diff produced by applying one block.
@@ -63,6 +66,7 @@ pub const LedgerDiff = struct {
     drep_deposit_changes: []const DRepDepositChange = &.{},
     stake_pool_delegation_changes: []const StakePoolDelegationChange = &.{},
     drep_delegation_changes: []const DRepDelegationChange = &.{},
+    stake_pointer_changes: []const StakePointerChange = &.{},
     previous_epoch_blocks_made_changes: []const BlocksMadeChange = &.{},
     current_epoch_blocks_made_changes: []const BlocksMadeChange = &.{},
 };
@@ -149,6 +153,12 @@ pub const DRepDelegationChange = struct {
     next: ?DRep,
 };
 
+pub const StakePointerChange = struct {
+    credential: Credential,
+    previous: ?Pointer,
+    next: ?Pointer,
+};
+
 pub const BlocksMadeChange = struct {
     pool: KeyHash,
     previous: ?u64,
@@ -175,6 +185,8 @@ pub const LedgerDB = struct {
     /// Current UTxO set (in-memory for now — LMDB for production).
     utxo_set: std.AutoHashMap(TxIn, UtxoEntry),
     stake_accounts: std.AutoHashMap(Credential, StakeAccountState),
+    stake_account_pointers: std.AutoHashMap(Credential, Pointer),
+    stake_credentials_by_pointer: std.AutoHashMap(Pointer, Credential),
     reward_balances: std.AutoHashMap(RewardAccount, Coin),
     reward_balances_tracked: bool,
     reward_account_network: types.Network,
@@ -220,6 +232,8 @@ pub const LedgerDB = struct {
             .allocator = allocator,
             .utxo_set = std.AutoHashMap(TxIn, UtxoEntry).init(allocator),
             .stake_accounts = std.AutoHashMap(Credential, StakeAccountState).init(allocator),
+            .stake_account_pointers = std.AutoHashMap(Credential, Pointer).init(allocator),
+            .stake_credentials_by_pointer = std.AutoHashMap(Pointer, Credential).init(allocator),
             .reward_balances = std.AutoHashMap(RewardAccount, Coin).init(allocator),
             .reward_balances_tracked = false,
             .reward_account_network = .testnet,
@@ -259,6 +273,8 @@ pub const LedgerDB = struct {
         }
         self.utxo_set.deinit();
         self.stake_accounts.deinit();
+        self.stake_account_pointers.deinit();
+        self.stake_credentials_by_pointer.deinit();
         self.reward_balances.deinit();
         self.mir_reserves.deinit();
         self.mir_treasury.deinit();
@@ -295,6 +311,7 @@ pub const LedgerDB = struct {
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, diff.drep_delegation_changes);
+            freeStakePointerChanges(self.allocator, diff.stake_pointer_changes);
             freeBlocksMadeChanges(self.allocator, diff.previous_epoch_blocks_made_changes);
             freeBlocksMadeChanges(self.allocator, diff.current_epoch_blocks_made_changes);
         }
@@ -318,6 +335,7 @@ pub const LedgerDB = struct {
                 .tx_in = entry.tx_in,
                 .value = entry.value,
                 .stake_credential = entry.stake_credential,
+                .stake_pointer = entry.stake_pointer,
                 .raw_cbor = owned_cbor,
             });
         }
@@ -342,6 +360,7 @@ pub const LedgerDB = struct {
         applyDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
         applyStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
         applyDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
+        applyStakePointerChanges(&self.stake_account_pointers, &self.stake_credentials_by_pointer, diff.stake_pointer_changes);
         applyBlocksMadeChanges(&self.blocks_made_previous_epoch, diff.previous_epoch_blocks_made_changes);
         applyBlocksMadeChanges(&self.blocks_made_current_epoch, diff.current_epoch_blocks_made_changes);
         try self.rebuildStakeAccounts();
@@ -369,6 +388,7 @@ pub const LedgerDB = struct {
             freeDRepChanges(self.allocator, old.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, old.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, old.drep_delegation_changes);
+            freeStakePointerChanges(self.allocator, old.stake_pointer_changes);
             freeBlocksMadeChanges(self.allocator, old.previous_epoch_blocks_made_changes);
             freeBlocksMadeChanges(self.allocator, old.current_epoch_blocks_made_changes);
         }
@@ -396,6 +416,7 @@ pub const LedgerDB = struct {
                     .tx_in = entry.tx_in,
                     .value = entry.value,
                     .stake_credential = entry.stake_credential,
+                    .stake_pointer = entry.stake_pointer,
                     .raw_cbor = owned_cbor,
                 });
             }
@@ -426,6 +447,7 @@ pub const LedgerDB = struct {
             rollbackDRepDepositChanges(&self.drep_deposits, diff.drep_deposit_changes);
             rollbackStakePoolDelegationChanges(&self.stake_pool_delegations, diff.stake_pool_delegation_changes);
             rollbackDRepDelegationChanges(&self.drep_delegations, diff.drep_delegation_changes);
+            rollbackStakePointerChanges(&self.stake_account_pointers, &self.stake_credentials_by_pointer, diff.stake_pointer_changes);
             rollbackBlocksMadeChanges(&self.blocks_made_previous_epoch, diff.previous_epoch_blocks_made_changes);
             rollbackBlocksMadeChanges(&self.blocks_made_current_epoch, diff.current_epoch_blocks_made_changes);
             freeStakeChanges(self.allocator, diff.stake_deposit_changes);
@@ -439,6 +461,7 @@ pub const LedgerDB = struct {
             freeDRepChanges(self.allocator, diff.drep_deposit_changes);
             freeStakePoolDelegationChanges(self.allocator, diff.stake_pool_delegation_changes);
             freeDRepDelegationChanges(self.allocator, diff.drep_delegation_changes);
+            freeStakePointerChanges(self.allocator, diff.stake_pointer_changes);
             freeBlocksMadeChanges(self.allocator, diff.previous_epoch_blocks_made_changes);
             freeBlocksMadeChanges(self.allocator, diff.current_epoch_blocks_made_changes);
         }
@@ -464,6 +487,8 @@ pub const LedgerDB = struct {
             try self.utxo_set.put(entry.tx_in, .{
                 .tx_in = entry.tx_in,
                 .value = entry.value,
+                .stake_credential = entry.stake_credential,
+                .stake_pointer = entry.stake_pointer,
                 .raw_cbor = owned_cbor,
             });
             inserted += 1;
@@ -474,13 +499,20 @@ pub const LedgerDB = struct {
 
     /// Insert a UTxO entry loaded from an external snapshot.
     /// Snapshot imports use empty raw bytes to keep memory usage down.
-    pub fn importUtxo(self: *LedgerDB, tx_in: TxIn, value: Coin, stake_credential: ?Credential) !void {
+    pub fn importUtxo(
+        self: *LedgerDB,
+        tx_in: TxIn,
+        value: Coin,
+        stake_credential: ?Credential,
+        stake_pointer: ?Pointer,
+    ) !void {
         if (self.utxo_set.contains(tx_in)) return;
 
         try self.utxo_set.put(tx_in, .{
             .tx_in = tx_in,
             .value = value,
             .stake_credential = stake_credential,
+            .stake_pointer = stake_pointer,
             .raw_cbor = try self.allocator.alloc(u8, 0),
         });
     }
@@ -495,6 +527,7 @@ pub const LedgerDB = struct {
         try self.setStakeAccountDeposit(account.credential, state.deposit);
         try self.setStakeAccountPoolDelegation(account.credential, state.stake_pool_delegation);
         try self.setStakeAccountDRepDelegation(account.credential, state.drep_delegation);
+        try self.setStakeAccountPointer(account.credential, state.pointer);
 
         if (state.registered or state.reward_balance > 0) {
             try self.reward_balances.put(account, state.reward_balance);
@@ -518,6 +551,15 @@ pub const LedgerDB = struct {
             try self.drep_delegations.put(account.credential, drep);
         } else {
             _ = self.drep_delegations.remove(account.credential);
+        }
+
+        if (state.pointer) |pointer| {
+            try self.stake_account_pointers.put(account.credential, pointer);
+            try self.stake_credentials_by_pointer.put(pointer, account.credential);
+        } else {
+            if (self.stake_account_pointers.fetchRemove(account.credential)) |removed| {
+                _ = self.stake_credentials_by_pointer.remove(removed.value);
+            }
         }
     }
 
@@ -619,6 +661,13 @@ pub const LedgerDB = struct {
         try self.setStakeAccountDRepDelegation(credential, drep);
     }
 
+    pub fn importStakePointer(self: *LedgerDB, credential: Credential, pointer: Pointer) !void {
+        try self.stake_account_pointers.put(credential, pointer);
+        try self.stake_credentials_by_pointer.put(pointer, credential);
+        try self.setStakeAccountRegistered(credential, true);
+        try self.setStakeAccountPointer(credential, pointer);
+    }
+
     pub fn importPreviousEpochBlocksMade(self: *LedgerDB, pool: KeyHash, count: u64) !void {
         if (count == 0) return;
         try self.blocks_made_previous_epoch.put(pool, count);
@@ -653,6 +702,15 @@ pub const LedgerDB = struct {
             return state.reward_balance;
         }
         return self.reward_balances.get(account);
+    }
+
+    pub fn lookupStakePointer(self: *const LedgerDB, credential: Credential) ?Pointer {
+        if (self.stake_accounts.get(credential)) |state| return state.pointer;
+        return self.stake_account_pointers.get(credential);
+    }
+
+    pub fn resolveStakePointer(self: *const LedgerDB, pointer: Pointer) ?Credential {
+        return self.stake_credentials_by_pointer.get(pointer);
     }
 
     pub fn lookupMirReward(
@@ -1111,7 +1169,12 @@ pub const LedgerDB = struct {
 
             var utxo_it = self.utxo_set.valueIterator();
             while (utxo_it.next()) |entry| {
-                const credential = entry.stake_credential orelse continue;
+                const credential = if (entry.stake_credential) |credential|
+                    credential
+                else if (entry.stake_pointer) |pointer|
+                    self.resolveStakePointer(pointer) orelse continue
+                else
+                    continue;
                 accumulateCredentialStake(&credential_stake, credential, entry.value) catch continue;
             }
 
@@ -1411,7 +1474,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 6, .big);
+        std.mem.writeInt(u32, buf[0..4], 7, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1611,6 +1674,21 @@ pub const LedgerDB = struct {
             std.mem.writeInt(u64, &buf, entry.value_ptr.*, .big);
             try file.writeAll(&buf);
         }
+
+        // Section 21: Stake registration pointers
+        std.mem.writeInt(u64, &buf, @intCast(self.stake_account_pointers.count()), .big);
+        try file.writeAll(&buf);
+        var pointer_it = self.stake_account_pointers.iterator();
+        while (pointer_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.slot, .big);
+            try file.writeAll(&buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.tx_ix, .big);
+            try file.writeAll(&buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.cert_ix, .big);
+            try file.writeAll(&buf);
+        }
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -1634,7 +1712,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -1920,6 +1998,29 @@ pub const LedgerDB = struct {
             }
         }
 
+        if (version >= 7) {
+            _ = try file.readAll(&buf);
+            const pointer_count = std.mem.readInt(u64, &buf, .big);
+            i = 0;
+            while (i < pointer_count) : (i += 1) {
+                var entry_buf: [1 + 28]u8 = undefined;
+                _ = try file.readAll(&entry_buf);
+                const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+                var hash: types.Hash28 = undefined;
+                @memcpy(&hash, entry_buf[1..29]);
+                _ = try file.readAll(&buf);
+                const slot = std.mem.readInt(u64, &buf, .big);
+                _ = try file.readAll(&buf);
+                const tx_ix = std.mem.readInt(u64, &buf, .big);
+                _ = try file.readAll(&buf);
+                const cert_ix = std.mem.readInt(u64, &buf, .big);
+                const credential = Credential{ .cred_type = cred_type, .hash = hash };
+                const pointer = Pointer{ .slot = slot, .tx_ix = tx_ix, .cert_ix = cert_ix };
+                try self.stake_account_pointers.put(credential, pointer);
+                try self.stake_credentials_by_pointer.put(pointer, credential);
+            }
+        }
+
         try self.rebuildStakeAccounts();
         return true;
     }
@@ -1934,6 +2035,8 @@ pub const LedgerDB = struct {
         self.mir_delta_treasury = 0;
         self.reward_balances_tracked = false;
         self.stake_accounts.clearRetainingCapacity();
+        self.stake_account_pointers.clearRetainingCapacity();
+        self.stake_credentials_by_pointer.clearRetainingCapacity();
         self.reward_balances.clearRetainingCapacity();
         self.mir_reserves.clearRetainingCapacity();
         self.mir_treasury.clearRetainingCapacity();
@@ -1988,6 +2091,12 @@ pub const LedgerDB = struct {
         entry.value_ptr.drep_delegation = drep;
     }
 
+    fn setStakeAccountPointer(self: *LedgerDB, credential: Credential, pointer: ?Pointer) !void {
+        var entry = try self.stake_accounts.getOrPut(credential);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        entry.value_ptr.pointer = pointer;
+    }
+
     fn rebuildStakeAccounts(self: *LedgerDB) !void {
         self.stake_accounts.clearRetainingCapacity();
 
@@ -2014,6 +2123,12 @@ pub const LedgerDB = struct {
         while (drep_deleg_it.next()) |entry| {
             try self.setStakeAccountRegistered(entry.key_ptr.*, true);
             try self.setStakeAccountDRepDelegation(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        var pointer_it = self.stake_account_pointers.iterator();
+        while (pointer_it.next()) |entry| {
+            try self.setStakeAccountRegistered(entry.key_ptr.*, true);
+            try self.setStakeAccountPointer(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 
@@ -2184,6 +2299,10 @@ fn freeStakePoolDelegationChanges(allocator: Allocator, changes: []const StakePo
 }
 
 fn freeDRepDelegationChanges(allocator: Allocator, changes: []const DRepDelegationChange) void {
+    if (changes.len > 0) allocator.free(changes);
+}
+
+fn freeStakePointerChanges(allocator: Allocator, changes: []const StakePointerChange) void {
     if (changes.len > 0) allocator.free(changes);
 }
 
@@ -2569,6 +2688,41 @@ fn rollbackDRepDelegationChanges(
             map.put(change.credential, drep) catch unreachable;
         } else {
             _ = map.remove(change.credential);
+        }
+    }
+}
+
+fn applyStakePointerChanges(
+    credential_map: *std.AutoHashMap(Credential, Pointer),
+    pointer_map: *std.AutoHashMap(Pointer, Credential),
+    changes: []const StakePointerChange,
+) void {
+    for (changes) |change| {
+        if (credential_map.fetchRemove(change.credential)) |removed| {
+            _ = pointer_map.remove(removed.value);
+        }
+        if (change.next) |pointer| {
+            credential_map.put(change.credential, pointer) catch unreachable;
+            pointer_map.put(pointer, change.credential) catch unreachable;
+        }
+    }
+}
+
+fn rollbackStakePointerChanges(
+    credential_map: *std.AutoHashMap(Credential, Pointer),
+    pointer_map: *std.AutoHashMap(Pointer, Credential),
+    changes: []const StakePointerChange,
+) void {
+    var i: usize = changes.len;
+    while (i > 0) {
+        i -= 1;
+        const change = changes[i];
+        if (credential_map.fetchRemove(change.credential)) |removed| {
+            _ = pointer_map.remove(removed.value);
+        }
+        if (change.previous) |pointer| {
+            credential_map.put(change.credential, pointer) catch unreachable;
+            pointer_map.put(pointer, change.credential) catch unreachable;
         }
     }
 }
@@ -3213,8 +3367,10 @@ test "ledgerdb: checkpoint save and load round-trip" {
             .network = .testnet,
             .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xaa} ** 28 },
         };
+        const pointer = Pointer{ .slot = 88, .tx_ix = 2, .cert_ix = 1 };
         try db.importRewardBalance(account, 7_000);
         try db.importStakeDeposit(account.credential, 2_000_000);
+        try db.importStakePointer(account.credential, pointer);
 
         const pool = [_]u8{0xbb} ** 28;
         try db.importPoolDeposit(pool, 500_000_000);
@@ -3274,8 +3430,10 @@ test "ledgerdb: checkpoint save and load round-trip" {
             .network = .testnet,
             .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xaa} ** 28 },
         };
+        const pointer = Pointer{ .slot = 88, .tx_ix = 2, .cert_ix = 1 };
         try std.testing.expectEqual(@as(?Coin, 7_000), db2.lookupRewardBalance(account));
         try std.testing.expectEqual(@as(?Coin, 2_000_000), db2.lookupStakeDeposit(account.credential));
+        try std.testing.expectEqual(pointer, db2.lookupStakePointer(account.credential).?);
 
         const pool = [_]u8{0xbb} ** 28;
         try std.testing.expectEqual(@as(?Coin, 500_000_000), db2.lookupPoolDeposit(pool));
@@ -3659,6 +3817,50 @@ test "ledgerdb: rotate stake snapshots builds mark from delegations" {
     try std.testing.expectEqual(@as(Coin, 7_000_000), ps.active_stake); // reward + UTxO
     try std.testing.expectEqual(@as(Coin, 7_000_000), ps.self_delegated_owner_stake);
     try std.testing.expect(mark.isPoolOwner(pool, cred.hash));
+    const delegated = mark.getDelegatedStake(cred).?;
+    try std.testing.expectEqual(pool, delegated.pool_id);
+    try std.testing.expectEqual(@as(Coin, 7_000_000), delegated.active_stake);
+}
+
+test "ledgerdb: rotate stake snapshots resolves pointer-backed stake" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-stake-pointer-rotate");
+    defer db.deinit();
+
+    const pool = [_]u8{0xa3} ** 28;
+    const cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0xa4} ** 28 };
+    const account = RewardAccount{ .network = .testnet, .credential = cred };
+    const pointer = Pointer{ .slot = 11, .tx_ix = 2, .cert_ix = 0 };
+
+    try db.importRewardBalance(account, 5_000_000);
+    try db.importStakeDeposit(cred, 2_000_000);
+    try db.importPoolDeposit(pool, 500_000_000);
+    try db.importPoolRewardAccount(pool, account);
+    try db.importStakePoolDelegation(cred, pool);
+    try db.importStakePointer(cred, pointer);
+
+    const produced = try allocator.alloc(UtxoEntry, 1);
+    produced[0] = .{
+        .tx_in = makeTxIn(0x04, 0),
+        .value = 2_000_000,
+        .stake_pointer = pointer,
+        .raw_cbor = try allocator.dupe(u8, "pointer-stake-utxo"),
+    };
+    try db.applyDiff(.{
+        .slot = 1,
+        .block_hash = [_]u8{0xac} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = produced,
+    });
+
+    db.rotateStakeSnapshots(1);
+
+    try std.testing.expect(db.getStakeSnapshots().mark != null);
+    const mark = db.getStakeSnapshots().mark.?;
+    try std.testing.expectEqual(@as(usize, 1), mark.poolCount());
+    const ps = mark.getPool(pool).?;
+    try std.testing.expectEqual(@as(Coin, 7_000_000), ps.active_stake);
+    try std.testing.expectEqual(@as(Coin, 0), ps.self_delegated_owner_stake);
     const delegated = mark.getDelegatedStake(cred).?;
     try std.testing.expectEqual(pool, delegated.pool_id);
     try std.testing.expectEqual(@as(Coin, 7_000_000), delegated.active_stake);

@@ -20,6 +20,7 @@ const PoolRetirementChange = @import("../storage/ledger.zig").PoolRetirementChan
 const DRepDepositChange = @import("../storage/ledger.zig").DRepDepositChange;
 const StakePoolDelegationChange = @import("../storage/ledger.zig").StakePoolDelegationChange;
 const DRepDelegationChange = @import("../storage/ledger.zig").DRepDelegationChange;
+const StakePointerChange = @import("../storage/ledger.zig").StakePointerChange;
 
 pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
@@ -87,6 +88,8 @@ pub const ValidationContext = struct {
     protocol_version_major: u64 = 0,
     epoch_length: ?u64 = null,
     stability_window: ?u64 = null,
+    tx_index: ?u64 = null,
+    supports_stake_pointers: bool = false,
 
     fn mirTransferAllowed(self: ValidationContext) bool {
         return self.protocol_version_major > 4;
@@ -119,6 +122,7 @@ pub const CertificateEffect = struct {
     drep_deposit_changes: []const DRepDepositChange,
     stake_pool_delegation_changes: []const StakePoolDelegationChange,
     drep_delegation_changes: []const DRepDelegationChange,
+    stake_pointer_changes: []const StakePointerChange,
 
     pub fn empty() CertificateEffect {
         return .{
@@ -139,6 +143,7 @@ pub const CertificateEffect = struct {
             .drep_deposit_changes = &.{},
             .stake_pool_delegation_changes = &.{},
             .drep_delegation_changes = &.{},
+            .stake_pointer_changes = &.{},
         };
     }
 
@@ -156,6 +161,7 @@ pub const CertificateEffect = struct {
         if (self.drep_deposit_changes.len > 0) allocator.free(self.drep_deposit_changes);
         if (self.stake_pool_delegation_changes.len > 0) allocator.free(self.stake_pool_delegation_changes);
         if (self.drep_delegation_changes.len > 0) allocator.free(self.drep_delegation_changes);
+        if (self.stake_pointer_changes.len > 0) allocator.free(self.stake_pointer_changes);
     }
 };
 
@@ -341,13 +347,15 @@ pub fn evaluateCertificateEffectWithContext(
     defer stake_pool_delegation_changes.deinit(allocator);
     var drep_delegation_changes: std.ArrayList(DRepDelegationChange) = .empty;
     defer drep_delegation_changes.deinit(allocator);
+    var stake_pointer_changes: std.ArrayList(StakePointerChange) = .empty;
+    defer stake_pointer_changes.deinit(allocator);
 
     var deposits: Coin = 0;
     var refunds: Coin = 0;
     var mir_delta_reserves_change: ?DeltaCoinStateChange = null;
     var mir_delta_treasury_change: ?DeltaCoinStateChange = null;
 
-    for (tx.certificates) |cert| {
+    for (tx.certificates, 0..) |cert, cert_ix| {
         switch (cert) {
             .stake_registration => |cred| {
                 if (findPendingStakeNext(stake_changes.items, cred) != null or ledger.lookupStakeDeposit(cred) != null) {
@@ -359,6 +367,9 @@ pub fn evaluateCertificateEffectWithContext(
                     .previous = ledger.lookupStakeDeposit(cred),
                     .next = pp.key_deposit,
                 });
+                if (stakePointerForCertificate(context, cert_ix)) |pointer| {
+                    try setPendingStakePointerNext(allocator, &stake_pointer_changes, ledger, cred, pointer);
+                }
             },
             .stake_delegation => |deleg| {
                 if (!isStakeRegistered(stake_changes.items, ledger, deleg.cred)) return error.InvalidCertificate;
@@ -387,6 +398,7 @@ pub fn evaluateCertificateEffectWithContext(
                 } else {
                     return error.InvalidCertificate;
                 }
+                try setPendingStakePointerNext(allocator, &stake_pointer_changes, ledger, cred, null);
                 try setPendingStakePoolDelegationNext(allocator, &stake_pool_delegation_changes, ledger, cred, null);
                 try setPendingDRepDelegationNext(allocator, &drep_delegation_changes, ledger, cred, null);
             },
@@ -540,6 +552,7 @@ pub fn evaluateCertificateEffectWithContext(
                 } else {
                     return error.InvalidCertificate;
                 }
+                try setPendingStakePointerNext(allocator, &stake_pointer_changes, ledger, unreg.cred, null);
                 try setPendingStakePoolDelegationNext(allocator, &stake_pool_delegation_changes, ledger, unreg.cred, null);
                 try setPendingDRepDelegationNext(allocator, &drep_delegation_changes, ledger, unreg.cred, null);
             },
@@ -700,6 +713,7 @@ pub fn evaluateCertificateEffectWithContext(
         .drep_deposit_changes = try drep_changes.toOwnedSlice(allocator),
         .stake_pool_delegation_changes = try stake_pool_delegation_changes.toOwnedSlice(allocator),
         .drep_delegation_changes = try drep_delegation_changes.toOwnedSlice(allocator),
+        .stake_pointer_changes = try stake_pointer_changes.toOwnedSlice(allocator),
     };
 }
 
@@ -1066,7 +1080,27 @@ fn rewardBalanceAfterWithdrawals(
     return current;
 }
 
+fn stakePointerForCertificate(context: ValidationContext, cert_ix: usize) ?types.Pointer {
+    if (!context.supports_stake_pointers) return null;
+    const tx_index = context.tx_index orelse return null;
+    return .{
+        .slot = context.current_slot,
+        .tx_ix = tx_index,
+        .cert_ix = cert_ix,
+    };
+}
+
 fn findPendingStakeNext(changes: []const StakeDepositChange, credential: types.Credential) ??Coin {
+    for (changes) |change| {
+        if (types.Credential.eql(change.credential, credential)) return change.next;
+    }
+    return null;
+}
+
+fn findPendingStakePointerNext(
+    changes: []const StakePointerChange,
+    credential: types.Credential,
+) ??types.Pointer {
     for (changes) |change| {
         if (types.Credential.eql(change.credential, credential)) return change.next;
     }
@@ -1088,6 +1122,26 @@ fn setPendingStakeNext(
     try changes.append(allocator, .{
         .credential = credential,
         .previous = null,
+        .next = next,
+    });
+}
+
+fn setPendingStakePointerNext(
+    allocator: std.mem.Allocator,
+    changes: *std.ArrayList(StakePointerChange),
+    ledger: *const LedgerDB,
+    credential: types.Credential,
+    next: ?types.Pointer,
+) !void {
+    for (changes.items) |*change| {
+        if (types.Credential.eql(change.credential, credential)) {
+            change.next = next;
+            return;
+        }
+    }
+    try changes.append(allocator, .{
+        .credential = credential,
+        .previous = if (findPendingStakePointerNext(changes.items, credential)) |pending| pending else ledger.lookupStakePointer(credential),
         .next = next,
     });
 }
@@ -1559,6 +1613,51 @@ test "rules: certificate effect charges and refunds stake deposit in same tx" {
     try std.testing.expectEqual(ProtocolParams.mainnet_defaults.key_deposit, effect.refunds);
     try std.testing.expectEqual(@as(usize, 1), effect.stake_deposit_changes.len);
     try std.testing.expect(effect.stake_deposit_changes[0].next == null);
+}
+
+test "rules: pre-Conway stake registration stages stake pointer" {
+    const allocator = std.testing.allocator;
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-rules-stake-pointer");
+    defer ledger.deinit();
+
+    const cred = types.Credential{
+        .cred_type = .key_hash,
+        .hash = [_]u8{0xac} ** 28,
+    };
+    const tx = TxBody{
+        .tx_id = [_]u8{0x45} ** 32,
+        .inputs = &[_]TxIn{},
+        .outputs = &[_]transaction.TxOut{},
+        .certificates = &[_]transaction.Certificate{
+            .{ .stake_registration = cred },
+        },
+        .fee = 0,
+        .withdrawals = &[_]transaction.Withdrawal{},
+        .withdrawal_total = 0,
+        .ttl = null,
+        .validity_start = null,
+        .update = null,
+        .raw_cbor = &[_]u8{},
+    };
+
+    var effect = try evaluateCertificateEffectWithContext(
+        allocator,
+        &tx,
+        &ledger,
+        ProtocolParams.mainnet_defaults,
+        .{
+            .current_slot = 123,
+            .tx_index = 4,
+            .supports_stake_pointers = true,
+        },
+    );
+    defer effect.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), effect.stake_pointer_changes.len);
+    try std.testing.expect(effect.stake_pointer_changes[0].previous == null);
+    try std.testing.expectEqual(@as(u64, 123), effect.stake_pointer_changes[0].next.?.slot);
+    try std.testing.expectEqual(@as(u64, 4), effect.stake_pointer_changes[0].next.?.tx_ix);
+    try std.testing.expectEqual(@as(u64, 0), effect.stake_pointer_changes[0].next.?.cert_ix);
 }
 
 test "rules: explicit stake deposit cert must match current pp" {

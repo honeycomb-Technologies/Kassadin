@@ -526,7 +526,7 @@ headers from ouroboros-consensus golden data.
 - [x] Reject stake-key deregistration refunds while tracked reward balances remain unless the same transaction drains the reward account
 - [ ] Maintain full reward-account and deposit state across epoch reward/stake updates during long-running sync
 - [ ] Replace the current per-credential registration mirror with fuller Haskell-style `Accounts` / `DState` follower state
-- [ ] Track pre-Conway pointer stake references in instant-stake accounting and snapshot rotation
+- [x] Track pre-Conway pointer stake references in instant-stake accounting and snapshot rotation
 
 ### 7.3 Full Integration
 - [x] Shelley genesis config parsing (real mainnet genesis verified)

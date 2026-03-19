@@ -55,6 +55,7 @@ fn buildDiff(
             .tx_in = input,
             .value = entry.value,
             .stake_credential = entry.stake_credential,
+            .stake_pointer = entry.stake_pointer,
             .raw_cbor = try allocator.dupe(u8, entry.raw_cbor),
         });
     }
@@ -63,10 +64,12 @@ fn buildDiff(
     defer produced_list.deinit(allocator);
 
     for (tx.outputs, 0..) |out, ix| {
+        const stake_info = types.stakeAddressInfoFromBytes(out.address_raw) catch types.StakeAddressInfo{};
         try produced_list.append(allocator, .{
             .tx_in = .{ .tx_id = tx.tx_id, .tx_ix = @intCast(ix) },
             .value = out.value,
-            .stake_credential = types.stakeCredentialFromAddressBytes(out.address_raw) catch null,
+            .stake_credential = stake_info.credential,
+            .stake_pointer = stake_info.pointer,
             .raw_cbor = try allocator.dupe(u8, out.raw_cbor),
         });
     }
@@ -103,6 +106,7 @@ fn buildDiff(
         .drep_deposit_changes = cert_effect.drep_deposit_changes,
         .stake_pool_delegation_changes = cert_effect.stake_pool_delegation_changes,
         .drep_delegation_changes = cert_effect.drep_delegation_changes,
+        .stake_pointer_changes = cert_effect.stake_pointer_changes,
     };
 }
 
@@ -153,11 +157,21 @@ fn applyShelleyLikeBlock(
         };
         defer tx_mod.freeTxBody(allocator, &tx);
 
+        const tx_validation_context = blk: {
+            var context = validation_context;
+            context.tx_index = tx_idx;
+            context.supports_stake_pointers = switch (block.era) {
+                .shelley, .allegra, .mary, .alonzo, .babbage => true,
+                else => false,
+            };
+            break :blk context;
+        };
+
         _ = rules.validateTxWithContext(
             &tx,
             ledger,
             pp,
-            validation_context,
+            tx_validation_context,
             switch (block.era) {
                 .shelley, .allegra, .mary => true,
                 else => false,
@@ -170,7 +184,7 @@ fn applyShelleyLikeBlock(
             continue;
         };
 
-        try ledger.applyDiff(try buildDiff(allocator, ledger, block, &tx, pp, validation_context));
+        try ledger.applyDiff(try buildDiff(allocator, ledger, block, &tx, pp, tx_validation_context));
         result.txs_applied += 1;
         result.total_fees += tx.fee;
         if (tx.update) |*update| {

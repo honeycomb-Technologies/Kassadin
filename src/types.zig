@@ -131,6 +131,11 @@ pub const Pointer = struct {
     cert_ix: u64,
 };
 
+pub const StakeAddressInfo = struct {
+    credential: ?Credential = null,
+    pointer: ?Pointer = null,
+};
+
 pub const AddressType = enum(u4) {
     base_key_key = 0,
     base_script_key = 1,
@@ -179,6 +184,25 @@ pub const Address = union(enum) {
                     .addr_type = addr_type,
                 } };
             },
+            .pointer_key, .pointer_script => {
+                if (bytes.len < 30) return error.InvalidAddress;
+                const payment_type: CredentialType = if (addr_type == .pointer_key) .key_hash else .script_hash;
+                var pos: usize = 29;
+                const slot = try readVariableLengthWord64(bytes, &pos);
+                const tx_ix = try readVariableLengthWord64(bytes, &pos);
+                const cert_ix = try readVariableLengthWord64(bytes, &pos);
+                if (pos != bytes.len) return error.InvalidAddress;
+                return .{ .shelley = .{
+                    .network = network,
+                    .payment = .{ .cred_type = payment_type, .hash = bytes[1..29].* },
+                    .stake = .{ .pointer = .{
+                        .slot = slot,
+                        .tx_ix = tx_ix,
+                        .cert_ix = cert_ix,
+                    } },
+                    .addr_type = addr_type,
+                } };
+            },
             .reward_key, .reward_script => {
                 if (bytes.len != 29) return error.InvalidAddress;
                 const cred_type: CredentialType = if (addr_type == .reward_key) .key_hash else .script_hash;
@@ -197,16 +221,33 @@ pub const Address = union(enum) {
     }
 };
 
-pub fn stakeCredentialFromAddressBytes(bytes: []const u8) !?Credential {
+fn readVariableLengthWord64(bytes: []const u8, pos: *usize) !u64 {
+    var value: u64 = 0;
+    var count: usize = 0;
+    while (true) {
+        if (pos.* >= bytes.len or count >= 10) return error.InvalidAddress;
+        const next = bytes[pos.*];
+        pos.* += 1;
+        count += 1;
+        value = (value << 7) | @as(u64, next & 0x7f);
+        if ((next & 0x80) == 0) return value;
+    }
+}
+
+pub fn stakeAddressInfoFromBytes(bytes: []const u8) !StakeAddressInfo {
     const address = try Address.fromBytes(bytes);
     return switch (address) {
-        .bootstrap => null,
+        .bootstrap => .{},
         .shelley => |shelley| switch (shelley.stake) {
-            .base => |credential| credential,
-            .pointer => null,
-            .null => null,
+            .base => |credential| .{ .credential = credential },
+            .pointer => |pointer| .{ .pointer = pointer },
+            .null => .{},
         },
     };
+}
+
+pub fn stakeCredentialFromAddressBytes(bytes: []const u8) !?Credential {
+    return (try stakeAddressInfoFromBytes(bytes)).credential;
 }
 
 pub const ShelleyAddress = struct {
@@ -506,6 +547,34 @@ test "address: extract enterprise stake credential is null" {
     @memset(addr_bytes[1..29], 0xab);
 
     try std.testing.expect((try stakeCredentialFromAddressBytes(&addr_bytes)) == null);
+}
+
+test "address: decode pointer stake reference" {
+    var addr_bytes: [33]u8 = undefined;
+    addr_bytes[0] = 0x40; // pointer key, testnet
+    @memset(addr_bytes[1..29], 0xaa);
+    addr_bytes[29] = 0x81;
+    addr_bytes[30] = 0x00;
+    addr_bytes[31] = 0x02;
+    addr_bytes[32] = 0x03;
+
+    const addr = try Address.fromBytes(&addr_bytes);
+    switch (addr) {
+        .shelley => |sa| switch (sa.stake) {
+            .pointer => |pointer| {
+                try std.testing.expectEqual(AddressType.pointer_key, sa.addr_type);
+                try std.testing.expectEqual(@as(u64, 128), pointer.slot);
+                try std.testing.expectEqual(@as(u64, 2), pointer.tx_ix);
+                try std.testing.expectEqual(@as(u64, 3), pointer.cert_ix);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .bootstrap => return error.TestUnexpectedResult,
+    }
+
+    const stake_info = try stakeAddressInfoFromBytes(&addr_bytes);
+    try std.testing.expect(stake_info.credential == null);
+    try std.testing.expect(stake_info.pointer != null);
 }
 
 test "asset name: from slice round-trip" {

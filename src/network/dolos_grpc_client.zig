@@ -172,6 +172,7 @@ pub const Client = struct {
                         .tx_in = output.tx_in,
                         .value = output.value,
                         .stake_credential = output.stake_credential,
+                        .stake_pointer = output.stake_pointer,
                         .raw_cbor = try allocator.dupe(u8, output.raw_cbor),
                     });
                     break;
@@ -550,10 +551,12 @@ fn decodeAnyUtxoData(allocator: Allocator, data: []const u8) !?UtxoEntry {
     if (raw_cbor == null or txo_ref == null) return null;
 
     const tx_out = try tx_mod.parseTxOut(raw_cbor.?);
+    const stake_info = types.stakeAddressInfoFromBytes(tx_out.address_raw) catch types.StakeAddressInfo{};
     return .{
         .tx_in = txo_ref.?,
         .value = tx_out.value,
-        .stake_credential = types.stakeCredentialFromAddressBytes(tx_out.address_raw) catch null,
+        .stake_credential = stake_info.credential,
+        .stake_pointer = stake_info.pointer,
         .raw_cbor = try allocator.dupe(u8, raw_cbor.?),
     };
 }
@@ -589,13 +592,15 @@ fn buildEntriesFromTxBody(allocator: Allocator, tx: *const tx_mod.TxBody) ![]Utx
     defer outputs.deinit(allocator);
 
     for (tx.outputs, 0..) |out, ix| {
+        const stake_info = types.stakeAddressInfoFromBytes(out.address_raw) catch types.StakeAddressInfo{};
         try outputs.append(allocator, .{
             .tx_in = .{
                 .tx_id = tx.tx_id,
                 .tx_ix = @intCast(ix),
             },
             .value = out.value,
-            .stake_credential = types.stakeCredentialFromAddressBytes(out.address_raw) catch null,
+            .stake_credential = stake_info.credential,
+            .stake_pointer = stake_info.pointer,
             .raw_cbor = try allocator.dupe(u8, out.raw_cbor),
         });
     }
@@ -617,6 +622,7 @@ fn decodeCardanoTxOutputs(allocator: Allocator, tx_id: Hash32, data: []const u8)
                     .tx_in = .{ .tx_id = tx_id, .tx_ix = index },
                     .value = parsed.value,
                     .stake_credential = parsed.stake_credential,
+                    .stake_pointer = parsed.stake_pointer,
                     .raw_cbor = parsed.raw_cbor,
                 });
                 index +%= 1;
@@ -628,7 +634,12 @@ fn decodeCardanoTxOutputs(allocator: Allocator, tx_id: Hash32, data: []const u8)
     return outputs.toOwnedSlice(allocator);
 }
 
-fn decodeCardanoTxOutput(allocator: Allocator, data: []const u8) !struct { value: u64, stake_credential: ?types.Credential, raw_cbor: []u8 } {
+fn decodeCardanoTxOutput(allocator: Allocator, data: []const u8) !struct {
+    value: u64,
+    stake_credential: ?types.Credential,
+    stake_pointer: ?types.Pointer,
+    raw_cbor: []u8,
+} {
     var address: []const u8 = &.{};
     var coin: u64 = 0;
 
@@ -642,9 +653,11 @@ fn decodeCardanoTxOutput(allocator: Allocator, data: []const u8) !struct { value
     }
 
     if (address.len == 0) return error.InvalidProto;
+    const stake_info = types.stakeAddressInfoFromBytes(address) catch types.StakeAddressInfo{};
     return .{
         .value = coin,
-        .stake_credential = types.stakeCredentialFromAddressBytes(address) catch null,
+        .stake_credential = stake_info.credential,
+        .stake_pointer = stake_info.pointer,
         .raw_cbor = try encodeMinimalTxOut(allocator, address, coin),
     };
 }

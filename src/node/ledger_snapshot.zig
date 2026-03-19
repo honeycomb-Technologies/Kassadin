@@ -139,7 +139,7 @@ pub fn loadSnapshotIntoLedger(
 
             const tx_in = try parsePackedTxIn(&key_buf);
             const output = try parsePackedTxOutInfo(value_buf.items);
-            try ledger.importUtxo(tx_in, output.coin, output.stake_credential);
+            try ledger.importUtxo(tx_in, output.coin, output.stake_credential, output.stake_pointer);
             loaded += 1;
 
             if (!builtin.is_test and loaded % 100_000 == 0) {
@@ -158,7 +158,7 @@ pub fn loadSnapshotIntoLedger(
 
         const tx_in = try parsePackedTxIn(&key_buf);
         const output = try parsePackedTxOutInfo(value_buf.items);
-        try ledger.importUtxo(tx_in, output.coin, output.stake_credential);
+        try ledger.importUtxo(tx_in, output.coin, output.stake_credential, output.stake_pointer);
         loaded += 1;
 
         if (!builtin.is_test and loaded % 100_000 == 0) {
@@ -1386,6 +1386,7 @@ fn importAccountEntry(
         .deposit = account.deposit,
         .stake_pool_delegation = account.stake_pool,
         .drep_delegation = account.drep,
+        .pointer = account.pointer,
     });
 
     if (account.balance > 0) {
@@ -1402,6 +1403,7 @@ const ParsedAccountState = struct {
     deposit: Coin,
     stake_pool: ?types.KeyHash,
     drep: ?DRep,
+    pointer: ?types.Pointer,
 };
 
 fn parseAccountState(dec: *Decoder, active_era: u8) !ParsedAccountState {
@@ -1421,10 +1423,11 @@ fn parseAccountState(dec: *Decoder, active_era: u8) !ParsedAccountState {
             .deposit = deposit,
             .stake_pool = stake_pool,
             .drep = drep,
+            .pointer = null,
         };
     }
 
-    try dec.skipValue(); // ptr
+    const pointer = try parseMaybePointer(dec);
     const balance = try dec.decodeUint();
     const deposit = try dec.decodeUint();
     const stake_pool = try parseMaybeKeyHash(dec);
@@ -1433,6 +1436,27 @@ fn parseAccountState(dec: *Decoder, active_era: u8) !ParsedAccountState {
         .deposit = deposit,
         .stake_pool = stake_pool,
         .drep = null,
+        .pointer = pointer,
+    };
+}
+
+fn parseMaybePointer(dec: *Decoder) !?types.Pointer {
+    const major = try dec.peekMajorType();
+    if (major == 7) {
+        try dec.decodeNull();
+        return null;
+    }
+
+    const pointer_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (pointer_len != 3) {
+        std.debug.print("Snapshot state: unexpected pointer len {}\n", .{pointer_len});
+        return error.InvalidSnapshotState;
+    }
+
+    return .{
+        .slot = try dec.decodeUint(),
+        .tx_ix = try dec.decodeUint(),
+        .cert_ix = try dec.decodeUint(),
     };
 }
 
@@ -1658,6 +1682,7 @@ fn parsePackedTxOutCoin(bytes: []const u8) !Coin {
 const PackedTxOutInfo = struct {
     coin: Coin,
     stake_credential: ?Credential,
+    stake_pointer: ?types.Pointer,
 };
 
 fn parsePackedTxOutInfo(bytes: []const u8) !PackedTxOutInfo {
@@ -1667,9 +1692,11 @@ fn parsePackedTxOutInfo(bytes: []const u8) !PackedTxOutInfo {
     switch (tag) {
         0, 1, 4, 5 => {
             const address_raw = try readPackedShortBytes(bytes, &pos);
+            const stake_info = types.stakeAddressInfoFromBytes(address_raw) catch types.StakeAddressInfo{};
             return .{
                 .coin = try readPackedCompactValueCoin(bytes, &pos),
-                .stake_credential = types.stakeCredentialFromAddressBytes(address_raw) catch null,
+                .stake_credential = stake_info.credential,
+                .stake_pointer = stake_info.pointer,
             };
         },
         2, 3 => {
@@ -1678,6 +1705,7 @@ fn parsePackedTxOutInfo(bytes: []const u8) !PackedTxOutInfo {
             return .{
                 .coin = try readPackedCompactCoin(bytes, &pos),
                 .stake_credential = stake_credential,
+                .stake_pointer = null,
             };
         },
         else => return error.UnsupportedPackedTxOut,
