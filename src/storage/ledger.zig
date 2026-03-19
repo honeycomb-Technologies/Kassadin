@@ -190,6 +190,7 @@ pub const LedgerDB = struct {
     reward_balances: std.AutoHashMap(RewardAccount, Coin),
     reward_balances_tracked: bool,
     reward_account_network: types.Network,
+    pointer_instant_stake_enabled: bool,
     treasury_balance: Coin,
     reserves_balance: Coin,
     fees_balance: Coin,
@@ -237,6 +238,7 @@ pub const LedgerDB = struct {
             .reward_balances = std.AutoHashMap(RewardAccount, Coin).init(allocator),
             .reward_balances_tracked = false,
             .reward_account_network = .testnet,
+            .pointer_instant_stake_enabled = true,
             .treasury_balance = 0,
             .reserves_balance = 0,
             .fees_balance = 0,
@@ -842,6 +844,14 @@ pub const LedgerDB = struct {
         self.reward_account_network = network;
     }
 
+    pub fn setPointerInstantStakeEnabled(self: *LedgerDB, enabled: bool) void {
+        self.pointer_instant_stake_enabled = enabled;
+    }
+
+    pub fn isPointerInstantStakeEnabled(self: *const LedgerDB) bool {
+        return self.pointer_instant_stake_enabled;
+    }
+
     pub fn setRewardBalance(self: *LedgerDB, account: RewardAccount, amount: Coin) !void {
         try self.reward_balances.put(account, amount);
         try self.setStakeAccountRegistered(account.credential, true);
@@ -1160,35 +1170,34 @@ pub const LedgerDB = struct {
     pub fn rotateStakeSnapshots(self: *LedgerDB, new_epoch: EpochNo) void {
         self.stake_snapshots.onEpochBoundary(new_epoch);
 
-        // Populate the new mark snapshot from current delegations using the
-        // Haskell-shaped instant-stake inputs: delegated UTxO stake plus
-        // reward-account balances, not registration deposits.
+        // Populate the new mark snapshot from Haskell-shaped active stake:
+        // instant stake from UTxO, resolved against the unified local
+        // stake-account state for registration, reward balance, and delegation.
         if (self.stake_snapshots.mark) |*mark| {
-            var credential_stake = std.AutoHashMap(Credential, Coin).init(self.allocator);
-            defer credential_stake.deinit();
+            var instant_stake = std.AutoHashMap(Credential, Coin).init(self.allocator);
+            defer instant_stake.deinit();
 
             var utxo_it = self.utxo_set.valueIterator();
             while (utxo_it.next()) |entry| {
-                const credential = if (entry.stake_credential) |credential|
-                    credential
-                else if (entry.stake_pointer) |pointer|
-                    self.resolveStakePointer(pointer) orelse continue
-                else
+                const credential = blk: {
+                    if (entry.stake_credential) |credential| break :blk credential;
+                    if (self.pointer_instant_stake_enabled) {
+                        if (entry.stake_pointer) |pointer| {
+                            break :blk self.resolveStakePointer(pointer) orelse continue;
+                        }
+                    }
                     continue;
-                accumulateCredentialStake(&credential_stake, credential, entry.value) catch continue;
+                };
+                accumulateCredentialStake(&instant_stake, credential, entry.value) catch continue;
             }
 
-            var reward_it = self.reward_balances.iterator();
-            while (reward_it.next()) |entry| {
-                if (entry.key_ptr.network != self.reward_account_network) continue;
-                accumulateCredentialStake(&credential_stake, entry.key_ptr.credential, entry.value_ptr.*) catch continue;
-            }
-
-            var it = self.stake_pool_delegations.iterator();
+            var it = self.stake_accounts.iterator();
             while (it.next()) |entry| {
                 const cred = entry.key_ptr.*;
-                const pool = entry.value_ptr.*;
-                const delegated = credential_stake.get(cred) orelse 0;
+                const account_state = entry.value_ptr.*;
+                if (!account_state.registered) continue;
+                const pool = account_state.stake_pool_delegation orelse continue;
+                const delegated = (instant_stake.get(cred) orelse 0) + account_state.reward_balance;
                 if (delegated == 0) continue;
 
                 const is_owner = cred.cred_type == .key_hash and self.isPoolOwner(pool, cred.hash);
@@ -1474,7 +1483,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 7, .big);
+        std.mem.writeInt(u32, buf[0..4], 8, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1689,6 +1698,9 @@ pub const LedgerDB = struct {
             std.mem.writeInt(u64, &buf, entry.value_ptr.cert_ix, .big);
             try file.writeAll(&buf);
         }
+
+        // Section 22: Instant-stake pointer resolution enabled
+        try file.writeAll(&[_]u8{if (self.pointer_instant_stake_enabled) 1 else 0});
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -1712,7 +1724,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -2021,6 +2033,12 @@ pub const LedgerDB = struct {
             }
         }
 
+        if (version >= 8) {
+            var enabled_buf: [1]u8 = undefined;
+            _ = try file.readAll(&enabled_buf);
+            self.pointer_instant_stake_enabled = enabled_buf[0] != 0;
+        }
+
         try self.rebuildStakeAccounts();
         return true;
     }
@@ -2034,6 +2052,7 @@ pub const LedgerDB = struct {
         self.mir_delta_reserves = 0;
         self.mir_delta_treasury = 0;
         self.reward_balances_tracked = false;
+        self.pointer_instant_stake_enabled = true;
         self.stake_accounts.clearRetainingCapacity();
         self.stake_account_pointers.clearRetainingCapacity();
         self.stake_credentials_by_pointer.clearRetainingCapacity();
@@ -3405,6 +3424,7 @@ test "ledgerdb: checkpoint save and load round-trip" {
         db.importMirDeltaTreasury(4);
         try db.importDRepDelegation(drep_cred, .{ .always_abstain = {} });
         try db.drep_deposits.put(drep_cred, 500_000_000);
+        db.setPointerInstantStakeEnabled(false);
 
         db.setTipSlot(12345);
 
@@ -3467,6 +3487,7 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try std.testing.expectEqual(@as(DeltaCoin, 4), db2.getMirDeltaTreasury());
         try std.testing.expect(db2.lookupDRepDelegation(drep_cred) != null);
         try std.testing.expectEqual(@as(?Coin, 500_000_000), db2.lookupDRepDeposit(drep_cred));
+        try std.testing.expect(!db2.isPointerInstantStakeEnabled());
     }
 }
 
@@ -3864,4 +3885,46 @@ test "ledgerdb: rotate stake snapshots resolves pointer-backed stake" {
     const delegated = mark.getDelegatedStake(cred).?;
     try std.testing.expectEqual(pool, delegated.pool_id);
     try std.testing.expectEqual(@as(Coin, 7_000_000), delegated.active_stake);
+}
+
+test "ledgerdb: conway-style instant stake ignores pointer-backed stake" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-stake-pointer-disabled");
+    defer db.deinit();
+
+    const pool = [_]u8{0xa5} ** 28;
+    const cred = Credential{ .cred_type = .key_hash, .hash = [_]u8{0xa6} ** 28 };
+    const account = RewardAccount{ .network = .testnet, .credential = cred };
+    const pointer = Pointer{ .slot = 12, .tx_ix = 3, .cert_ix = 1 };
+
+    try db.importRewardBalance(account, 5_000_000);
+    try db.importStakeDeposit(cred, 2_000_000);
+    try db.importPoolDeposit(pool, 500_000_000);
+    try db.importPoolRewardAccount(pool, account);
+    try db.importStakePoolDelegation(cred, pool);
+    try db.importStakePointer(cred, pointer);
+    db.setPointerInstantStakeEnabled(false);
+
+    const produced = try allocator.alloc(UtxoEntry, 1);
+    produced[0] = .{
+        .tx_in = makeTxIn(0x05, 0),
+        .value = 2_000_000,
+        .stake_pointer = pointer,
+        .raw_cbor = try allocator.dupe(u8, "conway-pointer-stake-utxo"),
+    };
+    try db.applyDiff(.{
+        .slot = 1,
+        .block_hash = [_]u8{0xad} ** 32,
+        .consumed = try allocator.alloc(UtxoEntry, 0),
+        .produced = produced,
+    });
+
+    db.rotateStakeSnapshots(1);
+
+    try std.testing.expect(db.getStakeSnapshots().mark != null);
+    const mark = db.getStakeSnapshots().mark.?;
+    const ps = mark.getPool(pool).?;
+    try std.testing.expectEqual(@as(Coin, 5_000_000), ps.active_stake);
+    const delegated = mark.getDelegatedStake(cred).?;
+    try std.testing.expectEqual(@as(Coin, 5_000_000), delegated.active_stake);
 }

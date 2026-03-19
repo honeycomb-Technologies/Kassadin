@@ -238,6 +238,9 @@ pub fn replayImmutableFromSlot(
                 const current_epoch = types.slotToEpoch(last_slot, slots_per_epoch);
                 const target_epoch = types.slotToEpoch(block.header.slot, slots_per_epoch);
                 if (target_epoch > current_epoch) {
+                    if (block.era == .conway) {
+                        ledger.setPointerInstantStakeEnabled(false);
+                    }
                     var epoch = current_epoch + 1;
                     while (epoch <= target_epoch) : (epoch += 1) {
                         ledger_diffs_applied += try applyReplayEpochBoundaryEffects(
@@ -400,7 +403,7 @@ fn importSnapshotAccountState(
     }
 
     const active_era = try parseCardanoLedgerState(allocator, ledger, network, &dec);
-    _ = active_era;
+    ledger.setPointerInstantStakeEnabled(active_era < @intFromEnum(block_mod.Era.conway));
     try dec.skipValue(); // headerState
 
     ledger.setRewardBalancesTracked(true);

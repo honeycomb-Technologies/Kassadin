@@ -242,6 +242,12 @@ pub const ChainDB = struct {
                 return .invalid;
             }
 
+            if (parsed_block) |*block| {
+                if (block.era == .conway) {
+                    self.ledger.setPointerInstantStakeEnabled(false);
+                }
+            }
+
             ledger_diffs_applied = try self.applyEpochBoundaryEffects(slot, hash);
             apply_result = ledger_apply.applyBlock(
                 self.allocator,
