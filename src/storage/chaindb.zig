@@ -127,6 +127,7 @@ pub const ChainDB = struct {
 
         self.ledger_validation_enabled = true;
         self.ledger_ready = true;
+        self.ledger.setRewardBalancesTracked(true);
         self.ledger.setTipSlot(if (self.base_tip) |tip| tip.point.slot else null);
     }
 

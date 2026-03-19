@@ -266,10 +266,7 @@ pub fn evaluateWithdrawalEffect(
     if (tx.withdrawals.len == 0) return WithdrawalEffect.empty();
 
     if (!ledger.areRewardBalancesTracked()) {
-        return .{
-            .withdrawn = tx.withdrawal_total,
-            .reward_balance_changes = &.{},
-        };
+        return error.InvalidWithdrawal;
     }
 
     var reward_changes: std.ArrayList(RewardBalanceChange) = .empty;
@@ -2184,7 +2181,7 @@ test "rules: tracked reward withdrawal rejects partial amount" {
     );
 }
 
-test "rules: untracked reward withdrawal still accepts amount on faith" {
+test "rules: untracked reward withdrawal is rejected" {
     const allocator = std.testing.allocator;
     var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-rules-withdrawal-untracked");
     defer ledger.deinit();
@@ -2216,13 +2213,10 @@ test "rules: untracked reward withdrawal still accepts amount on faith" {
         .raw_cbor = &[_]u8{0} ** 1024,
     };
 
-    const effect = try evaluateWithdrawalEffect(allocator, &tx, &ledger);
-    defer {
-        var mutable = effect;
-        mutable.deinit(allocator);
-    }
-    try std.testing.expectEqual(@as(Coin, 4_000_000), effect.withdrawn);
-    try std.testing.expectEqual(@as(usize, 0), effect.reward_balance_changes.len);
+    try std.testing.expectError(
+        error.InvalidWithdrawal,
+        evaluateWithdrawalEffect(allocator, &tx, &ledger),
+    );
 }
 
 test "rules: stake deregistration rejects non-empty tracked reward account" {
