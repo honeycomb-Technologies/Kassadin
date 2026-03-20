@@ -39,6 +39,16 @@ pub const TxBody = struct {
     validity_start: ?u64, // Allegra+ validity interval start
     update: ?TxProtocolUpdate, // Shelley-era protocol parameter update
     raw_cbor: []const u8, // original CBOR for hashing
+    // Alonzo+ fields
+    auxiliary_data_hash: ?Hash32 = null, // key 7
+    mint_raw: ?[]const u8 = null, // key 9: raw CBOR of multi-asset mint map
+    script_data_hash: ?Hash32 = null, // key 11
+    collateral_inputs: []const TxIn = &.{}, // key 13
+    required_signers: []const Hash28 = &.{}, // key 14
+    network_id: ?u64 = null, // key 15
+    collateral_return_raw: ?[]const u8 = null, // key 16: raw CBOR
+    total_collateral: ?Coin = null, // key 17
+    reference_inputs: []const TxIn = &.{}, // key 18
 
     /// Total output value.
     pub fn totalOutputValue(self: *const TxBody) Coin {
@@ -119,10 +129,22 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
     defer certificates.deinit(allocator);
     var withdrawals: std.ArrayList(Withdrawal) = .empty;
     defer withdrawals.deinit(allocator);
+    var collateral_inputs: std.ArrayList(TxIn) = .empty;
+    defer collateral_inputs.deinit(allocator);
+    var required_signers: std.ArrayList(Hash28) = .empty;
+    defer required_signers.deinit(allocator);
+    var reference_inputs: std.ArrayList(TxIn) = .empty;
+    defer reference_inputs.deinit(allocator);
     var fee: Coin = 0;
     var withdrawal_total: Coin = 0;
     var ttl: ?u64 = null;
     var validity_start: ?u64 = null;
+    var auxiliary_data_hash: ?Hash32 = null;
+    var mint_raw: ?[]const u8 = null;
+    var script_data_hash: ?Hash32 = null;
+    var network_id: ?u64 = null;
+    var collateral_return_raw: ?[]const u8 = null;
+    var total_collateral: ?Coin = null;
     var update: ?TxProtocolUpdate = null;
 
     var i: u64 = 0;
@@ -243,8 +265,97 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
             6 => {
                 update = try protocol_update.parseTxUpdate(allocator, try dec.sliceOfNextValue());
             },
+            7 => {
+                // Auxiliary data hash
+                const hash_bytes = try dec.decodeBytes();
+                if (hash_bytes.len == 32) {
+                    auxiliary_data_hash = hash_bytes[0..32].*;
+                } else try dec.skipValue();
+            },
+            9 => {
+                // Mint (multi-asset map) — store raw CBOR for now
+                mint_raw = try dec.sliceOfNextValue();
+            },
+            11 => {
+                // Script data hash
+                const hash_bytes = try dec.decodeBytes();
+                if (hash_bytes.len == 32) {
+                    script_data_hash = hash_bytes[0..32].*;
+                } else try dec.skipValue();
+            },
+            13 => {
+                // Collateral inputs
+                const container = try dec.peekMajorType();
+                var num: u64 = 0;
+                if (container == 6) {
+                    _ = try dec.decodeTag();
+                    num = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                } else {
+                    num = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                }
+                var j: u64 = 0;
+                while (j < num) : (j += 1) {
+                    _ = try dec.decodeArrayLen();
+                    const txid_bytes = try dec.decodeBytes();
+                    if (txid_bytes.len != 32) return error.InvalidCbor;
+                    var txid: TxId = undefined;
+                    @memcpy(&txid, txid_bytes);
+                    const ix = @as(u16, @intCast(try dec.decodeUint()));
+                    try collateral_inputs.append(allocator, .{ .tx_id = txid, .tx_ix = ix });
+                }
+            },
+            14 => {
+                // Required signers
+                const container = try dec.peekMajorType();
+                var num: u64 = 0;
+                if (container == 6) {
+                    _ = try dec.decodeTag();
+                    num = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                } else {
+                    num = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                }
+                var j: u64 = 0;
+                while (j < num) : (j += 1) {
+                    const signer_bytes = try dec.decodeBytes();
+                    if (signer_bytes.len != 28) return error.InvalidCbor;
+                    try required_signers.append(allocator, signer_bytes[0..28].*);
+                }
+            },
+            15 => {
+                // Network ID
+                network_id = try dec.decodeUint();
+            },
+            16 => {
+                // Collateral return output — store raw CBOR
+                collateral_return_raw = try dec.sliceOfNextValue();
+            },
+            17 => {
+                // Total collateral
+                total_collateral = try dec.decodeUint();
+            },
+            18 => {
+                // Reference inputs
+                const container = try dec.peekMajorType();
+                var num: u64 = 0;
+                if (container == 6) {
+                    _ = try dec.decodeTag();
+                    num = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                } else {
+                    num = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                }
+                var j: u64 = 0;
+                while (j < num) : (j += 1) {
+                    _ = try dec.decodeArrayLen();
+                    const txid_bytes = try dec.decodeBytes();
+                    if (txid_bytes.len != 32) return error.InvalidCbor;
+                    var txid: TxId = undefined;
+                    @memcpy(&txid, txid_bytes);
+                    const ix = @as(u16, @intCast(try dec.decodeUint()));
+                    try reference_inputs.append(allocator, .{ .tx_id = txid, .tx_ix = ix });
+                }
+            },
             else => {
-                // Skip unknown fields (certificates, withdrawals, etc.)
+                // Skip Conway governance fields and other unknown keys
                 try dec.skipValue();
             },
         }
@@ -262,6 +373,15 @@ pub fn parseTxBody(allocator: std.mem.Allocator, data: []const u8) !TxBody {
         .validity_start = validity_start,
         .update = update,
         .raw_cbor = data,
+        .auxiliary_data_hash = auxiliary_data_hash,
+        .mint_raw = mint_raw,
+        .script_data_hash = script_data_hash,
+        .collateral_inputs = try collateral_inputs.toOwnedSlice(allocator),
+        .required_signers = try required_signers.toOwnedSlice(allocator),
+        .network_id = network_id,
+        .collateral_return_raw = collateral_return_raw,
+        .total_collateral = total_collateral,
+        .reference_inputs = try reference_inputs.toOwnedSlice(allocator),
     };
 }
 
@@ -403,6 +523,9 @@ pub fn freeTxBody(allocator: std.mem.Allocator, body: *TxBody) void {
     allocator.free(body.outputs);
     allocator.free(body.certificates);
     allocator.free(body.withdrawals);
+    allocator.free(body.collateral_inputs);
+    allocator.free(body.required_signers);
+    allocator.free(body.reference_inputs);
 }
 
 // ──────────────────────────────────── Tests ────────────────────────────────────
