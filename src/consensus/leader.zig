@@ -47,9 +47,31 @@ pub fn makeSeed(universal_constant_nonce: Nonce, slot: SlotNo, epoch_nonce: Nonc
     return seed;
 }
 
-/// VRF input for leader election uses the leader universal constant.
+/// VRF input for leader election uses the leader universal constant (TPraos).
 pub fn makeVRFInput(epoch_nonce: Nonce, slot: SlotNo) [32]u8 {
     return makeSeed(seedL(), slot, epoch_nonce);
+}
+
+/// Praos-era (Babbage+) unified VRF input: Blake2b256(slot || epochNonce)
+/// No universal constant XOR — range extension happens post-verification.
+pub fn makeInputVRF(slot: SlotNo, epoch_nonce: Nonce) [32]u8 {
+    return makeSeed(.neutral, slot, epoch_nonce);
+}
+
+/// Praos-era nonce derivation: Blake2b256("N" || vrfOutput)
+pub fn praosNonceFromVrfOutput(output: VRF.Output) [32]u8 {
+    var buf: [1 + 64]u8 = undefined;
+    buf[0] = 'N';
+    @memcpy(buf[1..65], &output);
+    return Blake2b256.hash(&buf);
+}
+
+/// Praos-era leader value derivation: Blake2b256("L" || vrfOutput)
+pub fn praosLeaderFromVrfOutput(output: VRF.Output) [32]u8 {
+    var buf: [1 + 64]u8 = undefined;
+    buf[0] = 'L';
+    @memcpy(buf[1..65], &output);
+    return Blake2b256.hash(&buf);
 }
 
 pub fn parseCertifiedVrf(raw: []const u8) !CertifiedVrf {
@@ -71,8 +93,15 @@ pub fn parseCertifiedVrf(raw: []const u8) !CertifiedVrf {
 
 pub fn verifyCertifiedVrfRaw(raw: []const u8, vk: VRF.VerKey, seed: [32]u8) ?VRF.Output {
     const certified = parseCertifiedVrf(raw) catch return null;
-    const output = VRF.verifyProof(&seed, vk, certified.proof) orelse return null;
-    if (!std.mem.eql(u8, &output, &certified.output)) return null;
+    const output = VRF.verifyProof(&seed, vk, certified.proof) orelse {
+        std.debug.print("VRF verify: proof rejected by C (draft03 and draft13 both failed)\n", .{});
+        std.debug.print("  seed[0..4]: {x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ seed[0], seed[1], seed[2], seed[3] });
+        return null;
+    };
+    if (!std.mem.eql(u8, &output, &certified.output)) {
+        std.debug.print("VRF verify: output mismatch\n", .{});
+        return null;
+    }
     return output;
 }
 
@@ -220,7 +249,7 @@ test "leader: full VRF leader check — deterministic" {
     for (0..100) |slot| {
         const result = checkLeaderVRF(nonce, @intCast(slot), kp.sk, 1, 1, praos.ActiveSlotCoeff.mainnet);
         if (result) |r| {
-            try std.testing.expectEqual(@as(usize, 128), r.proof.len);
+            try std.testing.expectEqual(@as(usize, 80), r.proof.len);
             try std.testing.expectEqual(@as(usize, 64), r.output.len);
             found_leader = true;
             break;

@@ -50,11 +50,28 @@ pub const GovernanceConfig = struct {
     epoch_length: u64,
     stability_window: u64,
     update_quorum: u64,
+    initial_nonce: types.Nonce,
+    extra_entropy: types.Nonce,
+    decentralization_param: types.UnitInterval,
     reward_params: rewards_mod.RewardParams,
     initial_genesis_delegations: []GenesisDelegation,
+    /// First Shelley-era slot. Epoch computation uses (slot - era_start_slot) / epoch_length.
+    /// On mainnet this is 89856000 (= 208 * 432000), on preprod 86400.
+    era_start_slot: u64 = 0,
 
     pub fn deinit(self: *GovernanceConfig, allocator: Allocator) void {
         allocator.free(self.initial_genesis_delegations);
+    }
+
+    /// Compute the Shelley-era epoch for a given slot.
+    pub fn slotToEpoch(self: *const GovernanceConfig, slot: u64) u64 {
+        if (slot < self.era_start_slot) return 0;
+        return (slot - self.era_start_slot) / self.epoch_length;
+    }
+
+    /// First slot of a Shelley-era epoch.
+    pub fn epochFirstSlot(self: *const GovernanceConfig, epoch: u64) u64 {
+        return self.era_start_slot + epoch * self.epoch_length;
     }
 };
 
@@ -489,6 +506,9 @@ test "protocol update: stage and adopt updates across epoch boundary" {
         .epoch_length = 100,
         .stability_window = 10,
         .update_quorum = 2,
+        .initial_nonce = @import("../consensus/praos.zig").initialNonce(),
+        .extra_entropy = .neutral,
+        .decentralization_param = .{ .numerator = 0, .denominator = 1 },
         .reward_params = rewards_mod.RewardParams.mainnet_defaults,
         .initial_genesis_delegations = delegations,
     };
@@ -539,6 +559,9 @@ test "protocol update: reject non-genesis proposer" {
         .epoch_length = 100,
         .stability_window = 10,
         .update_quorum = 1,
+        .initial_nonce = @import("../consensus/praos.zig").initialNonce(),
+        .extra_entropy = .neutral,
+        .decentralization_param = .{ .numerator = 0, .denominator = 1 },
         .reward_params = rewards_mod.RewardParams.mainnet_defaults,
         .initial_genesis_delegations = delegations,
     };

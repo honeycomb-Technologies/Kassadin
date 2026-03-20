@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const std_json = std.json;
 const types = @import("../types.zig");
+const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
 const praos = @import("../consensus/praos.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
 const rewards_mod = @import("../ledger/rewards.zig");
@@ -65,6 +66,7 @@ pub const ByronGenesis = struct {
     protocol_magic: u32,
     security_param: u64,
     start_time: u64,
+    slot_duration_ms: u64,
     avvm_distr: []ByronGenesisBalance,
     non_avvm_balances: []ByronGenesisBalance,
     max_tx_size: u64,
@@ -193,10 +195,13 @@ pub fn loadShelleyGovernanceConfig(allocator: Allocator, path: []const u8) !prot
 
     const root = valueAsObject(parsed.value);
     const gen_delegs = valueAsObject(root.get("genDelegs") orelse return error.MissingGenesisDelegates);
+    const protocol_params = valueAsObject(root.get("protocolParams") orelse return error.MissingProtocolParams);
     const epoch_length = try valueToU64(root.get("epochLength") orelse return error.MissingEpochLength);
     const security_param = try valueToU64(root.get("securityParam") orelse return error.MissingSecurityParam);
     const active_slots_coeff = try valueToF64(root.get("activeSlotsCoeff") orelse return error.MissingActiveSlotsCoeff);
     const update_quorum = try valueToU64(root.get("updateQuorum") orelse return error.MissingUpdateQuorum);
+    const extra_entropy = try valueToNonce(protocol_params.get("extraEntropy") orelse return error.MissingExtraEntropy);
+    const decentralization_param = toUnitInterval(try valueToF64(protocol_params.get("decentralisationParam") orelse return error.MissingDecentralizationParam));
     var shelley_genesis = try parseShelleyGenesis(allocator, path);
     defer shelley_genesis.deinit(allocator);
 
@@ -218,9 +223,19 @@ pub fn loadShelleyGovernanceConfig(allocator: Allocator, path: []const u8) !prot
         .epoch_length = epoch_length,
         .stability_window = computeStabilityWindow(security_param, active_slots_coeff),
         .update_quorum = update_quorum,
+        .initial_nonce = .{ .hash = Blake2b256.hash(content) },
+        .extra_entropy = extra_entropy,
+        .decentralization_param = decentralization_param,
         .reward_params = toRewardParams(&shelley_genesis),
         .initial_genesis_delegations = delegations,
     };
+}
+
+/// Compute the first Shelley-era slot from Byron genesis parameters and the hard fork epoch.
+/// The HFC uses continuous slot numbering: era_start_slot = hard_fork_epoch * byron_epoch_length.
+/// Byron slot duration is irrelevant for slot numbering (only affects real time).
+pub fn computeEraStartSlot(byron: *const ByronGenesis, hard_fork_epoch: u64) u64 {
+    return hard_fork_epoch * 10 * byron.security_param;
 }
 
 pub fn loadByronLedgerProtocolParams(allocator: Allocator, path: []const u8) !ledger_rules.ProtocolParams {
@@ -285,6 +300,7 @@ pub fn parseByronGenesis(allocator: Allocator, path: []const u8) !ByronGenesis {
         .protocol_magic = @intCast(try valueToU64(protocol_consts.get("protocolMagic") orelse return error.MissingProtocolMagic)),
         .security_param = try valueToU64(protocol_consts.get("k") orelse return error.MissingSecurityParam),
         .start_time = try valueToU64(root.get("startTime") orelse return error.MissingStartTime),
+        .slot_duration_ms = try valueToU64(block_version_data.get("slotDuration") orelse return error.MissingSlotDuration),
         .avvm_distr = avvm_distr,
         .non_avvm_balances = non_avvm_balances,
         .max_tx_size = try valueToU64(block_version_data.get("maxTxSize") orelse return error.MissingMaxTxSize),
@@ -358,6 +374,16 @@ fn valueToU64(value: std_json.Value) !u64 {
         .string => |s| std.fmt.parseInt(u64, s, 10),
         .number_string => |s| std.fmt.parseInt(u64, s, 10),
         else => error.InvalidGenesisValue,
+    };
+}
+
+fn valueToNonce(value: std_json.Value) !types.Nonce {
+    const object = valueAsObject(value);
+    const tag = valueAsString(object.get("tag") orelse return error.InvalidGenesisValue);
+    if (std.mem.eql(u8, tag, "NeutralNonce")) return .neutral;
+    if (!std.mem.eql(u8, tag, "Nonce")) return error.InvalidGenesisValue;
+    return .{
+        .hash = try decodeHexHash32(valueAsString(object.get("contents") orelse return error.InvalidGenesisValue)),
     };
 }
 

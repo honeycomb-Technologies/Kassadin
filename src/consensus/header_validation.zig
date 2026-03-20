@@ -8,6 +8,8 @@ const Ed25519 = @import("../crypto/ed25519.zig").Ed25519;
 const opcert_mod = @import("../crypto/opcert.zig");
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
 const Blake2b224 = @import("../crypto/hash.zig").Blake2b224;
+const leader = @import("leader.zig");
+const praos = @import("praos.zig");
 
 pub const SlotNo = types.SlotNo;
 pub const BlockNo = types.BlockNo;
@@ -83,6 +85,93 @@ pub fn validateExpectedVRFKeyHash(
     const vrf_key_hash = Blake2b256.hash(&header.vrf_vkey);
     if (!std.mem.eql(u8, &vrf_key_hash, &expected_vrf_key_hash)) {
         return error.VRFKeyMismatch;
+    }
+}
+
+pub fn extractBlockNonceOutput(
+    header: *const block_mod.BlockHeader,
+) ValidationError!VRF.Output {
+    const certified = leader.parseCertifiedVrf(header.vrf_result_raw) catch return error.VRFBadProof;
+    return certified.output;
+}
+
+/// Returns true if the header uses Praos-era (Babbage+) single-VRF-cert format
+/// rather than the TPraos two-cert format.
+fn isPraosVrf(header: *const block_mod.BlockHeader) bool {
+    return header.leader_vrf_raw == null;
+}
+
+pub fn validateVrfProofsAndLeaderValue(
+    header: *const block_mod.BlockHeader,
+    epoch_nonce: types.Nonce,
+    relative_stake_num: u64,
+    relative_stake_den: u64,
+    active_slot_coeff: praos.ActiveSlotCoeff,
+) ValidationError!void {
+    if (isPraosVrf(header)) {
+        // Praos (Babbage+): single VRF cert, plain input, post-hash range extension.
+        const input = leader.makeInputVRF(header.slot, epoch_nonce);
+        const vrf_output = leader.verifyCertifiedVrfRaw(header.vrf_result_raw, header.vrf_vkey, input) orelse {
+            return error.VRFBadProof;
+        };
+        const leader_hash = leader.praosLeaderFromVrfOutput(vrf_output);
+        // Praos leader check uses the 32-byte hash interpreted as a big-endian natural.
+        // meetsLeaderThreshold reads the first 8 bytes, so pad to 64.
+        var padded: [64]u8 = [_]u8{0} ** 64;
+        @memcpy(padded[0..32], &leader_hash);
+        if (!leader.meetsLeaderThreshold(
+            padded,
+            relative_stake_num,
+            relative_stake_den,
+            active_slot_coeff,
+        )) {
+            return error.VRFLeaderValueTooBig;
+        }
+    } else {
+        // TPraos (Shelley-Alonzo): two VRF certs with seedEta/seedL XOR.
+        const eta_seed = leader.makeSeed(leader.seedEta(), header.slot, epoch_nonce);
+        _ = leader.verifyCertifiedVrfRaw(header.vrf_result_raw, header.vrf_vkey, eta_seed) orelse {
+            return error.VRFBadProof;
+        };
+
+        const leader_output = leader.verifyCertifiedVrfRaw(
+            header.leader_vrf_raw.?,
+            header.vrf_vkey,
+            leader.makeSeed(leader.seedL(), header.slot, epoch_nonce),
+        ) orelse return error.VRFBadProof;
+
+        if (!leader.meetsLeaderThreshold(
+            leader_output,
+            relative_stake_num,
+            relative_stake_den,
+            active_slot_coeff,
+        )) {
+            return error.VRFLeaderValueTooBig;
+        }
+    }
+}
+
+pub fn validateVrfProofsOnly(
+    header: *const block_mod.BlockHeader,
+    epoch_nonce: types.Nonce,
+) ValidationError!void {
+    if (isPraosVrf(header)) {
+        // Praos (Babbage+): single VRF cert, plain input.
+        const input = leader.makeInputVRF(header.slot, epoch_nonce);
+        _ = leader.verifyCertifiedVrfRaw(header.vrf_result_raw, header.vrf_vkey, input) orelse {
+            return error.VRFBadProof;
+        };
+    } else {
+        // TPraos (Shelley-Alonzo): two VRF certs.
+        const eta_seed = leader.makeSeed(leader.seedEta(), header.slot, epoch_nonce);
+        _ = leader.verifyCertifiedVrfRaw(header.vrf_result_raw, header.vrf_vkey, eta_seed) orelse {
+            return error.VRFBadProof;
+        };
+        _ = leader.verifyCertifiedVrfRaw(
+            header.leader_vrf_raw.?,
+            header.vrf_vkey,
+            leader.makeSeed(leader.seedL(), header.slot, epoch_nonce),
+        ) orelse return error.VRFBadProof;
     }
 }
 

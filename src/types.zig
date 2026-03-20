@@ -301,18 +301,18 @@ pub const Nonce = union(enum) {
     neutral: void,
     hash: Hash32,
 
-    /// XOR two nonces. Neutral is the identity element.
+    /// Combine two nonces per Haskell's (⭒) operator: Blake2b256(a || b).
+    /// Neutral is the identity element.
     pub fn xorOp(a: Nonce, b: Nonce) Nonce {
         switch (a) {
             .neutral => return b,
             .hash => |ha| switch (b) {
                 .neutral => return a,
                 .hash => |hb| {
-                    var result: Hash32 = undefined;
-                    for (&result, ha, hb) |*r, x, y| {
-                        r.* = x ^ y;
-                    }
-                    return .{ .hash = result };
+                    var buf: [64]u8 = undefined;
+                    @memcpy(buf[0..32], &ha);
+                    @memcpy(buf[32..64], &hb);
+                    return .{ .hash = Blake2b256.hash(&buf) };
                 },
             },
         }
@@ -434,16 +434,21 @@ test "nonce: xor identity" {
     try std.testing.expect(Nonce.eql(Nonce.xorOp(neutral, neutral), neutral));
 }
 
-test "nonce: xor commutativity" {
+test "nonce: combine is deterministic" {
     const a = Nonce{ .hash = [_]u8{0x11} ** 32 };
     const b = Nonce{ .hash = [_]u8{0x22} ** 32 };
-    try std.testing.expect(Nonce.eql(Nonce.xorOp(a, b), Nonce.xorOp(b, a)));
+    // Haskell's (⭒) is Blake2b256(a || b), which is NOT commutative
+    const ab = Nonce.xorOp(a, b);
+    const ab2 = Nonce.xorOp(a, b);
+    try std.testing.expect(Nonce.eql(ab, ab2));
+    // But a ⭒ b ≠ b ⭒ a in general
 }
 
-test "nonce: xor self is zero" {
+test "nonce: combine self is not zero" {
     const a = Nonce{ .hash = [_]u8{0xff} ** 32 };
     const result = Nonce.xorOp(a, a);
-    try std.testing.expect(Nonce.eql(result, Nonce{ .hash = [_]u8{0x00} ** 32 }));
+    // Haskell's (⭒) is Blake2b256(a || a), not XOR, so result ≠ 0
+    try std.testing.expect(!Nonce.eql(result, Nonce{ .hash = [_]u8{0x00} ** 32 }));
 }
 
 test "unit interval: valid and invalid" {

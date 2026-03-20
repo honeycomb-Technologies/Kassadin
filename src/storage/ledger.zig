@@ -864,6 +864,14 @@ pub const LedgerDB = struct {
         return null;
     }
 
+    pub fn isGenesisDelegateIssuer(self: *const LedgerDB, issuer: KeyHash) bool {
+        var it = self.genesis_delegations.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, &entry.value_ptr.delegate, &issuer)) return true;
+        }
+        return false;
+    }
+
     pub fn lookupFuturePoolParams(self: *const LedgerDB, pool: KeyHash) ?FuturePoolParams {
         return self.future_pool_params.get(pool);
     }

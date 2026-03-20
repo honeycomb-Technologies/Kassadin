@@ -15,6 +15,7 @@ pub const CardanoNodeConfig = struct {
     conway_genesis_path: ?[]u8,
     database_path: ?[]u8,
     socket_path: ?[]u8,
+    shelley_hard_fork_epoch: ?u64 = null,
 
     pub fn deinit(self: *CardanoNodeConfig, allocator: Allocator) void {
         allocator.free(self.protocol);
@@ -49,6 +50,7 @@ pub fn parseCardanoNodeConfig(allocator: Allocator, path: []const u8) !CardanoNo
         .conway_genesis_path = try extractResolvedPath(allocator, path, content, "ConwayGenesisFile"),
         .database_path = try extractResolvedPath(allocator, path, content, "DatabasePath"),
         .socket_path = try extractResolvedPath(allocator, path, content, "SocketPath"),
+        .shelley_hard_fork_epoch = extractUint(content, "TestShelleyHardForkAtEpoch"),
     };
 }
 
@@ -75,6 +77,19 @@ fn resolveRelativePath(allocator: Allocator, config_path: []const u8, raw_path: 
 
     const config_dir = std.fs.path.dirname(config_path) orelse ".";
     return std.fs.path.join(allocator, &.{ config_dir, raw_path });
+}
+
+fn extractUint(json: []const u8, field: []const u8) ?u64 {
+    var search_buf: [256]u8 = undefined;
+    const search = std.fmt.bufPrint(&search_buf, "\"{s}\"", .{field}) catch return null;
+    const pos = std.mem.indexOf(u8, json, search) orelse return null;
+    const after = json[pos + search.len ..];
+    var i: usize = 0;
+    while (i < after.len and (after[i] == ' ' or after[i] == ':' or after[i] == '\n' or after[i] == '\r')) : (i += 1) {}
+    var end = i;
+    while (end < after.len and after[end] >= '0' and after[end] <= '9') : (end += 1) {}
+    if (end == i) return null;
+    return std.fmt.parseInt(u64, after[i..end], 10) catch null;
 }
 
 fn extractString(json: []const u8, field: []const u8) ?[]const u8 {

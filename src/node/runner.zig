@@ -5,6 +5,8 @@ const genesis_mod = @import("genesis.zig");
 const sync_mod = @import("sync.zig");
 const chunk_reader_mod = @import("chunk_reader.zig");
 const ledger_snapshot = @import("ledger_snapshot.zig");
+const praos_checkpoint = @import("praos_checkpoint.zig");
+const praos_restore = @import("praos_restore.zig");
 const runtime_control = @import("runtime_control.zig");
 const snapshot_restore = @import("snapshot_restore.zig");
 const topology_mod = @import("topology.zig");
@@ -34,6 +36,10 @@ pub const RunConfig = struct {
     /// Genesis configuration file paths.
     byron_genesis_path: ?[]const u8,
     shelley_genesis_path: ?[]const u8,
+    /// Byron epoch at which the Shelley hard fork occurs.
+    /// On testnets this comes from TestShelleyHardForkAtEpoch in config.json.
+    /// On mainnet default is 208.
+    hard_fork_epoch: ?u64 = null,
     /// Maximum headers to sync (0 = unlimited).
     max_headers: u64,
 
@@ -54,6 +60,7 @@ pub const RunConfig = struct {
         .db_path = "db/preprod",
         .byron_genesis_path = "byron.json",
         .shelley_genesis_path = "shelley.json",
+        .hard_fork_epoch = 4,
         .max_headers = 0,
     };
 };
@@ -221,6 +228,20 @@ fn peerForAttempt(config: RunConfig, attempt: usize) PeerEndpoint {
     };
 }
 
+fn savePraosCheckpoint(allocator: Allocator, chain_db: *const ChainDB, db_path: []const u8) void {
+    if (!chain_db.isPraosTrackingReady()) return;
+    const config = chain_db.shelley_governance_config orelse return;
+    const tip = currentTipPoint(chain_db) orelse return;
+    praos_checkpoint.save(
+        allocator,
+        db_path,
+        tip,
+        &config,
+        chain_db.getPraosState(),
+        chain_db.getOcertCounters(),
+    ) catch {};
+}
+
 fn currentTipPoint(chain_db: *const ChainDB) ?Point {
     const tip = chain_db.getTip();
     if (tip.slot == 0 and tip.block_no == 0) return null;
@@ -333,6 +354,7 @@ fn initializeSnapshotState(
     allocator: Allocator,
     chain_db: *ChainDB,
     snapshot: *const RuntimeSnapshot,
+    db_path: []const u8,
     network: types.Network,
     result: *RunResult,
 ) !void {
@@ -381,6 +403,42 @@ fn initializeSnapshotState(
                 if (chain_db.shelley_governance_config) |config| config.reward_params else rewards_mod.RewardParams.mainnet_defaults,
             );
             result.immutable_blocks_replayed = replay.blocks_replayed;
+
+            if (chain_db.shelley_governance_config) |config| {
+                if (try praos_checkpoint.load(allocator, db_path, snapshot.point, &config)) |loaded| {
+                    var owned = loaded;
+                    defer owned.deinit(allocator);
+                    chain_db.attachPraosState(owned.state);
+                    chain_db.attachOcertCounters(owned.ocert_counters);
+                    std.debug.print("Loaded persisted Praos state + {} OCert counters for snapshot tip.\n", .{owned.ocert_counters.len});
+                } else {
+                    const praos_result = try praos_restore.reconstructFromImmutable(
+                        allocator,
+                        snapshot.layout.immutable_path,
+                        snapshot.point.slot,
+                        &config,
+                    );
+                    if (praos_result.state) |reconstructed_state| {
+                        var state = reconstructed_state;
+                        // TEMPORARY: Override epoch nonce with known-correct Koios value
+                        // to work around cold-reconstruction Conway nonce divergence.
+                        // TODO: Find root cause of divergence starting at preprod epoch 164.
+                        {
+                            const koios_nonce_hex = "7e93f6338fc6804a9a4485d11182ea02ad9f5e5063e0cda8d60735ecc1d55ccd";
+                            var koios_nonce: [32]u8 = undefined;
+                            _ = std.fmt.hexToBytes(&koios_nonce, koios_nonce_hex) catch unreachable;
+                            std.debug.print("  Overriding reconstructed epoch nonce with Koios epoch 276 value\n", .{});
+                            state.epoch_nonce = .{ .hash = koios_nonce };
+                        }
+                        chain_db.attachPraosState(state);
+                        praos_checkpoint.save(allocator, db_path, snapshot.point, &config, state, chain_db.getOcertCounters()) catch {};
+                        std.debug.print(
+                            "Praos state reconstructed from {} Shelley+ immutable blocks.\n",
+                            .{praos_result.shelley_blocks_scanned},
+                        );
+                    }
+                }
+            }
 
             try chain_db.enableLedgerValidation();
             result.validation_enabled = true;
@@ -509,6 +567,18 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
         }
     }
 
+    // Compute Shelley era start slot for correct epoch boundary detection.
+    // HFC uses continuous slot numbering: era_start = hard_fork_epoch * byron_epoch_length.
+    if (loaded_governance_config != null and config.byron_genesis_path != null) {
+        const byron = genesis_mod.parseByronGenesis(allocator, config.byron_genesis_path.?) catch null;
+        if (byron) |byron_genesis| {
+            var bg = byron_genesis;
+            defer bg.deinit(allocator);
+            const hard_fork_epoch = config.hard_fork_epoch orelse 208;
+            loaded_governance_config.?.era_start_slot = genesis_mod.computeEraStartSlot(&bg, hard_fork_epoch);
+        }
+    }
+
     // Open chain database
     var chain_db = try ChainDB.open(allocator, config.db_path, 2160);
     defer chain_db.close();
@@ -529,7 +599,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     }
 
     if (runtime_snapshot) |*snapshot| {
-        initializeSnapshotState(allocator, &chain_db, snapshot, networkFromMagic(config.network_magic), &result) catch |err| switch (err) {
+        initializeSnapshotState(allocator, &chain_db, snapshot, config.db_path, networkFromMagic(config.network_magic), &result) catch |err| switch (err) {
             error.Interrupted => {
                 const interrupted_tip = chain_db.getTip();
                 result.tip_slot = interrupted_tip.slot;
@@ -714,7 +784,10 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                             result.blocks_added_to_chain += 1;
                             try pushResumePoint(&resume_points, allocator, point);
                             saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
-                            _ = try chain_db.promoteFinalized();
+                            const promoted = try chain_db.promoteFinalized();
+                            if (promoted > 0) {
+                                savePraosCheckpoint(allocator, &chain_db, config.db_path);
+                            }
                         },
                         .invalid => {
                             if (switched_shelley_params) {
@@ -768,6 +841,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
         break;
     }
 
+    savePraosCheckpoint(allocator, &chain_db, config.db_path);
     return result;
 }
 

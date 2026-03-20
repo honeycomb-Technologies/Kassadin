@@ -12,6 +12,8 @@ const rewards_mod = @import("../ledger/rewards.zig");
 const chunk_reader_mod = @import("chunk_reader.zig");
 const genesis_mod = @import("genesis.zig");
 const ledger_snapshot = @import("ledger_snapshot.zig");
+const praos_checkpoint = @import("praos_checkpoint.zig");
+const praos_restore = @import("praos_restore.zig");
 const runtime_control = @import("runtime_control.zig");
 const snapshot_restore = @import("snapshot_restore.zig");
 const topology_mod = @import("topology.zig");
@@ -188,6 +190,42 @@ pub fn bootstrapSync(
                 else => return err,
             };
             result.immutable_blocks_replayed = replay.blocks_replayed;
+            if (chain_db.shelley_governance_config) |config| {
+                if (try praos_checkpoint.load(allocator, db_path, .{
+                    .slot = tip_block.header.slot,
+                    .hash = block_hash,
+                }, &config)) |loaded| {
+                    var owned = loaded;
+                    defer owned.deinit(allocator);
+                    chain_db.attachPraosState(owned.state);
+                    chain_db.attachOcertCounters(owned.ocert_counters);
+                    std.debug.print("Loaded persisted Praos state + {} OCert counters for snapshot tip.\n", .{owned.ocert_counters.len});
+                } else {
+                    const praos_result = praos_restore.reconstructFromImmutable(
+                        allocator,
+                        layout.immutable_path,
+                        tip_block.header.slot,
+                        &config,
+                    ) catch |err| switch (err) {
+                        error.Interrupted => {
+                            result.stopped_by_signal = true;
+                            return result;
+                        },
+                        else => return err,
+                    };
+                    if (praos_result.state) |state| {
+                        chain_db.attachPraosState(state);
+                        praos_checkpoint.save(allocator, db_path, .{
+                            .slot = tip_block.header.slot,
+                            .hash = block_hash,
+                        }, &config, state, chain_db.getOcertCounters()) catch {};
+                        std.debug.print(
+                            "Praos state reconstructed from {} Shelley+ immutable blocks.\n",
+                            .{praos_result.shelley_blocks_scanned},
+                        );
+                    }
+                }
+            }
             local_validation_ready = true;
             result.validation_enabled = true;
             std.debug.print(
@@ -380,7 +418,10 @@ pub fn bootstrapSync(
                     switch (add_result) {
                         .added_to_current_chain => {
                             result.blocks_added_to_chain += 1;
-                            _ = try chain_db.promoteFinalized();
+                            const promoted = try chain_db.promoteFinalized();
+                            if (promoted > 0) {
+                                savePraosCheckpoint(allocator, &chain_db, db_path);
+                            }
                         },
                         .invalid => {
                             result.invalid_blocks += 1;
@@ -430,6 +471,7 @@ pub fn bootstrapSync(
         break;
     }
 
+    savePraosCheckpoint(allocator, &chain_db, db_path);
     return result;
 }
 
@@ -491,6 +533,21 @@ fn hydrateMissingSnapshotInputs(
     defer dolos_grpc_mod.freeReadUtxos(allocator, base_entries);
 
     return chain_db.primeBaseUtxos(base_entries);
+}
+
+fn savePraosCheckpoint(allocator: Allocator, chain_db: *const ChainDB, db_path: []const u8) void {
+    if (!chain_db.isPraosTrackingReady()) return;
+    const config = chain_db.shelley_governance_config orelse return;
+    const tip = chain_db.getTip();
+    if (tip.slot == 0 and tip.block_no == 0) return;
+    praos_checkpoint.save(
+        allocator,
+        db_path,
+        .{ .slot = tip.slot, .hash = tip.hash },
+        &config,
+        chain_db.getPraosState(),
+        chain_db.getOcertCounters(),
+    ) catch {};
 }
 
 fn networkFromMagic(network_magic: u32) types.Network {

@@ -1,7 +1,5 @@
 const std = @import("std");
 const types = @import("../types.zig");
-const VRF = @import("../crypto/vrf.zig").VRF;
-const Ed25519 = @import("../crypto/ed25519.zig").Ed25519;
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
 
 pub const SlotNo = types.SlotNo;
@@ -31,56 +29,120 @@ pub const slots_per_kes_period: u64 = 129_600;
 /// Randomness stabilization window: 3 * k * (1/f) slots from epoch start.
 pub const randomness_stabilization_window: u64 = 3 * security_param_k; // = 6480 slots
 
-/// Protocol state tracking nonces and operational certificate counters.
+pub fn hashHeaderToNonce(hash: HeaderHash) Nonce {
+    return .{ .hash = hash };
+}
+
+pub fn prevHashToNonce(prev_hash: ?HeaderHash) Nonce {
+    if (prev_hash) |hash| {
+        return hashHeaderToNonce(hash);
+    }
+    return .neutral;
+}
+
+/// TPraos (Shelley-Alonzo) nonce derivation: Blake2b256(vrfOutput)
+pub fn nonceFromVrfOutput(output: [64]u8) Nonce {
+    return .{ .hash = Blake2b256.hash(&output) };
+}
+
+/// Praos (Babbage+) nonce derivation: Blake2b256(Blake2b256("N" || vrfOutput))
+/// Double hash per Haskell VRF.hs vrfNonceValue: range extension then nonce derivation.
+pub fn praosNonceFromVrfOutput(output: [64]u8) Nonce {
+    var buf: [1 + 64]u8 = undefined;
+    buf[0] = 'N';
+    @memcpy(buf[1..65], &output);
+    const first_hash = Blake2b256.hash(&buf);
+    return .{ .hash = Blake2b256.hash(&first_hash) };
+}
+
+pub fn initialNonce() Nonce {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, 0, .big);
+    return .{ .hash = Blake2b256.hash(&buf) };
+}
+
+pub const Flavor = enum(u8) {
+    tpraos = 0,
+    praos = 1,
+};
+
+/// Haskell-shaped follower-side chain-dep state.
 pub const PraosState = struct {
-    last_slot: ?SlotNo,
+    flavor: Flavor,
     evolving_nonce: Nonce,
     candidate_nonce: Nonce,
     epoch_nonce: Nonce,
     previous_epoch_nonce: Nonce,
-    lab_nonce: Nonce, // Last Applied Block nonce
     last_epoch_block_nonce: Nonce,
+    lab_nonce: Nonce,
 
     pub fn init() PraosState {
+        return initWithNonce(initialNonce());
+    }
+
+    pub fn initWithNonce(init_nonce: Nonce) PraosState {
         return .{
-            .last_slot = null,
-            .evolving_nonce = .neutral,
-            .candidate_nonce = .neutral,
-            .epoch_nonce = .neutral,
-            .previous_epoch_nonce = .neutral,
-            .lab_nonce = .neutral,
+            .flavor = .tpraos,
+            .evolving_nonce = init_nonce,
+            .candidate_nonce = init_nonce,
+            .epoch_nonce = init_nonce,
+            .previous_epoch_nonce = init_nonce,
             .last_epoch_block_nonce = .neutral,
+            .lab_nonce = .neutral,
         };
     }
 
-    /// Update state when a new block is received.
-    pub fn onBlock(self: *PraosState, slot: SlotNo, prev_hash: ?HeaderHash, vrf_output: ?[64]u8) void {
-        self.last_slot = slot;
-
-        // Update LAB nonce from previous block hash
-        if (prev_hash) |ph| {
-            self.lab_nonce = .{ .hash = Blake2b256.hash(&ph) };
-        }
-
-        // Update evolving nonce with VRF output
-        if (vrf_output) |vrf_out| {
-            const vrf_nonce = Nonce{ .hash = Blake2b256.hash(&vrf_out) };
-            self.evolving_nonce = Nonce.xorOp(self.evolving_nonce, vrf_nonce);
-        }
-
-        // Snapshot candidate nonce at randomness stabilization window
-        const slot_in_epoch = slot % slots_per_epoch;
-        if (slot_in_epoch == randomness_stabilization_window) {
-            self.candidate_nonce = self.evolving_nonce;
-        }
+    pub fn transitionToPraos(self: *PraosState) void {
+        if (self.flavor == .praos) return;
+        self.flavor = .praos;
+        self.previous_epoch_nonce = self.epoch_nonce;
     }
 
-    /// Update state at epoch boundary.
-    pub fn onEpochBoundary(self: *PraosState) void {
-        self.previous_epoch_nonce = self.epoch_nonce;
-        self.epoch_nonce = Nonce.xorOp(self.candidate_nonce, self.last_epoch_block_nonce);
-        self.evolving_nonce = .neutral;
+    /// Tick chain-dep state across an epoch boundary before validating the first block
+    /// in a Shelley-Alonzo epoch.
+    pub fn tickTpraos(self: *PraosState, is_new_epoch: bool, extra_entropy: Nonce) void {
+        if (!is_new_epoch) return;
+        self.epoch_nonce = Nonce.xorOp(
+            self.candidate_nonce,
+            Nonce.xorOp(self.last_epoch_block_nonce, extra_entropy),
+        );
         self.last_epoch_block_nonce = self.lab_nonce;
+    }
+
+    /// Tick chain-dep state across an epoch boundary before validating the first block
+    /// in a Babbage+ epoch.
+    pub fn tickPraos(self: *PraosState, is_new_epoch: bool) void {
+        self.transitionToPraos();
+        if (!is_new_epoch) return;
+        const old_epoch_nonce = self.epoch_nonce;
+        self.epoch_nonce = Nonce.xorOp(
+            self.candidate_nonce,
+            self.last_epoch_block_nonce,
+        );
+        self.previous_epoch_nonce = old_epoch_nonce;
+        self.last_epoch_block_nonce = self.lab_nonce;
+    }
+
+    /// Update chain-dep state after a block has been accepted.
+    pub fn updateWithBlock(
+        self: *PraosState,
+        slot: SlotNo,
+        prev_hash: ?HeaderHash,
+        block_nonce: Nonce,
+        epoch_length: u64,
+        stability_window: u64,
+        era_start_slot: u64,
+    ) void {
+        self.evolving_nonce = Nonce.xorOp(self.evolving_nonce, block_nonce);
+
+        const relative_slot = if (slot >= era_start_slot) slot - era_start_slot else slot;
+        const current_epoch = relative_slot / epoch_length;
+        const first_slot_next_epoch = era_start_slot + (current_epoch + 1) * epoch_length;
+        if (slot + stability_window < first_slot_next_epoch) {
+            self.candidate_nonce = self.evolving_nonce;
+        }
+
+        self.lab_nonce = prevHashToNonce(prev_hash);
     }
 };
 
@@ -130,38 +192,73 @@ test "praos: chain selection prefers longer chain" {
     try std.testing.expect(!preferCandidate(100, 99));
 }
 
-test "praos: state init" {
+test "praos: state init uses Haskell initial nonce" {
     const state = PraosState.init();
-    try std.testing.expect(state.last_slot == null);
-    try std.testing.expect(Nonce.eql(state.epoch_nonce, .neutral));
+    try std.testing.expectEqual(Flavor.tpraos, state.flavor);
+    try std.testing.expect(Nonce.eql(state.evolving_nonce, initialNonce()));
+    try std.testing.expect(Nonce.eql(state.candidate_nonce, initialNonce()));
+    try std.testing.expect(Nonce.eql(state.epoch_nonce, initialNonce()));
+    try std.testing.expect(Nonce.eql(state.previous_epoch_nonce, initialNonce()));
 }
 
-test "praos: nonce evolution on block" {
-    var state = PraosState.init();
+test "praos: init with nonce matches Haskell initial chain dep state" {
+    const init_nonce = Nonce{ .hash = [_]u8{0x77} ** 32 };
+    const state = PraosState.initWithNonce(init_nonce);
+    try std.testing.expectEqual(Flavor.tpraos, state.flavor);
+    try std.testing.expect(Nonce.eql(state.evolving_nonce, init_nonce));
+    try std.testing.expect(Nonce.eql(state.candidate_nonce, init_nonce));
+    try std.testing.expect(Nonce.eql(state.epoch_nonce, init_nonce));
+    try std.testing.expect(Nonce.eql(state.previous_epoch_nonce, init_nonce));
+    try std.testing.expect(Nonce.eql(state.last_epoch_block_nonce, .neutral));
+    try std.testing.expect(Nonce.eql(state.lab_nonce, .neutral));
+}
 
-    // Apply a block
-    const fake_vrf_output = [_]u8{0xab} ** 64;
-    state.onBlock(100, [_]u8{0x01} ** 32, fake_vrf_output);
+test "praos: updateWithBlock tracks evolving and candidate nonces" {
+    var state = PraosState.initWithNonce(.neutral);
+    state.updateWithBlock(
+        100,
+        [_]u8{0x01} ** 32,
+        nonceFromVrfOutput([_]u8{0xab} ** 64),
+        slots_per_epoch,
+        randomness_stabilization_window,
+        0,
+    );
 
-    try std.testing.expectEqual(@as(?SlotNo, 100), state.last_slot);
     try std.testing.expect(!Nonce.eql(state.evolving_nonce, .neutral));
+    try std.testing.expect(Nonce.eql(state.candidate_nonce, state.evolving_nonce));
     try std.testing.expect(!Nonce.eql(state.lab_nonce, .neutral));
 }
 
-test "praos: epoch boundary updates nonces" {
-    var state = PraosState.init();
-    state.epoch_nonce = .{ .hash = [_]u8{0x11} ** 32 };
+test "praos: TPraos tick updates epoch nonce from candidate, previous hash, and entropy" {
+    var state = PraosState.initWithNonce(.neutral);
     state.candidate_nonce = .{ .hash = [_]u8{0x22} ** 32 };
-    state.lab_nonce = .{ .hash = [_]u8{0x33} ** 32 };
+    state.last_epoch_block_nonce = .{ .hash = [_]u8{0x33} ** 32 };
+    state.lab_nonce = .{ .hash = [_]u8{0x44} ** 32 };
 
-    state.onEpochBoundary();
+    state.tickTpraos(true, .{ .hash = [_]u8{0x55} ** 32 });
 
-    // previous_epoch_nonce should be the old epoch_nonce
-    try std.testing.expect(Nonce.eql(state.previous_epoch_nonce, .{ .hash = [_]u8{0x11} ** 32 }));
-    // epoch_nonce = candidate XOR last_epoch_block_nonce
     try std.testing.expect(!Nonce.eql(state.epoch_nonce, .neutral));
-    // evolving_nonce reset to neutral
-    try std.testing.expect(Nonce.eql(state.evolving_nonce, .neutral));
+    try std.testing.expect(Nonce.eql(state.last_epoch_block_nonce, .{ .hash = [_]u8{0x44} ** 32 }));
+}
+
+test "praos: Praos tick updates epoch nonce and previous epoch nonce" {
+    var state = PraosState.initWithNonce(.neutral);
+    state.transitionToPraos();
+    state.candidate_nonce = .{ .hash = [_]u8{0x22} ** 32 };
+    state.epoch_nonce = .{ .hash = [_]u8{0x11} ** 32 };
+    state.last_epoch_block_nonce = .{ .hash = [_]u8{0x33} ** 32 };
+    state.lab_nonce = .{ .hash = [_]u8{0x44} ** 32 };
+
+    state.tickPraos(true);
+
+    try std.testing.expectEqual(Flavor.praos, state.flavor);
+    try std.testing.expect(Nonce.eql(state.previous_epoch_nonce, .{ .hash = [_]u8{0x11} ** 32 }));
+    try std.testing.expect(Nonce.eql(state.last_epoch_block_nonce, .{ .hash = [_]u8{0x44} ** 32 }));
+}
+
+test "praos: prevHashToNonce uses neutral for genesis" {
+    try std.testing.expect(Nonce.eql(prevHashToNonce(null), .neutral));
+    try std.testing.expect(Nonce.eql(prevHashToNonce([_]u8{0x11} ** 32), .{ .hash = [_]u8{0x11} ** 32 }));
 }
 
 test "praos: constants match mainnet" {

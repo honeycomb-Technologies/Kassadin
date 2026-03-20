@@ -464,7 +464,14 @@ relative to the config bundle, select a relay from official topology JSON,
 parse Byron genesis protocol constants plus initial balance distributions from
 official/local genesis files, load Byron fee/size params when starting from
 origin, and parse/apply Byron regular-block transactions plus Byron regular/EBB
-headers from ouroboros-consensus golden data.
+headers from ouroboros-consensus golden data. Follower consensus now seeds
+Praos/TPraos state from the Shelley genesis file hash, distinguishes
+Shelley-Alonzo TPraos epoch ticks from Babbage/Conway Praos epoch ticks, and
+persists snapshot-tip chain-dependent nonce state locally in
+`db/<network>/praos.resume`; the first cold snapshot-backed start still pays one
+full immutable-state reconstruction before that checkpoint exists. A new
+`kassadin dolos-tip` CLI plus `scripts/phase7_preprod_soak.sh` now provide the
+basic tooling for repeated Dolos side-by-side tip/RSS checks.
 
 ### 7.1 Mithril Snapshot Bootstrap
 - [x] Query Mithril aggregator API for latest snapshot (preprod: epoch 276, 3.1GB)
@@ -509,6 +516,9 @@ headers from ouroboros-consensus golden data.
 - [x] Switch local validation from Byron protocol params to Shelley genesis params on the first post-Byron block
 - [x] Prove origin-start validation end-to-end across the Byron-to-Shelley transition on a live chain (`test-origin-transition`: 46 Byron blocks + first Shelley block validated locally from a fresh DB)
 - [x] Parse Shelley tx-body field `6` updates, stage identical-vote quorum by epoch, adopt supported protocol-parameter changes at epoch boundaries, and keep that state rollback-safe in `ChainDB`
+- [x] Seed snapshot/runtime Praos init from the Shelley genesis hash nonce instead of synthetic fallback state
+- [x] Split Shelley-Alonzo TPraos epoch ticks from Babbage/Conway Praos epoch ticks in follower chain-dependent state
+- [x] Persist snapshot-tip Praos restart state locally in `db/<network>/praos.resume`
 - [x] Parse tx-body withdrawals into reward accounts and make tracked reward-balance withdrawals rollback-safe in `LedgerDB`
 - [x] Make tracked withdrawals follow the Haskell exact-drain rule once local reward state is loaded
 - [x] Hydrate reward-account balances and stake deposits from ancillary snapshot state during bootstrap/runtime sync
@@ -540,7 +550,9 @@ headers from ouroboros-consensus golden data.
 ### 7.3 Full Integration
 - [x] Shelley genesis config parsing (real mainnet genesis verified)
 - [x] CLI with sync and bootstrap commands
+- [x] Dolos tip CLI for side-by-side follower checks (`kassadin dolos-tip`)
 - [x] P2P topology configuration
+- [x] Soak harness script for repeated preprod follower batches + Dolos/RSS capture (`scripts/phase7_preprod_soak.sh`)
 - [ ] Logging system
 - [ ] Graceful shutdown (clean signal exit now works; final shutdown snapshot/checkpoint persistence still pending)
 

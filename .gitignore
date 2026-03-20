@@ -9,3 +9,7 @@ reference-*/
 data/
 db/
 .DS_Store
+scratch_*
+.zig-cache-local/
+.zig-global-cache/
+logs/

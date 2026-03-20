@@ -21,7 +21,12 @@ pub fn main() !void {
 
     const byron_pp = try genesis_mod.loadByronLedgerProtocolParams(allocator, "byron.json");
     const shelley_pp = try genesis_mod.loadLedgerProtocolParams(allocator, "shelley.json");
+    var governance_config = try genesis_mod.loadShelleyGovernanceConfig(allocator, "shelley.json");
+    var governance_config_owned = true;
+    defer if (governance_config_owned) governance_config.deinit(allocator);
     chain_db.setProtocolParams(byron_pp);
+    try chain_db.configureShelleyGovernanceTracking(governance_config);
+    governance_config_owned = false;
 
     var genesis = try genesis_mod.parseByronGenesis(allocator, "byron.json");
     defer genesis.deinit(allocator);
@@ -74,9 +79,12 @@ pub fn main() !void {
                     block.header.prev_hash,
                 );
                 if (add_result == .invalid) {
-                    std.debug.print("Transition test saw invalid block {} at slot {}\n", .{
+                    std.debug.print("Transition test saw invalid block era={} block={} slot={} vrf_len={} leader_len={}\n", .{
+                        block.era,
                         block.header.block_no,
                         block.header.slot,
+                        block.header.vrf_result_raw.len,
+                        if (block.header.leader_vrf_raw) |leader_raw| leader_raw.len else @as(usize, 0),
                     });
                     std.process.exit(1);
                 }

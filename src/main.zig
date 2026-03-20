@@ -78,6 +78,11 @@ pub const node = struct {
     pub const topology = @import("node/topology.zig");
 };
 
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt, args);
+    std.process.exit(1);
+}
+
 pub fn main() !void {
     const args = try std.process.argsAlloc(std.heap.page_allocator);
     defer std.process.argsFree(std.heap.page_allocator, args);
@@ -100,8 +105,7 @@ pub fn main() !void {
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--network")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --network\n", .{});
-                    return;
+                    fatal("Missing value after --network\n", .{});
                 }
 
                 if (std.mem.eql(u8, args[i + 1], "preview")) {
@@ -111,86 +115,74 @@ pub fn main() !void {
                     config = node.runner.RunConfig.preprod_defaults;
                     network_name = "preprod";
                 } else {
-                    std.debug.print("Unsupported network: {s}\n", .{args[i + 1]});
-                    return;
+                    fatal("Unsupported network: {s}\n", .{args[i + 1]});
                 }
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--max-headers")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --max-headers\n", .{});
-                    return;
+                    fatal("Missing value after --max-headers\n", .{});
                 }
                 config.max_headers = std.fmt.parseInt(u64, args[i + 1], 10) catch {
-                    std.debug.print("Invalid --max-headers value: {s}\n", .{args[i + 1]});
-                    return;
+                    fatal("Invalid --max-headers value: {s}\n", .{args[i + 1]});
                 };
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--shelley-genesis")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --shelley-genesis\n", .{});
-                    return;
+                    fatal("Missing value after --shelley-genesis\n", .{});
                 }
                 config.shelley_genesis_path = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--byron-genesis")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --byron-genesis\n", .{});
-                    return;
+                    fatal("Missing value after --byron-genesis\n", .{});
                 }
                 config.byron_genesis_path = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --config\n", .{});
-                    return;
+                    fatal("Missing value after --config\n", .{});
                 }
                 config_file_path = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--topology")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --topology\n", .{});
-                    return;
+                    fatal("Missing value after --topology\n", .{});
                 }
                 topology_path = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--db-path")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --db-path\n", .{});
-                    return;
+                    fatal("Missing value after --db-path\n", .{});
                 }
                 db_path_override = args[i + 1];
                 i += 1;
             } else {
-                std.debug.print("Unknown sync argument: {s}\n", .{args[i]});
-                return;
+                fatal("Unknown sync argument: {s}\n", .{args[i]});
             }
         }
 
         if (config_file_path) |path| {
             var parsed = node.config.parseCardanoNodeConfig(std.heap.page_allocator, path) catch |err| {
-                std.debug.print("Config parse failed: {}\n", .{err});
-                return;
+                fatal("Config parse failed: {}\n", .{err});
             };
             defer parsed.deinit(std.heap.page_allocator);
 
             if (parsed.byron_genesis_path) |genesis_path| {
                 config.byron_genesis_path = std.heap.page_allocator.dupe(u8, genesis_path) catch {
-                    std.debug.print("Failed to copy Byron genesis path from config\n", .{});
-                    return;
+                    fatal("Failed to copy Byron genesis path from config\n", .{});
                 };
             }
             if (parsed.shelley_genesis_path) |genesis_path| {
                 config.shelley_genesis_path = std.heap.page_allocator.dupe(u8, genesis_path) catch {
-                    std.debug.print("Failed to copy Shelley genesis path from config\n", .{});
-                    return;
+                    fatal("Failed to copy Shelley genesis path from config\n", .{});
                 };
             }
+            config.hard_fork_epoch = parsed.shelley_hard_fork_epoch;
         }
 
         if (topology_path) |path| {
             parsed_topology = node.topology.parseTopology(std.heap.page_allocator, path) catch |err| {
-                std.debug.print("Topology parse failed: {}\n", .{err});
-                return;
+                fatal("Topology parse failed: {}\n", .{err});
             };
             config.peer_endpoints = parsed_topology.?.peers;
         }
@@ -204,8 +196,7 @@ pub fn main() !void {
         node.runtime_control.installSignalHandlers();
 
         const result = node.runner.run(std.heap.page_allocator, config) catch |err| {
-            std.debug.print("Sync error: {}\n", .{err});
-            return;
+            fatal("Sync error: {}\n", .{err});
         };
 
         std.debug.print("Sync complete:\n", .{});
@@ -243,8 +234,7 @@ pub fn main() !void {
             std.heap.page_allocator,
             node.mithril.aggregator_urls.preprod,
         ) catch |err| {
-            std.debug.print("Failed to fetch snapshot: {}\n", .{err});
-            return;
+            fatal("Failed to fetch snapshot: {}\n", .{err});
         };
         defer info.deinit(std.heap.page_allocator);
 
@@ -265,8 +255,7 @@ pub fn main() !void {
                 info,
                 "db/preprod",
             ) catch |err| {
-                std.debug.print("Bootstrap failed: {}\n", .{err});
-                return;
+                fatal("Bootstrap failed: {}\n", .{err});
             };
             std.debug.print("Bootstrap complete! Run 'kassadin bootstrap-sync' to continue from tip.\n", .{});
         }
@@ -292,74 +281,63 @@ pub fn main() !void {
                 validation_endpoint = "127.0.0.1:50051";
             } else if (std.mem.eql(u8, args[i], "--dolos-grpc")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing endpoint after --dolos-grpc\n", .{});
-                    return;
+                    fatal("Missing endpoint after --dolos-grpc\n", .{});
                 }
                 validation_endpoint = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--shelley-genesis")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing path after --shelley-genesis\n", .{});
-                    return;
+                    fatal("Missing path after --shelley-genesis\n", .{});
                 }
                 shelley_genesis_path = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing path after --config\n", .{});
-                    return;
+                    fatal("Missing path after --config\n", .{});
                 }
                 config_file_path = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--max-blocks")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --max-blocks\n", .{});
-                    return;
+                    fatal("Missing value after --max-blocks\n", .{});
                 }
                 max_blocks = std.fmt.parseInt(u64, args[i + 1], 10) catch {
-                    std.debug.print("Invalid --max-blocks value: {s}\n", .{args[i + 1]});
-                    return;
+                    fatal("Invalid --max-blocks value: {s}\n", .{args[i + 1]});
                 };
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--topology")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --topology\n", .{});
-                    return;
+                    fatal("Missing value after --topology\n", .{});
                 }
                 topology_path = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--db-path")) {
                 if (i + 1 >= args.len) {
-                    std.debug.print("Missing value after --db-path\n", .{});
-                    return;
+                    fatal("Missing value after --db-path\n", .{});
                 }
                 db_path = args[i + 1];
                 i += 1;
             } else {
-                std.debug.print("Unknown bootstrap-sync argument: {s}\n", .{args[i]});
-                return;
+                fatal("Unknown bootstrap-sync argument: {s}\n", .{args[i]});
             }
         }
 
         if (config_file_path) |path| {
             var parsed = node.config.parseCardanoNodeConfig(std.heap.page_allocator, path) catch |err| {
-                std.debug.print("Config parse failed: {}\n", .{err});
-                return;
+                fatal("Config parse failed: {}\n", .{err});
             };
             defer parsed.deinit(std.heap.page_allocator);
 
             if (parsed.shelley_genesis_path) |genesis_path| {
                 shelley_genesis_path = std.heap.page_allocator.dupe(u8, genesis_path) catch {
-                    std.debug.print("Failed to copy Shelley genesis path from config\n", .{});
-                    return;
+                    fatal("Failed to copy Shelley genesis path from config\n", .{});
                 };
             }
         }
 
         if (topology_path) |path| {
             parsed_topology = node.topology.parseTopology(std.heap.page_allocator, path) catch |err| {
-                std.debug.print("Topology parse failed: {}\n", .{err});
-                return;
+                fatal("Topology parse failed: {}\n", .{err});
             };
         }
         node.runtime_control.resetStopRequested();
@@ -376,8 +354,7 @@ pub fn main() !void {
             shelley_genesis_path,
             validation_endpoint,
         ) catch |err| {
-            std.debug.print("Bootstrap sync failed: {}\n", .{err});
-            return;
+            fatal("Bootstrap sync failed: {}\n", .{err});
         };
 
         std.debug.print("\nBootstrap sync complete:\n", .{});
@@ -404,6 +381,48 @@ pub fn main() !void {
         std.debug.print("  Network tip: block={}, slot={}\n", .{ result.network_tip_block, result.network_tip_slot });
         std.debug.print("  Rollbacks: {}\n", .{result.rollbacks});
         std.debug.print("  Stopped by signal: {}\n", .{result.stopped_by_signal});
+    } else if (args.len > 1 and std.mem.eql(u8, args[1], "dolos-tip")) {
+        var endpoint: []const u8 = "127.0.0.1:50051";
+
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--dolos-grpc")) {
+                if (i + 1 >= args.len) {
+                    fatal("Missing endpoint after --dolos-grpc\n", .{});
+                }
+                endpoint = args[i + 1];
+                i += 1;
+            } else {
+                fatal("Unknown dolos-tip argument: {s}\n", .{args[i]});
+            }
+        }
+
+        std.debug.print("Kassadin — Dolos Tip\n\n", .{});
+        var client = network.dolos_grpc_client.Client.init(std.heap.page_allocator, endpoint) catch |err| {
+            fatal("Failed to initialize Dolos gRPC client: {}\n", .{err});
+        };
+        defer client.deinit();
+
+        const tip = client.readTip() catch |err| {
+            fatal("Failed to read Dolos tip: {}\n", .{err});
+        };
+
+        std.debug.print("Dolos tip:\n", .{});
+        std.debug.print("  Slot: {}\n", .{tip.slot});
+        std.debug.print("  Height: {}\n", .{tip.height});
+        std.debug.print(
+            "  Hash: {x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
+            .{
+                tip.hash[0], tip.hash[1], tip.hash[2], tip.hash[3],
+                tip.hash[4], tip.hash[5], tip.hash[6], tip.hash[7],
+                tip.hash[8], tip.hash[9], tip.hash[10], tip.hash[11],
+                tip.hash[12], tip.hash[13], tip.hash[14], tip.hash[15],
+                tip.hash[16], tip.hash[17], tip.hash[18], tip.hash[19],
+                tip.hash[20], tip.hash[21], tip.hash[22], tip.hash[23],
+                tip.hash[24], tip.hash[25], tip.hash[26], tip.hash[27],
+                tip.hash[28], tip.hash[29], tip.hash[30], tip.hash[31],
+            },
+        );
     } else {
         std.debug.print("Kassadin — Cardano Node in Zig\n", .{});
         std.debug.print("Version: 0.1.0\n", .{});
@@ -412,6 +431,7 @@ pub fn main() !void {
         std.debug.print("  kassadin bootstrap --download Download and restore snapshot\n", .{});
         std.debug.print("  kassadin bootstrap-sync [--db-path path] [--config config.json] [--topology topology.json] [--shelley-genesis path] [--max-blocks N] [--validate-dolos] [--dolos-grpc host:port]\n", .{});
         std.debug.print("  kassadin sync [--network preview|preprod] [--db-path path] [--max-headers N] [--config config.json] [--topology topology.json] [--byron-genesis path] [--shelley-genesis path]\n", .{});
+        std.debug.print("  kassadin dolos-tip [--dolos-grpc host:port]\n", .{});
         std.debug.print("  kassadin                      Show this help\n", .{});
     }
 }
