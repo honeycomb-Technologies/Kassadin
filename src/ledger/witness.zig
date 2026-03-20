@@ -32,10 +32,33 @@ pub const WitnessSet = struct {
     plutus_v3_scripts: []const []const u8,
 };
 
+/// Skip an optional CBOR tag 258 (set encoding) wrapper.
+/// Conway-era uses #6.258([...]) for witness arrays.
+fn skipSetTag(dec: *Decoder) void {
+    const pos = dec.pos;
+    if (dec.peekByte()) |b| {
+        if (b >> 5 == 6) { // major type 6 = tag
+            _ = dec.decodeTag() catch {
+                dec.pos = pos;
+                return;
+            };
+            return;
+        }
+    } else |_| {}
+}
+
+/// Decode array length, handling both definite and indefinite-length arrays.
+/// For indefinite-length, returns null (caller must read until break).
+fn decodeArrayLenFlex(dec: *Decoder) !?u64 {
+    skipSetTag(dec);
+    return dec.decodeArrayLen();
+}
+
 /// Parse a witness set from CBOR (map format).
+/// Handles both definite and indefinite-length maps (Conway compatibility).
 pub fn parseWitnessSet(allocator: Allocator, data: []const u8) !WitnessSet {
     var dec = Decoder.init(data);
-    const map_len = try dec.decodeMapLen() orelse return error.InvalidCbor;
+    const map_len = try dec.decodeMapLen(); // null = indefinite
 
     var vkey_witnesses: std.ArrayList(VKeyWitness) = .empty;
     defer vkey_witnesses.deinit(allocator);
@@ -47,14 +70,25 @@ pub fn parseWitnessSet(allocator: Allocator, data: []const u8) !WitnessSet {
     defer plutus_data.deinit(allocator);
 
     var i: u64 = 0;
-    while (i < map_len) : (i += 1) {
+    while (if (map_len) |len| i < len else true) : (i += 1) {
+        // For indefinite-length maps, check for break byte
+        if (map_len == null) {
+            if ((try dec.peekByte()) == 0xff) {
+                dec.pos += 1;
+                break;
+            }
+        }
         const key = try dec.decodeUint();
         switch (key) {
             0 => {
-                // VKey witnesses: [*[vkey, sig]]
-                const n = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                // VKey witnesses: [*[vkey, sig]] or #6.258([*[vkey, sig]])
+                const n = try decodeArrayLenFlex(&dec);
                 var j: u64 = 0;
-                while (j < n) : (j += 1) {
+                while (if (n) |len| j < len else true) : (j += 1) {
+                    if (n == null and (try dec.peekByte()) == 0xff) {
+                        dec.pos += 1;
+                        break;
+                    }
                     _ = try dec.decodeArrayLen(); // [vkey, sig]
                     const vkey_bytes = try dec.decodeBytes();
                     const sig_bytes = try dec.decodeBytes();
@@ -65,44 +99,64 @@ pub fn parseWitnessSet(allocator: Allocator, data: []const u8) !WitnessSet {
                     });
                 }
             },
-            3 => {
-                // Plutus V1 scripts
-                const n = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+            3, 6, 7 => {
+                // Plutus scripts (V1=3, V2=6, V3=7)
+                const n = try decodeArrayLenFlex(&dec);
                 var j: u64 = 0;
-                while (j < n) : (j += 1) {
+                while (if (n) |len| j < len else true) : (j += 1) {
+                    if (n == null and (try dec.peekByte()) == 0xff) {
+                        dec.pos += 1;
+                        break;
+                    }
                     const script_bytes = try dec.decodeBytes();
-                    try plutus_v1.append(allocator, script_bytes);
+                    if (key == 3) try plutus_v1.append(allocator, script_bytes);
                 }
             },
             4 => {
                 // Plutus data (datums)
-                const n = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
+                const n = try decodeArrayLenFlex(&dec);
                 var j: u64 = 0;
-                while (j < n) : (j += 1) {
+                while (if (n) |len| j < len else true) : (j += 1) {
+                    if (n == null and (try dec.peekByte()) == 0xff) {
+                        dec.pos += 1;
+                        break;
+                    }
                     const datum_raw = try dec.sliceOfNextValue();
                     try plutus_data.append(allocator, datum_raw);
                 }
             },
             5 => {
-                // Redeemers: [*[tag, index, data, ex_units]]
-                const n = (try dec.decodeArrayLen()) orelse return error.InvalidCbor;
-                var j: u64 = 0;
-                while (j < n) : (j += 1) {
-                    _ = try dec.decodeArrayLen(); // [tag, index, data, ex_units]
-                    const tag_val = try dec.decodeUint();
-                    const index = @as(u32, @intCast(try dec.decodeUint()));
-                    const data_raw = try dec.sliceOfNextValue();
-                    _ = try dec.decodeArrayLen(); // [mem, steps]
-                    const mem = try dec.decodeUint();
-                    const steps = try dec.decodeUint();
+                // Redeemers: array format [*[tag, index, data, ex_units]] (Alonzo-Babbage)
+                // or map format {[tag, index] => [data, ex_units]} (Conway)
+                const major = try dec.peekMajorType();
+                if (major == 4 or major == 6) {
+                    // Array format (possibly with set tag)
+                    const n = try decodeArrayLenFlex(&dec);
+                    var j: u64 = 0;
+                    while (if (n) |len| j < len else true) : (j += 1) {
+                        if (n == null and (try dec.peekByte()) == 0xff) {
+                            dec.pos += 1;
+                            break;
+                        }
+                        _ = try dec.decodeArrayLen(); // [tag, index, data, ex_units]
+                        const tag_val = try dec.decodeUint();
+                        const index = @as(u32, @intCast(try dec.decodeUint()));
+                        const data_raw = try dec.sliceOfNextValue();
+                        _ = try dec.decodeArrayLen(); // [mem, steps]
+                        const mem = try dec.decodeUint();
+                        const steps = try dec.decodeUint();
 
-                    try redeemers.append(allocator, .{
-                        .tag = @enumFromInt(@as(u8, @intCast(tag_val))),
-                        .index = index,
-                        .data_raw = data_raw,
-                        .ex_units_mem = mem,
-                        .ex_units_steps = steps,
-                    });
+                        try redeemers.append(allocator, .{
+                            .tag = @enumFromInt(@as(u8, @intCast(tag_val))),
+                            .index = index,
+                            .data_raw = data_raw,
+                            .ex_units_mem = mem,
+                            .ex_units_steps = steps,
+                        });
+                    }
+                } else {
+                    // Map format (Conway) — skip for now
+                    try dec.skipValue();
                 }
             },
             else => try dec.skipValue(),

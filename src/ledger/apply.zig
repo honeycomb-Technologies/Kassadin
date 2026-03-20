@@ -11,6 +11,9 @@ const UtxoEntry = @import("../storage/ledger.zig").UtxoEntry;
 const LedgerDiff = @import("../storage/ledger.zig").LedgerDiff;
 const CoinStateChange = @import("../storage/ledger.zig").CoinStateChange;
 const Decoder = @import("../cbor/decoder.zig").Decoder;
+const witness_mod = @import("witness.zig");
+const Ed25519 = @import("../crypto/ed25519.zig").Ed25519;
+const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
 
 pub const SlotNo = types.SlotNo;
 pub const BlockNo = types.BlockNo;
@@ -158,6 +161,12 @@ fn applyShelleyLikeBlock(
 
     var tx_dec = Decoder.init(block.tx_bodies_raw);
     const num_txs = (try tx_dec.decodeArrayLen()) orelse return result;
+
+    // Decode witness array header in parallel (same count as tx bodies)
+    var ws_dec = Decoder.init(block.tx_witnesses_raw);
+    const num_witnesses = (try ws_dec.decodeArrayLen()) orelse 0;
+    _ = num_witnesses;
+
     const validation_context = rules.ValidationContext{
         .current_slot = block.header.slot,
         .protocol_version_major = block.header.protocol_version_major,
@@ -168,6 +177,8 @@ fn applyShelleyLikeBlock(
     var tx_idx: u64 = 0;
     while (tx_idx < num_txs) : (tx_idx += 1) {
         const tx_raw = try tx_dec.sliceOfNextValue();
+        // Advance witness decoder in parallel (even if we skip this tx)
+        const ws_raw = ws_dec.sliceOfNextValue() catch null;
 
         var tx = tx_mod.parseTxBody(allocator, tx_raw) catch |err| {
             if (!builtin.is_test) {
@@ -178,6 +189,28 @@ fn applyShelleyLikeBlock(
             continue;
         };
         defer tx_mod.freeTxBody(allocator, &tx);
+
+        // Verify Ed25519 witness signatures against tx body hash
+        const witness_sig_invalid = blk: {
+            const witness_data = ws_raw orelse break :blk false;
+            var ws = witness_mod.parseWitnessSet(allocator, witness_data) catch break :blk false;
+            defer witness_mod.freeWitnessSet(allocator, &ws);
+
+            const tx_body_hash = Blake2b256.hash(tx_raw);
+            for (ws.vkey_witnesses) |vkw| {
+                if (!Ed25519.verify(&tx_body_hash, vkw.signature, vkw.vkey)) {
+                    if (!builtin.is_test) {
+                        std.debug.print("    Tx {}: invalid Ed25519 witness signature\n", .{tx_idx});
+                    }
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (witness_sig_invalid) {
+            result.txs_failed += 1;
+            continue;
+        }
 
         const tx_validation_context = blk: {
             var context = validation_context;
