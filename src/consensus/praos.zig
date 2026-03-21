@@ -26,9 +26,6 @@ pub const slots_per_epoch: u64 = 432_000;
 /// Slots per KES period on mainnet.
 pub const slots_per_kes_period: u64 = 129_600;
 
-/// Randomness stabilization window: 3 * k * (1/f) slots from epoch start.
-pub const randomness_stabilization_window: u64 = 3 * security_param_k; // = 6480 slots
-
 pub fn hashHeaderToNonce(hash: HeaderHash) Nonce {
     return .{ .hash = hash };
 }
@@ -220,7 +217,7 @@ test "praos: updateWithBlock tracks evolving and candidate nonces" {
         [_]u8{0x01} ** 32,
         nonceFromVrfOutput([_]u8{0xab} ** 64),
         slots_per_epoch,
-        randomness_stabilization_window,
+        129600, // 3 * k / f = 3 * 2160 / 0.05
         0,
     );
 

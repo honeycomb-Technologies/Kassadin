@@ -27,17 +27,26 @@ pub fn seedL() Nonce {
     return nonceFromNumber(1);
 }
 
-/// Haskell-aligned VRF seed construction:
-/// Seed = Blake2b256(slotNumber(8 BE) || epochNonce) XOR universalConstantNonce
+/// Haskell-aligned VRF seed construction (mkSeed):
+/// Seed = Blake2b256(slotNumber(8 BE) [|| epochNonce]) XOR universalConstantNonce
+/// When epochNonce is NeutralNonce, Haskell uses mempty (no bytes), not 32 zeros.
 pub fn makeSeed(universal_constant_nonce: Nonce, slot: SlotNo, epoch_nonce: Nonce) [32]u8 {
-    var input: [40]u8 = undefined;
-    std.mem.writeInt(u64, input[0..8], slot, .big);
+    var seed: [32]u8 = undefined;
     switch (epoch_nonce) {
-        .neutral => @memset(input[8..40], 0),
-        .hash => |h| @memcpy(input[8..40], &h),
+        .neutral => {
+            // Haskell: mempty — hash only the 8-byte slot
+            var input: [8]u8 = undefined;
+            std.mem.writeInt(u64, &input, slot, .big);
+            seed = Blake2b256.hash(&input);
+        },
+        .hash => |h| {
+            // Haskell: 8-byte slot || 32-byte nonce hash
+            var input: [40]u8 = undefined;
+            std.mem.writeInt(u64, input[0..8], slot, .big);
+            @memcpy(input[8..40], &h);
+            seed = Blake2b256.hash(&input);
+        },
     }
-
-    var seed = Blake2b256.hash(&input);
     switch (universal_constant_nonce) {
         .neutral => {},
         .hash => |h| {
