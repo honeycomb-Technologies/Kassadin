@@ -71,6 +71,7 @@ pub const RunResult = struct {
     blocks_fetched: u64,
     blocks_added_to_chain: u64,
     invalid_blocks: u64,
+    vrf_threshold_warnings: u64,
     tip_slot: u64,
     tip_block_no: u64,
     rollbacks: u64,
@@ -486,6 +487,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
         .blocks_fetched = 0,
         .blocks_added_to_chain = 0,
         .invalid_blocks = 0,
+        .vrf_threshold_warnings = 0,
         .tip_slot = 0,
         .tip_block_no = 0,
         .rollbacks = 0,
@@ -844,6 +846,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     }
 
     savePraosCheckpoint(allocator, &chain_db, config.db_path);
+    result.vrf_threshold_warnings = chain_db.vrf_threshold_warnings;
     return result;
 }
 
@@ -861,6 +864,7 @@ test "runner: initialize Byron genesis state on empty chain" {
         .blocks_fetched = 0,
         .blocks_added_to_chain = 0,
         .invalid_blocks = 0,
+        .vrf_threshold_warnings = 0,
         .tip_slot = 0,
         .tip_block_no = 0,
         .rollbacks = 0,

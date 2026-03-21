@@ -204,6 +204,9 @@ pub fn main() !void {
         std.debug.print("  Blocks fetched: {}\n", .{result.blocks_fetched});
         std.debug.print("  Blocks added: {}\n", .{result.blocks_added_to_chain});
         std.debug.print("  Invalid blocks: {}\n", .{result.invalid_blocks});
+        if (result.vrf_threshold_warnings > 0) {
+            std.debug.print("  VRF threshold warnings: {} (stake snapshot stale)\n", .{result.vrf_threshold_warnings});
+        }
         std.debug.print("  Tip slot: {}\n", .{result.tip_slot});
         std.debug.print("  Tip block: {}\n", .{result.tip_block_no});
         std.debug.print("  Rollbacks: {}\n", .{result.rollbacks});
