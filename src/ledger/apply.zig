@@ -167,6 +167,21 @@ fn applyShelleyLikeBlock(
     const num_witnesses = (try ws_dec.decodeArrayLen()) orelse 0;
     _ = num_witnesses;
 
+    // Parse invalid_txs set (Alonzo+): indices of Phase 2 script failures
+    var invalid_tx_set = std.AutoHashMap(u64, void).init(allocator);
+    defer invalid_tx_set.deinit();
+    if (block.invalid_txs_raw) |itx_raw| {
+        var itx_dec = Decoder.init(itx_raw);
+        // May be tagged with #6.258 (set)
+        if ((try itx_dec.peekMajorType()) == 6) _ = try itx_dec.decodeTag();
+        if (try itx_dec.decodeArrayLen()) |n| {
+            var j: u64 = 0;
+            while (j < n) : (j += 1) {
+                try invalid_tx_set.put(try itx_dec.decodeUint(), {});
+            }
+        }
+    }
+
     const validation_context = rules.ValidationContext{
         .current_slot = block.header.slot,
         .protocol_version_major = block.header.protocol_version_major,
@@ -209,6 +224,36 @@ fn applyShelleyLikeBlock(
         };
         if (witness_sig_invalid) {
             result.txs_failed += 1;
+            continue;
+        }
+
+        // Phase 2 script failure: apply collateral instead of normal tx
+        if (invalid_tx_set.contains(tx_idx)) {
+            if (tx.collateral_inputs.len > 0) {
+                var consumed_list: std.ArrayList(UtxoEntry) = .empty;
+                defer consumed_list.deinit(allocator);
+
+                for (tx.collateral_inputs) |input| {
+                    if (ledger.lookupUtxo(input)) |entry| {
+                        try consumed_list.append(allocator, .{
+                            .tx_in = input,
+                            .value = entry.value,
+                            .stake_credential = entry.stake_credential,
+                            .stake_pointer = entry.stake_pointer,
+                            .raw_cbor = try allocator.dupe(u8, entry.raw_cbor),
+                        });
+                    }
+                }
+                const consumed = try consumed_list.toOwnedSlice(allocator);
+                try ledger.applyDiff(.{
+                    .slot = block.header.slot,
+                    .block_hash = block.hash(),
+                    .consumed = consumed,
+                    .produced = &.{},
+                });
+            }
+            result.total_fees += if (tx.total_collateral) |c| c else tx.fee;
+            result.txs_applied += 1;
             continue;
         }
 
