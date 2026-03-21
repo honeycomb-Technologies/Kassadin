@@ -76,6 +76,8 @@ pub const ChainDB = struct {
     praos_epoch_length: u64,
     praos_era_start_slot: u64,
     praos_stability_window: u64,
+    /// Conway+ nonce freeze window (4k/f). Set from GovernanceConfig.
+    praos_randomness_stabilisation_window: u64,
     praos_initial_nonce: types.Nonce,
     praos_extra_entropy: types.Nonce,
     praos_active_slot_coeff: praos.ActiveSlotCoeff,
@@ -120,6 +122,7 @@ pub const ChainDB = struct {
             .praos_epoch_length = types.mainnet.slots_per_epoch,
             .praos_era_start_slot = 0,
             .praos_stability_window = 3 * security_param,
+            .praos_randomness_stabilisation_window = 4 * security_param,
             .praos_initial_nonce = praos.initialNonce(),
             .praos_extra_entropy = .neutral,
             .praos_active_slot_coeff = .{
@@ -219,6 +222,10 @@ pub const ChainDB = struct {
         self.praos_epoch_length = config.epoch_length;
         self.praos_era_start_slot = config.era_start_slot;
         self.praos_stability_window = config.stability_window;
+        self.praos_randomness_stabilisation_window = if (config.randomness_stabilisation_window > 0)
+            config.randomness_stabilisation_window
+        else
+            config.stability_window;
         self.praos_initial_nonce = config.initial_nonce;
         self.praos_extra_entropy = config.extra_entropy;
         self.praos_active_slot_coeff = .{
@@ -456,12 +463,17 @@ pub const ChainDB = struct {
                         .babbage, .conway => praos.praosNonceFromVrfOutput(nonce_output),
                         else => praos.nonceFromVrfOutput(nonce_output),
                     };
+                    // Babbage uses 3k/f (backwards compat), Conway+ uses 4k/f.
+                    const nonce_window = switch (block.era) {
+                        .conway => self.praos_randomness_stabilisation_window,
+                        else => self.praos_stability_window,
+                    };
                     next_praos_state.updateWithBlock(
                         block.header.slot,
                         block.header.prev_hash,
                         block_nonce,
                         self.praos_epoch_length,
-                        self.praos_stability_window,
+                        nonce_window,
                         self.praos_era_start_slot,
                     );
                     pending_praos_state = next_praos_state;
@@ -649,9 +661,11 @@ pub const ChainDB = struct {
         else
             null;
 
-        // GC promoted blocks from volatile
+        // GC promoted blocks from volatile.
+        // Window must be in slot-space: stabilityWindow = 3k/f ≈ 129600 slots on preprod.
+        // Keep 2x that to be safe (matches Haskell's conservative GC window).
         if (self.tip_block_no > self.security_param) {
-            const min_slot = self.tip_slot -| (self.security_param * 2); // conservative
+            const min_slot = self.tip_slot -| (self.praos_stability_window * 2);
             try vol.garbageCollect(min_slot);
         }
 
@@ -708,36 +722,36 @@ pub const ChainDB = struct {
             return rolled_back;
         }
 
+        // current_chain is empty after rollback. Decide where to set the tip.
         if (point) |target| {
-            if (self.base_tip) |base| {
-                if (Point.eql(base.point, target)) {
-                    self.tip_slot = base.point.slot;
-                    self.tip_hash = base.point.hash;
-                    self.tip_block_no = base.block_no;
-                    if (self.base_praos_state) |snapshot| {
-                        self.praos_state = snapshot;
-                        self.praos_tracking_ready = true;
-                    } else {
-                        self.praos_state = praos.PraosState.initWithNonce(self.praos_initial_nonce);
-                        self.praos_tracking_ready = false;
-                    }
-                    self.ledger_ready = self.ledger_validation_enabled;
-                    return rolled_back;
-                }
+            // The relay told us to roll back to a specific point. Trust it.
+            // This handles the common case where the relay skips ahead past our
+            // snapshot tip to a more recent point.
+            self.tip_slot = target.slot;
+            self.tip_hash = target.hash;
+            // Estimate block_no from base_tip if available.
+            self.tip_block_no = if (self.base_tip) |base| base.block_no else 0;
+            if (self.base_praos_state) |snapshot| {
+                self.praos_state = snapshot;
+                self.praos_tracking_ready = true;
+            } else {
+                self.praos_state = praos.PraosState.initWithNonce(self.praos_initial_nonce);
+                self.praos_tracking_ready = false;
             }
+            self.ledger_ready = self.ledger_validation_enabled;
+            return rolled_back;
         }
 
+        // Rollback to genesis (point == null)
         self.tip_slot = 0;
         self.tip_hash = [_]u8{0} ** 32;
         self.tip_block_no = 0;
-        if (point == null) {
-            self.base_tip = null;
-            self.base_praos_state = null;
-            self.ocert_counters.clearRetainingCapacity();
-        }
+        self.base_tip = null;
+        self.base_praos_state = null;
+        self.ocert_counters.clearRetainingCapacity();
         self.praos_state = praos.PraosState.initWithNonce(self.praos_initial_nonce);
         self.praos_tracking_ready = false;
-        self.ledger_ready = self.ledger_validation_enabled and point == null and self.base_tip == null;
+        self.ledger_ready = false;
         return rolled_back;
     }
 

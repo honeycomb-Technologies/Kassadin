@@ -16,6 +16,7 @@ const rewards_mod = @import("../ledger/rewards.zig");
 const ledger_rules = @import("../ledger/rules.zig");
 const ChainDB = @import("../storage/chaindb.zig").ChainDB;
 const protocol = @import("../network/protocol.zig");
+const N2CServer = @import("n2c_server.zig").N2CServer;
 
 const Point = types.Point;
 const checkpoint_version: u32 = 1;
@@ -42,6 +43,8 @@ pub const RunConfig = struct {
     hard_fork_epoch: ?u64 = null,
     /// Maximum headers to sync (0 = unlimited).
     max_headers: u64,
+    /// Optional N2C Unix socket path for local queries (e.g., cardano-cli).
+    socket_path: ?[]const u8 = null,
 
     pub const preview_defaults = RunConfig{
         .network_magic = protocol.NetworkMagic.preview,
@@ -98,6 +101,8 @@ const RuntimeSnapshot = struct {
     layout: snapshot_restore.SnapshotLayout,
     point: Point,
     block_no: u64,
+    /// Last chunk number in the Mithril snapshot (boundary for write isolation).
+    last_chunk: u32,
 
     fn deinit(self: *RuntimeSnapshot, allocator: Allocator) void {
         self.layout.deinit(allocator);
@@ -348,6 +353,7 @@ fn discoverRuntimeSnapshot(allocator: Allocator, db_path: []const u8) !?RuntimeS
             .hash = tip_result.block.hash(),
         },
         .block_no = tip_result.block.header.block_no,
+        .last_chunk = if (reader.total_chunks > 0) reader.total_chunks - 1 else 0,
     };
 }
 
@@ -420,17 +426,7 @@ fn initializeSnapshotState(
                         &config,
                     );
                     if (praos_result.state) |reconstructed_state| {
-                        var state = reconstructed_state;
-                        // TEMPORARY: Override epoch nonce with known-correct Koios value
-                        // to work around cold-reconstruction Conway nonce divergence.
-                        // TODO: Find root cause of divergence starting at preprod epoch 164.
-                        {
-                            const koios_nonce_hex = "7e93f6338fc6804a9a4485d11182ea02ad9f5e5063e0cda8d60735ecc1d55ccd";
-                            var koios_nonce: [32]u8 = undefined;
-                            _ = std.fmt.hexToBytes(&koios_nonce, koios_nonce_hex) catch unreachable;
-                            std.debug.print("  Overriding reconstructed epoch nonce with Koios epoch 276 value\n", .{});
-                            state.epoch_nonce = .{ .hash = koios_nonce };
-                        }
+                        const state = reconstructed_state;
                         chain_db.attachPraosState(state);
                         praos_checkpoint.save(allocator, db_path, snapshot.point, &config, state, chain_db.getOcertCounters()) catch {};
                         std.debug.print(
@@ -478,6 +474,17 @@ fn initializeByronGenesisState(
     result.base_utxos_primed = try chain_db.primeBaseUtxos(utxos);
     try chain_db.enableLedgerValidation();
     result.validation_enabled = true;
+}
+
+/// N2C server loop — accepts connections and serves queries until stopped.
+fn n2cServerLoop(server: *N2CServer, tip: *const N2CServer.TipState) void {
+    _ = tip;
+    while (!runtime_control.stopRequested()) {
+        server.serveOne() catch |err| {
+            if (runtime_control.stopRequested()) return;
+            std.debug.print("N2C client error: {}\n", .{err});
+        };
+    }
 }
 
 /// Run the node: load config, optionally restore from snapshot, connect, sync.
@@ -586,6 +593,11 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     defer chain_db.close();
     chain_db.ledger.setRewardAccountNetwork(networkFromMagic(config.network_magic));
 
+    // Protect Mithril snapshot chunks from being appended to.
+    if (runtime_snapshot) |snapshot| {
+        chain_db.immutable.setMithrilBoundary(snapshot.last_chunk);
+    }
+
     if (loaded_protocol_params) |protocol_params| {
         chain_db.setProtocolParams(protocol_params);
     }
@@ -636,8 +648,43 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
 
     const max = if (config.max_headers == 0) std.math.maxInt(u64) else config.max_headers;
 
+    // Shared tip state for the N2C server thread.
+    var n2c_tip = N2CServer.TipState{
+        .slot = chain_db.tip_slot,
+        .hash = chain_db.tip_hash,
+        .block_no = chain_db.tip_block_no,
+        .network_magic = config.network_magic,
+    };
+
+    // Start N2C server in a background thread if socket path configured.
+    var n2c_thread: ?std.Thread = null;
+    var n2c_server: ?N2CServer = null;
+    if (config.socket_path) |socket_path| {
+        n2c_server = N2CServer.init(allocator, socket_path, &n2c_tip) catch |err| blk: {
+            std.debug.print("N2C server failed to start on {s}: {}\n", .{ socket_path, err });
+            break :blk null;
+        };
+        if (n2c_server != null) {
+            n2c_thread = std.Thread.spawn(.{}, n2cServerLoop, .{ &n2c_server.?, &n2c_tip }) catch |err| blk: {
+                std.debug.print("N2C server thread failed to start: {}\n", .{err});
+                n2c_server.?.deinit();
+                n2c_server = null;
+                break :blk null;
+            };
+        }
+    }
+    defer {
+        if (n2c_server) |*server| server.deinit();
+    }
+
     var initial_intersect_done = false;
     var reconnect_count: u32 = 0;
+    var batch_start_time = std.time.timestamp();
+    var batch_block_count: u64 = 0;
+    var last_log_epoch: u64 = if (chain_db.shelley_governance_config) |cfg|
+        cfg.slotToEpoch(chain_db.tip_slot)
+    else
+        0;
 
     reconnect: while (result.headers_synced < max) {
         if (runtime_control.stopRequested()) {
@@ -654,8 +701,8 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                 .{ reconnect_count, endpoint.host, endpoint.port, backoff_secs },
             );
             std.Thread.sleep(backoff_secs * std.time.ns_per_s);
-        } else if (peerCount(config) > 1) {
-            std.debug.print("Connecting via topology peer {s}:{}...\n", .{ endpoint.host, endpoint.port });
+        } else {
+            std.debug.print("Connecting to {s}:{}...\n", .{ endpoint.host, endpoint.port });
         }
 
         var client = sync_mod.SyncClient.connect(
@@ -694,6 +741,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                 },
             };
             initial_intersect_done = true;
+            std.debug.print("Intersect found, syncing forward from slot {}...\n", .{result.tip_slot});
         } else {
             performReconnectIntersect(&client, &chain_db) catch |err| {
                 result.errors += 1;
@@ -808,6 +856,54 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                     const tip = chain_db.getTip();
                     result.tip_slot = tip.slot;
                     result.tip_block_no = tip.block_no;
+
+                    // Update N2C shared tip state
+                    n2c_tip.slot = tip.slot;
+                    n2c_tip.hash = tip.hash;
+                    n2c_tip.block_no = tip.block_no;
+
+                    // Epoch boundary marker
+                    if (chain_db.shelley_governance_config) |cfg| {
+                        const block_epoch = cfg.slotToEpoch(block.header.slot);
+                        if (block_epoch > last_log_epoch) {
+                            std.debug.print(
+                                "══ Epoch {} boundary at slot {} ══\n",
+                                .{ block_epoch, cfg.epochFirstSlot(block_epoch) },
+                            );
+                            last_log_epoch = block_epoch;
+                        }
+                    }
+
+                    // Per-block log
+                    std.debug.print("Block {} slot {} era={s}", .{
+                        block.header.block_no,
+                        block.header.slot,
+                        @tagName(block.era),
+                    });
+                    if (add_result == .added_to_current_chain) {
+                        std.debug.print(" +chain", .{});
+                    }
+                    std.debug.print("\n", .{});
+
+                    // Periodic summary every 100 blocks
+                    batch_block_count += 1;
+                    if (batch_block_count % 100 == 0) {
+                        const batch_now = std.time.timestamp();
+                        const elapsed = batch_now - batch_start_time;
+                        const rate = if (elapsed > 0) @divTrunc(@as(i64, @intCast(batch_block_count)), elapsed) else 0;
+                        std.debug.print(
+                            "=== {d} blocks in {d}s ({d}/s) | tip: slot {d} block {d} | volatile: {d} | rollbacks: {d} ===\n",
+                            .{
+                                batch_block_count,
+                                elapsed,
+                                rate,
+                                result.tip_slot,
+                                result.tip_block_no,
+                                chain_db.@"volatile".count(),
+                                result.rollbacks,
+                            },
+                        );
+                    }
                 },
                 .await_reply => {
                     if (runtime_control.stopRequested()) {
@@ -815,11 +911,23 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                         break :reconnect;
                     }
                     // At tip — send keep-alive and wait
+                    if (batch_block_count > 0) {
+                        std.debug.print("At tip — slot {} block {} ({} blocks synced). Waiting for new blocks...\n", .{
+                            result.tip_slot, result.tip_block_no, batch_block_count,
+                        });
+                        batch_block_count = 0;
+                        batch_start_time = std.time.timestamp();
+                    }
                     client.keepAlive() catch {};
                     std.Thread.sleep(1 * std.time.ns_per_s);
                 },
                 .roll_backward => |rb| {
                     result.rollbacks += 1;
+                    if (rb.point) |p| {
+                        std.debug.print("Rollback to slot {} (total rollbacks: {})\n", .{ p.slot, result.rollbacks });
+                    } else {
+                        std.debug.print("Rollback to genesis (total rollbacks: {})\n", .{result.rollbacks});
+                    }
                     _ = chain_db.rollbackToPoint(rb.point) catch blk: {
                         result.errors += 1;
                         break :blk 0;

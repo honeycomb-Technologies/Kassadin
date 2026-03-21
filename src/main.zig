@@ -76,6 +76,7 @@ pub const node = struct {
     pub const bootstrap_sync = @import("node/bootstrap_sync.zig");
     pub const runtime_control = @import("node/runtime_control.zig");
     pub const topology = @import("node/topology.zig");
+    pub const n2c_server = @import("node/n2c_server.zig");
 };
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
@@ -96,6 +97,7 @@ pub fn main() !void {
         var config_file_path: ?[]const u8 = null;
         var topology_path: ?[]const u8 = null;
         var db_path_override: ?[]const u8 = null;
+        var socket_path: ?[]const u8 = null;
         var parsed_topology: ?node.topology.Topology = null;
         defer {
             if (parsed_topology) |*topology| topology.deinit(std.heap.page_allocator);
@@ -156,6 +158,12 @@ pub fn main() !void {
                 }
                 db_path_override = args[i + 1];
                 i += 1;
+            } else if (std.mem.eql(u8, args[i], "--socket-path")) {
+                if (i + 1 >= args.len) {
+                    fatal("Missing value after --socket-path\n", .{});
+                }
+                socket_path = args[i + 1];
+                i += 1;
             } else {
                 fatal("Unknown sync argument: {s}\n", .{args[i]});
             }
@@ -190,6 +198,7 @@ pub fn main() !void {
         if (db_path_override) |path| {
             config.db_path = path;
         }
+        config.socket_path = socket_path;
 
         std.debug.print("Syncing from {s} network...\n\n", .{network_name});
         node.runtime_control.resetStopRequested();
@@ -433,7 +442,7 @@ pub fn main() !void {
         std.debug.print("  kassadin bootstrap           Show latest Mithril snapshot info\n", .{});
         std.debug.print("  kassadin bootstrap --download Download and restore snapshot\n", .{});
         std.debug.print("  kassadin bootstrap-sync [--db-path path] [--config config.json] [--topology topology.json] [--shelley-genesis path] [--max-blocks N] [--validate-dolos] [--dolos-grpc host:port]\n", .{});
-        std.debug.print("  kassadin sync [--network preview|preprod] [--db-path path] [--max-headers N] [--config config.json] [--topology topology.json] [--byron-genesis path] [--shelley-genesis path]\n", .{});
+        std.debug.print("  kassadin sync [--network preview|preprod] [--db-path path] [--max-headers N] [--config config.json] [--topology topology.json] [--byron-genesis path] [--shelley-genesis path] [--socket-path path]\n", .{});
         std.debug.print("  kassadin dolos-tip [--dolos-grpc host:port]\n", .{});
         std.debug.print("  kassadin                      Show this help\n", .{});
     }
