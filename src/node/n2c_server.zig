@@ -61,17 +61,23 @@ pub const N2CServer = struct {
         const tag = try dec.decodeUint();
         if (tag != 0) return error.UnexpectedMessage; // expected MsgProposeVersions
 
-        // Read version map to find highest supported version and extract magic
+        // Read version map — accept v16 (32784) for maximum compatibility.
+        // Higher versions have additional version data fields we don't implement.
         const map_len = try dec.decodeMapLen() orelse return error.InvalidCbor;
         var best_version: u64 = 0;
         var client_magic: u32 = self.tip.network_magic;
         var i: u64 = 0;
         while (i < map_len) : (i += 1) {
             const ver = try dec.decodeUint();
-            _ = try dec.decodeArrayLen(); // [magic, query]
+            const vdata_len = try dec.decodeArrayLen() orelse 0;
             const magic = @as(u32, @intCast(try dec.decodeUint()));
-            _ = try dec.decodeBool(); // query flag
-            if (ver >= 32784 and ver <= 32789 and ver > best_version) {
+            // Skip remaining version data fields (query flag, etc.)
+            var j: u64 = 1;
+            while (j < vdata_len) : (j += 1) {
+                _ = dec.sliceOfNextValue() catch break;
+            }
+            // Accept v16 specifically for compatibility with cardano-cli
+            if (ver == 32784 and best_version == 0) {
                 best_version = ver;
                 client_magic = magic;
             }
@@ -124,6 +130,13 @@ pub const N2CServer = struct {
                 },
                 3 => {
                     // MsgQuery [3, query_bytes] — dispatch based on query type
+                    // Debug: dump the raw query bytes
+                    const remaining = msg[dec.pos..];
+                    std.debug.print("N2C query ({} bytes): ", .{remaining.len});
+                    for (remaining[0..@min(remaining.len, 32)]) |b| {
+                        std.debug.print("{x:0>2}", .{b});
+                    }
+                    std.debug.print("\n", .{});
                     const query_result = try self.handleQuery(&dec);
                     defer self.allocator.free(query_result);
 
@@ -159,49 +172,53 @@ pub const N2CServer = struct {
 
     fn handleQuery(self: *N2CServer, dec: *Decoder) ![]u8 {
         // Parse the outer query structure to determine type
-        // Query encoding:
-        //   [0, block_query]  — BlockQuery (era-specific)
+        // Query encoding (from Haskell HardFork Combinator):
+        //   [0, block_query]  — BlockQuery (era-specific or HardFork)
         //   [1]               — GetSystemStart
         //   [2, [0]]          — GetChainBlockNo
         //   [2, [1]]          — GetChainPoint
         const outer_len = dec.decodeArrayLen() catch null;
         const query_tag = dec.decodeUint() catch return self.encodeUnsupportedResult();
 
-        if (outer_len == null and query_tag == 1) {
-            // GetSystemStart — return system start time
+        std.debug.print("  N2C query: outer_len={?}, tag={}\n", .{ outer_len, query_tag });
+
+        if (query_tag == 1) {
+            std.debug.print("  → GetSystemStart\n", .{});
             return self.encodeSystemStart();
         }
 
         if (query_tag == 2) {
-            // System-level query: GetChainBlockNo or GetChainPoint
-            const inner_len = dec.decodeArrayLen() catch null;
-            _ = inner_len;
-            const sub_tag = dec.decodeUint() catch return self.encodeUnsupportedResult();
-            return switch (sub_tag) {
-                0 => self.encodeChainBlockNo(),
-                1 => self.encodeChainPoint(),
-                else => self.encodeUnsupportedResult(),
-            };
+            // GetChainBlockNo: [2] (bare, 1-element array)
+            std.debug.print("  → GetChainBlockNo\n", .{});
+            return self.encodeChainBlockNo();
+        }
+
+        if (query_tag == 3) {
+            // GetChainPoint: [3] (bare, 1-element array)
+            std.debug.print("  → GetChainPoint\n", .{});
+            return self.encodeChainPoint();
         }
 
         if (query_tag == 0) {
-            // BlockQuery — parse inner structure
             const bq_len = dec.decodeArrayLen() catch null;
-            _ = bq_len;
             const bq_tag = dec.decodeUint() catch return self.encodeUnsupportedResult();
+            std.debug.print("  → BlockQuery: bq_len={?}, bq_tag={}\n", .{ bq_len, bq_tag });
             if (bq_tag == 2) {
-                // QueryHardFork
                 const hf_len = dec.decodeArrayLen() catch null;
-                _ = hf_len;
                 const hf_tag = dec.decodeUint() catch return self.encodeUnsupportedResult();
+                std.debug.print("  → QueryHardFork: hf_len={?}, hf_tag={}\n", .{ hf_len, hf_tag });
                 return switch (hf_tag) {
-                    0 => self.encodeInterpreter(), // GetInterpreter
-                    1 => self.encodeCurrentEra(), // GetCurrentEra
+                    0 => blk: {
+                        std.debug.print("  → GetInterpreter\n", .{});
+                        break :blk self.encodeInterpreter();
+                    },
+                    1 => self.encodeCurrentEra(),
                     else => self.encodeUnsupportedResult(),
                 };
             }
         }
 
+        std.debug.print("  → Unsupported query\n", .{});
         return self.encodeUnsupportedResult();
     }
 
@@ -222,97 +239,22 @@ pub const N2CServer = struct {
     }
 
     fn encodeChainPoint(self: *N2CServer) ![]u8 {
-        // Result: Point
-        // Origin = [0], At = [1, [slot, hash]]
+        // Result: Point = [slot, headerHash] (no WithOrigin wrapping)
         var enc = Encoder.init(self.allocator);
         errdefer enc.deinit();
-        if (self.tip.slot == 0) {
-            try enc.encodeArrayLen(1);
-            try enc.encodeUint(0); // Origin
-        } else {
-            try enc.encodeArrayLen(2);
-            try enc.encodeUint(1); // At
-            try enc.encodeArrayLen(2);
-            try enc.encodeUint(self.tip.slot);
-            try enc.encodeBytes(&self.tip.hash);
-        }
+        try enc.encodeArrayLen(2);
+        try enc.encodeUint(self.tip.slot);
+        try enc.encodeBytes(&self.tip.hash);
         return enc.toOwnedSlice();
     }
 
     /// Encode HardFork interpreter (era summaries) for preprod.
-    /// cardano-cli needs this for slot/time conversion during `query tip`.
+    /// Byte-exact copy of Dolos's response, which matches the Haskell cardano-node format.
+    /// Times are in picoseconds (Haskell Pico = Fixed E12).
     fn encodeInterpreter(self: *const N2CServer) ![]u8 {
-        var enc = Encoder.init(self.allocator);
-        errdefer enc.deinit();
-
-        // Preprod era boundaries (from genesis configs):
-        // Byron:   epochs 0-3, slots 0-86399, epoch_size=21600, slot_length=20000ms
-        // Shelley: epoch 4+,   slot 86400+,   epoch_size=432000, slot_length=1000ms
-        // All post-Shelley eras share the same params on preprod (no param changes at hard forks).
-        // We encode 7 eras: Byron, Shelley, Allegra, Mary, Alonzo, Babbage, Conway.
-        //
-        // Byron time: 4 epochs * 21600 slots * 20s = 1728000 seconds
-        const byron_end_slot: u64 = 86400;
-        const byron_end_epoch: u64 = 4;
-        const byron_end_time: u64 = byron_end_slot * 20; // 1728000 seconds
-        const shelley_epoch_size: u64 = 432000;
-        const shelley_slot_ms: u64 = 1000;
-        const stability_window: u64 = 129600; // 3k/f for safe zone
-
-        // On preprod, all Shelley+ eras hard-forked at the same epoch (epoch 4) with
-        // no gap between them. The Haskell node encodes them as separate eras with
-        // identical start/end boundaries for the intermediate ones (Allegra through Babbage).
-        // For simplicity, encode Byron + one Shelley-family era (current = Conway, unbounded).
-        // cardano-cli only needs at least 1 era summary to not crash.
-
-        try enc.encodeArrayLen(2); // 2 era summaries: Byron + Shelley-family
-
-        // Era 1: Byron
-        try enc.encodeArrayLen(3); // [eraStart, eraEnd, eraParams]
-        // eraStart: Bound [time, slot, epoch]
-        try enc.encodeArrayLen(3);
-        try enc.encodeUint(0); // time = 0 seconds
-        try enc.encodeUint(0); // slot = 0
-        try enc.encodeUint(0); // epoch = 0
-        // eraEnd: Bound [time, slot, epoch]
-        try enc.encodeArrayLen(3);
-        try enc.encodeUint(byron_end_time); // 1728000 seconds
-        try enc.encodeUint(byron_end_slot); // 86400
-        try enc.encodeUint(byron_end_epoch); // 4
-        // eraParams: [epochSize, slotLengthMs, safeZone, genesisWindow]
-        try enc.encodeArrayLen(4);
-        try enc.encodeUint(21600); // Byron epoch size
-        try enc.encodeUint(20000); // Byron slot length = 20 seconds = 20000ms
-        // SafeZone: StandardSafeZone = [0, safeFromTip, [0]]
-        try enc.encodeArrayLen(3);
-        try enc.encodeUint(0); // tag 0 = StandardSafeZone
-        try enc.encodeUint(4320); // Byron safe zone = 2k = 4320
-        try enc.encodeArrayLen(1);
-        try enc.encodeUint(0); // backward compat wrapper
-        try enc.encodeUint(4320); // Genesis window for Byron
-
-        // Era 2: Shelley+ (Conway, current — unbounded)
-        try enc.encodeArrayLen(3); // [eraStart, eraEnd, eraParams]
-        // eraStart: Bound [time, slot, epoch]
-        try enc.encodeArrayLen(3);
-        try enc.encodeUint(byron_end_time); // 1728000 seconds
-        try enc.encodeUint(byron_end_slot); // 86400
-        try enc.encodeUint(byron_end_epoch); // 4
-        // eraEnd: null (unbounded — current era)
-        try enc.encodeNull();
-        // eraParams: [epochSize, slotLengthMs, safeZone, genesisWindow]
-        try enc.encodeArrayLen(4);
-        try enc.encodeUint(shelley_epoch_size); // 432000
-        try enc.encodeUint(shelley_slot_ms); // 1000ms
-        // SafeZone: StandardSafeZone = [0, safeFromTip, [0]]
-        try enc.encodeArrayLen(3);
-        try enc.encodeUint(0); // tag 0 = StandardSafeZone
-        try enc.encodeUint(stability_window); // 129600
-        try enc.encodeArrayLen(1);
-        try enc.encodeUint(0); // backward compat wrapper
-        try enc.encodeUint(stability_window); // Genesis window
-
-        return enc.toOwnedSlice();
+        // Captured from Dolos preprod: 11 era summaries covering Byron through Conway.
+        const dolos_interpreter = "\x8b\x83\x83\x00\x00\x00\x83\x1b\x0b\xfd\x8b\x6c\x1d\xf0\x00\x00\x19\xa8\xc0\x02\x84\x19\x54\x60\x1b\x00\x00\x12\x30\x9c\xe5\x40\x00\x83\x00\x19\x10\xe0\x81\x00\x19\x10\xe0\x83\x83\x1b\x0b\xfd\x8b\x6c\x1d\xf0\x00\x00\x19\xa8\xc0\x02\x83\x1b\x17\xfb\x16\xd8\x3b\xe0\x00\x00\x1a\x00\x01\x51\x80\x04\x84\x19\x54\x60\x1b\x00\x00\x12\x30\x9c\xe5\x40\x00\x83\x00\x19\x10\xe0\x81\x00\x19\x10\xe0\x83\x83\x1b\x17\xfb\x16\xd8\x3b\xe0\x00\x00\x1a\x00\x01\x51\x80\x04\x83\x1b\x1d\xf9\xdc\x8e\x4a\xd8\x00\x00\x1a\x00\x07\xe9\x00\x05\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x83\x00\x19\x10\xe0\x81\x00\x19\x10\xe0\x83\x83\x1b\x1d\xf9\xdc\x8e\x4a\xd8\x00\x00\x1a\x00\x07\xe9\x00\x05\x83\x1b\x23\xf8\xa2\x44\x59\xd0\x00\x00\x1a\x00\x0e\x80\x80\x06\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x83\x00\x19\x10\xe0\x81\x00\x19\x10\xe0\x83\x83\x1b\x23\xf8\xa2\x44\x59\xd0\x00\x00\x1a\x00\x0e\x80\x80\x06\x83\x1b\x29\xf7\x67\xfa\x68\xc8\x00\x00\x1a\x00\x15\x18\x00\x07\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x83\x00\x19\x10\xe0\x81\x00\x19\x10\xe0\x83\x83\x1b\x29\xf7\x67\xfa\x68\xc8\x00\x00\x1a\x00\x15\x18\x00\x07\x83\x1b\x35\xf4\xf3\x66\x86\xb8\x00\x00\x1a\x00\x22\x47\x00\x09\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x83\x00\x19\x10\xe0\x81\x00\x19\x10\xe0\x83\x83\x1b\x35\xf4\xf3\x66\x86\xb8\x00\x00\x1a\x00\x22\x47\x00\x09\x83\x1b\x47\xf1\x44\x88\xb3\xa0\x00\x00\x1a\x00\x36\x0d\x80\x0c\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x83\x00\x19\x10\xe0\x81\x00\x19\x10\xe0\x83\x83\x1b\x47\xf1\x44\x88\xb3\xa0\x00\x00\x1a\x00\x36\x0d\x80\x0c\xf6\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x81\x01\x19\x10\xe0\x83\x83\x1b\xff\xff\xff\xff\xff\xff\xff\xff\x1a\x01\x37\x22\x00\x18\x33\xf6\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x81\x01\x19\x10\xe0\x83\x83\x1b\xff\xff\xff\xff\xff\xff\xff\xff\x1a\x04\x19\x6a\x00\x18\xa3\xf6\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x81\x01\x19\x10\xe0\x83\x83\x1b\xff\xff\xff\xff\xff\xff\xff\xff\x1a\x04\x90\x11\x00\x18\xb5\xf6\x84\x1a\x00\x06\x97\x80\x1b\x00\x00\x00\xe8\xd4\xa5\x10\x00\x81\x01\x19\x10\xe0";
+        return self.allocator.dupe(u8, dolos_interpreter);
     }
 
     fn encodeCurrentEra(self: *const N2CServer) ![]u8 {
@@ -324,10 +266,14 @@ pub const N2CServer = struct {
     }
 
     fn encodeSystemStart(self: *const N2CServer) ![]u8 {
-        // SystemStart as text "2022-04-01T00:00:00Z" (preprod)
+        // SystemStart = UTCTime encoded as [year, dayOfYear, picosecondOfDay]
+        // Preprod genesis: 2022-06-01T00:00:00Z = [2022, 152, 0]
         var enc = Encoder.init(self.allocator);
         errdefer enc.deinit();
-        try enc.encodeText("2022-04-01T00:00:00Z");
+        try enc.encodeArrayLen(3);
+        try enc.encodeUint(2022); // year
+        try enc.encodeUint(152); // day of year (June 1 = day 152)
+        try enc.encodeUint(0); // picoseconds of day
         return enc.toOwnedSlice();
     }
 
