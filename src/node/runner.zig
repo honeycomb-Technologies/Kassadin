@@ -636,9 +636,8 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
 
     var initial_intersect_done = false;
     var reconnect_count: u32 = 0;
-    const max_reconnects: u32 = 50;
 
-    reconnect: while (reconnect_count <= max_reconnects and result.headers_synced < max) {
+    reconnect: while (result.headers_synced < max) {
         if (runtime_control.stopRequested()) {
             result.stopped_by_signal = true;
             break;
@@ -646,11 +645,13 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
 
         const endpoint = peerForAttempt(config, reconnect_count);
         if (reconnect_count > 0) {
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s max
+            const backoff_secs: u64 = @min(60, @as(u64, 1) << @intCast(@min(reconnect_count, 6)));
             std.debug.print(
-                "Reconnecting ({}/{}) via {s}:{}...\n",
-                .{ reconnect_count, max_reconnects, endpoint.host, endpoint.port },
+                "Reconnecting (attempt {}) via {s}:{} (backoff {}s)...\n",
+                .{ reconnect_count, endpoint.host, endpoint.port, backoff_secs },
             );
-            std.Thread.sleep(2 * std.time.ns_per_s);
+            std.Thread.sleep(backoff_secs * std.time.ns_per_s);
         } else if (peerCount(config) > 1) {
             std.debug.print("Connecting via topology peer {s}:{}...\n", .{ endpoint.host, endpoint.port });
         }
@@ -782,6 +783,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                     switch (add_result) {
                         .added_to_current_chain => {
                             result.blocks_added_to_chain += 1;
+                            reconnect_count = 0; // reset backoff on progress
                             try pushResumePoint(&resume_points, allocator, point);
                             saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
                             const promoted = try chain_db.promoteFinalized();
