@@ -426,11 +426,11 @@ pub const ChainDB = struct {
                 }
 
                 self.validateConsensusPrereqs(block, &next_praos_state) catch |err| {
-                    // Treat VRFLeaderValueTooBig as non-fatal: the VRF proof is valid
-                    // but the leader threshold check fails due to stale snapshot stake
-                    // data. This is expected when our Mithril snapshot is behind the
-                    // chain tip. The block was already validated by the producing node.
-                    if (err == error.VRFLeaderValueTooBig) {
+                    // Treat VRFLeaderValueTooBig and VRFKeyUnknown as non-fatal:
+                    // our Mithril snapshot pool registry is inherently stale — pools
+                    // may have registered or rotated VRF keys since the snapshot.
+                    // The block was already validated by the producing node.
+                    if (err == error.VRFLeaderValueTooBig or err == error.VRFKeyUnknown) {
                         self.vrf_threshold_warnings += 1;
                     } else {
                         if (!builtin.is_test) {
