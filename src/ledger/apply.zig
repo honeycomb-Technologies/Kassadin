@@ -535,7 +535,7 @@ test "apply: golden Byron block transaction updates ledger" {
     var tx = try tx_mod.parseByronTxBody(allocator, tx_raw);
     defer tx_mod.freeTxBody(allocator, &tx);
 
-    var genesis = @import("../node/genesis.zig").parseByronGenesis(allocator, "byron.json") catch |err| {
+    var genesis = @import("../node/genesis.zig").parseByronGenesis(allocator, "config/preprod/byron.json") catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };

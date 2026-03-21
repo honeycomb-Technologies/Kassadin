@@ -61,8 +61,8 @@ pub const RunConfig = struct {
         .peer_host = "preprod-node.play.dev.cardano.org",
         .peer_port = 3001,
         .db_path = "db/preprod",
-        .byron_genesis_path = "byron.json",
-        .shelley_genesis_path = "shelley.json",
+        .byron_genesis_path = "config/preprod/byron.json",
+        .shelley_genesis_path = "config/preprod/shelley.json",
         .hard_fork_epoch = 4,
         .max_headers = 0,
     };
@@ -995,7 +995,7 @@ test "runner: initialize Byron genesis state on empty chain" {
         .stopped_by_signal = false,
     };
 
-    initializeByronGenesisState(allocator, &chain_db, "byron.json", &result) catch |err| {
+    initializeByronGenesisState(allocator, &chain_db, "config/preprod/byron.json", &result) catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };
@@ -1043,7 +1043,7 @@ test "runner: config defaults" {
     const preprod = RunConfig.preprod_defaults;
     try std.testing.expectEqual(@as(u32, 1), preprod.network_magic);
     try std.testing.expectEqualStrings("db/preprod", preprod.db_path);
-    try std.testing.expectEqualStrings("byron.json", preprod.byron_genesis_path.?);
+    try std.testing.expectEqualStrings("config/preprod/byron.json", preprod.byron_genesis_path.?);
 }
 
 test "runner: resume checkpoint round-trip" {

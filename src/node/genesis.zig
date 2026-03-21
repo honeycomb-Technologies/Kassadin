@@ -479,7 +479,7 @@ test "genesis: parse real shelley genesis" {
 test "genesis: load Shelley governance config" {
     const allocator = std.testing.allocator;
 
-    var config = loadShelleyGovernanceConfig(allocator, "shelley.json") catch |err| {
+    var config = loadShelleyGovernanceConfig(allocator, "config/preprod/shelley.json") catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };
@@ -522,7 +522,7 @@ test "genesis: extract float from JSON" {
 test "genesis: parse local byron genesis summary" {
     const allocator = std.testing.allocator;
 
-    var genesis = parseByronGenesis(allocator, "byron.json") catch |err| {
+    var genesis = parseByronGenesis(allocator, "config/preprod/byron.json") catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };
@@ -552,7 +552,7 @@ test "genesis: parse official mainnet byron genesis summary" {
 test "genesis: build local byron genesis utxos" {
     const allocator = std.testing.allocator;
 
-    var genesis = parseByronGenesis(allocator, "byron.json") catch |err| {
+    var genesis = parseByronGenesis(allocator, "config/preprod/byron.json") catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };

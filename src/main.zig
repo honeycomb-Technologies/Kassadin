@@ -276,7 +276,7 @@ pub fn main() !void {
         std.debug.print("Kassadin — Bootstrap Sync (preprod)\n\n", .{});
 
         var validation_endpoint: ?[]const u8 = null;
-        var shelley_genesis_path: ?[]const u8 = "shelley.json";
+        var shelley_genesis_path: ?[]const u8 = "config/preprod/shelley.json";
         var config_file_path: ?[]const u8 = null;
         var topology_path: ?[]const u8 = null;
         var max_blocks: u64 = 0;

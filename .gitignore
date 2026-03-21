@@ -14,3 +14,5 @@ scratch_*
 .zig-cache-local/
 .zig-global-cache/
 logs/
+cardano-cli-native
+*.socket
