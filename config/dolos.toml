@@ -6,10 +6,10 @@ version = "v3"
 path = "data"
 
 [genesis]
-byron_path = "byron.json"
-shelley_path = "shelley.json"
-alonzo_path = "alonzo.json"
-conway_path = "conway.json"
+byron_path = "config/preprod/byron.json"
+shelley_path = "config/preprod/shelley.json"
+alonzo_path = "config/preprod/alonzo.json"
+conway_path = "config/preprod/conway.json"
 
 [sync]
 max_history = 86400
