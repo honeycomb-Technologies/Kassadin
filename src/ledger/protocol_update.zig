@@ -49,6 +49,8 @@ pub const OwnedVote = struct {
 pub const GovernanceConfig = struct {
     epoch_length: u64,
     stability_window: u64,
+    /// Nonce freeze window for Conway+ (4k/f slots). Babbage and earlier use stability_window (3k/f).
+    randomness_stabilisation_window: u64 = 0,
     update_quorum: u64,
     initial_nonce: types.Nonce,
     extra_entropy: types.Nonce,

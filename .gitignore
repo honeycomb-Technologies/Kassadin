@@ -6,6 +6,7 @@ zig-cache/
 *.so
 *.dylib
 reference-*/
+vendor/plutuz/.zig-cache/
 data/
 db/
 .DS_Store

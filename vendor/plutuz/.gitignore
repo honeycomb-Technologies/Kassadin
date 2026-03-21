@@ -1,0 +1,8 @@
+zig-out/
+.zig-cache/
+uplc/
+plutigo/
+plutus-hs/
+bench/turbo
+bench/results/
+.claude/settings.local.json

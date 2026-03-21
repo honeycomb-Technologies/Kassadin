@@ -22,6 +22,13 @@ pub const Peer = struct {
         const stream = try std.net.tcpConnectToHost(allocator, host, port);
         errdefer stream.close();
 
+        // Set socket timeouts to avoid hanging on dead connections.
+        // SO_RCVTIMEO = 60s for reads, SO_SNDTIMEO = 30s for writes.
+        const recv_timeout = std.posix.timeval{ .sec = 60, .usec = 0 };
+        const send_timeout = std.posix.timeval{ .sec = 30, .usec = 0 };
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_timeout)) catch {};
+
         var self = Peer{
             .allocator = allocator,
             .stream = stream,

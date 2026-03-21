@@ -27,9 +27,17 @@ pub fn reconstructFromImmutable(
     var state: ?praos.PraosState = null;
     var last_shelley_slot: ?types.SlotNo = null;
 
+    std.debug.print("Reconstructing Praos state from {} immutable chunks (this may take several minutes)...\n", .{reader.total_chunks});
+
     var chunk_idx: u32 = 0;
     outer: while (chunk_idx < reader.total_chunks) : (chunk_idx += 1) {
         if (runtime_control.stopRequested()) return error.Interrupted;
+
+        if (chunk_idx > 0 and chunk_idx % 500 == 0) {
+            std.debug.print("  Praos reconstruction: chunk {}/{} ({}%)...\n", .{
+                chunk_idx, reader.total_chunks, chunk_idx * 100 / reader.total_chunks,
+            });
+        }
 
         var path_buf: [512]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{
@@ -74,12 +82,20 @@ pub fn reconstructFromImmutable(
                 .babbage, .conway => praos.praosNonceFromVrfOutput(nonce_output),
                 else => praos.nonceFromVrfOutput(nonce_output),
             };
+            // Babbage uses 3k/f (backwards compat), Conway+ uses 4k/f.
+            const nonce_window = switch (block.era) {
+                .conway => if (config.randomness_stabilisation_window > 0)
+                    config.randomness_stabilisation_window
+                else
+                    config.stability_window,
+                else => config.stability_window,
+            };
             state.?.updateWithBlock(
                 block.header.slot,
                 block.header.prev_hash,
                 block_nonce,
                 config.epoch_length,
-                config.stability_window,
+                nonce_window,
                 config.era_start_slot,
             );
 

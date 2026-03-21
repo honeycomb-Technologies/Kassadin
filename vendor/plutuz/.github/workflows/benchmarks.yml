@@ -1,0 +1,62 @@
+name: Benchmarks
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 2 AM UTC nightly
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new commits
+        id: check
+        run: |
+          LAST_RUN=$(gh run list --workflow=benchmarks.yml --status=success --limit=1 --json createdAt --jq '.[0].createdAt // empty' 2>/dev/null || true)
+          if [ -n "$LAST_RUN" ]; then
+            COMMITS=$(git log --since="$LAST_RUN" --oneline | wc -l)
+            if [ "$COMMITS" -eq 0 ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "No new commits since last successful run"
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Setup Zig
+        if: steps.check.outputs.skip != 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cache turbo benchmark data
+        if: steps.check.outputs.skip != 'true'
+        id: cache-turbo
+        uses: actions/cache@v4
+        with:
+          path: bench/turbo
+          key: turbo-bench-data-v1
+
+      - name: Download turbo benchmark data
+        if: steps.check.outputs.skip != 'true' && steps.cache-turbo.outputs.cache-hit != 'true'
+        run: zig build download-bench
+
+      - name: Run plutus_use_cases benchmarks
+        if: steps.check.outputs.skip != 'true'
+        run: zig build bench -- --quiet
+
+      - name: Run turbo benchmarks
+        if: false # disabled — turbo bench is being weird
+        run: zig build bench-turbo -- --quiet
+
+      - name: Upload benchmark results
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: bench/results/
+          retention-days: 30

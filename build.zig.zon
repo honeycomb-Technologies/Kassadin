@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .plutuz = .{
-            .path = "reference-plutuz",
+            .path = "vendor/plutuz",
         },
     },
     .paths = .{

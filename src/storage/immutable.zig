@@ -44,6 +44,9 @@ pub const ImmutableDB = struct {
     secondary_index: std.AutoHashMap(HeaderHash, BlockInfo),
     // Current chunk file handle
     chunk_file: ?std.fs.File,
+    /// When set, appendBlock() will skip to boundary+1 instead of writing
+    /// into Mithril snapshot chunks (which use different framing).
+    mithril_boundary_chunk: ?u32 = null,
 
     pub fn open(allocator: Allocator, base_path: []const u8) !ImmutableDB {
         // Ensure directory exists
@@ -71,8 +74,24 @@ pub const ImmutableDB = struct {
         self.secondary_index.deinit();
     }
 
+    /// Mark the highest Mithril snapshot chunk so appendBlock() won't corrupt it.
+    pub fn setMithrilBoundary(self: *ImmutableDB, last_chunk: u32) void {
+        self.mithril_boundary_chunk = last_chunk;
+    }
+
     /// Append a block to the current chunk.
     pub fn appendBlock(self: *ImmutableDB, hash: HeaderHash, block_data: []const u8, slot: SlotNo, block_no: BlockNo) !void {
+        // Skip past Mithril snapshot chunks to avoid corrupting them.
+        if (self.mithril_boundary_chunk) |boundary| {
+            if (self.current_chunk <= boundary) {
+                if (self.chunk_file) |f| {
+                    f.close();
+                    self.chunk_file = null;
+                }
+                self.current_chunk = boundary + 1;
+            }
+        }
+
         // Open or create chunk file
         if (self.chunk_file == null) {
             self.chunk_file = try self.openOrCreateChunk(self.current_chunk);

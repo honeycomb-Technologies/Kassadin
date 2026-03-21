@@ -245,6 +245,7 @@ pub const Bearer = struct {
             const n = self.stream.read(buf[total..]) catch |err| {
                 return switch (err) {
                     error.ConnectionResetByPeer => error.ConnectionClosed,
+                    error.WouldBlock => error.ReadTimeout,
                     else => err,
                 };
             };
@@ -259,6 +260,7 @@ pub const Bearer = struct {
             total += self.stream.write(data[total..]) catch |err| {
                 return switch (err) {
                     error.BrokenPipe => error.ConnectionClosed,
+                    error.WouldBlock => error.WriteTimeout,
                     else => err,
                 };
             };
@@ -268,6 +270,8 @@ pub const Bearer = struct {
     pub const Error = error{
         BufferTooSmall,
         ConnectionClosed,
+        ReadTimeout,
+        WriteTimeout,
     };
 };
 

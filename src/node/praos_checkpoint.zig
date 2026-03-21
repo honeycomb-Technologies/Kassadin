@@ -5,7 +5,7 @@ const praos = @import("../consensus/praos.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
 const ChainDB = @import("../storage/chaindb.zig").ChainDB;
 
-const checkpoint_version: u32 = 3;
+const checkpoint_version: u32 = 4;
 
 /// Maximum number of OCert counter entries we'll persist.
 /// Preprod has ~500 active pools; mainnet ~3,000. 8,192 is generous headroom.
@@ -231,9 +231,9 @@ test "praos checkpoint: old version returns null" {
     const path = try checkpointPath(allocator, db_path);
     defer allocator.free(path);
 
-    // Write a file with version 2 (old format)
+    // Write a file with version 3 (old format)
     var header: [4]u8 = undefined;
-    std.mem.writeInt(u32, &header, 2, .big);
+    std.mem.writeInt(u32, &header, 3, .big);
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = &header });
 
     const point = types.Point{ .slot = 0, .hash = [_]u8{0} ** 32 };

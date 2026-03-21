@@ -222,6 +222,7 @@ pub fn loadShelleyGovernanceConfig(allocator: Allocator, path: []const u8) !prot
     return .{
         .epoch_length = epoch_length,
         .stability_window = computeStabilityWindow(security_param, active_slots_coeff),
+        .randomness_stabilisation_window = computeRandomnessStabilisationWindow(security_param, active_slots_coeff),
         .update_quorum = update_quorum,
         .initial_nonce = .{ .hash = Blake2b256.hash(content) },
         .extra_entropy = extra_entropy,
@@ -424,6 +425,12 @@ fn computeStabilityWindow(security_param: u64, active_slots_coeff: f64) u64 {
     return @intFromFloat(@ceil(numerator / active_slots_coeff));
 }
 
+/// Conway+ nonce freeze window = ceil(4k/f). See Haskell computeRandomnessStabilisationWindow.
+fn computeRandomnessStabilisationWindow(security_param: u64, active_slots_coeff: f64) u64 {
+    const numerator = 4.0 * @as(f64, @floatFromInt(security_param));
+    return @intFromFloat(@ceil(numerator / active_slots_coeff));
+}
+
 fn extractBalanceMap(
     allocator: Allocator,
     root: std_json.ObjectMap,
@@ -480,6 +487,7 @@ test "genesis: load Shelley governance config" {
 
     try std.testing.expectEqual(@as(u64, 432000), config.epoch_length);
     try std.testing.expectEqual(@as(u64, 129600), config.stability_window);
+    try std.testing.expectEqual(@as(u64, 172800), config.randomness_stabilisation_window);
     try std.testing.expectEqual(@as(u64, 5), config.update_quorum);
     try std.testing.expectEqual(@as(u16, 150), config.reward_params.n_opt);
     try std.testing.expectApproxEqAbs(@as(f64, 0.3), config.reward_params.a0.toFloat(), 1e-6);
