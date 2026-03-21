@@ -185,7 +185,7 @@ pub const N2CServer = struct {
         }
 
         if (query_tag == 0) {
-            // BlockQuery — check for GetCurrentEra [0, [2, [1]]]
+            // BlockQuery — parse inner structure
             const bq_len = dec.decodeArrayLen() catch null;
             _ = bq_len;
             const bq_tag = dec.decodeUint() catch return self.encodeUnsupportedResult();
@@ -194,10 +194,11 @@ pub const N2CServer = struct {
                 const hf_len = dec.decodeArrayLen() catch null;
                 _ = hf_len;
                 const hf_tag = dec.decodeUint() catch return self.encodeUnsupportedResult();
-                if (hf_tag == 1) {
-                    // GetCurrentEra
-                    return self.encodeCurrentEra();
-                }
+                return switch (hf_tag) {
+                    0 => self.encodeInterpreter(), // GetInterpreter
+                    1 => self.encodeCurrentEra(), // GetCurrentEra
+                    else => self.encodeUnsupportedResult(),
+                };
             }
         }
 
@@ -235,6 +236,82 @@ pub const N2CServer = struct {
             try enc.encodeUint(self.tip.slot);
             try enc.encodeBytes(&self.tip.hash);
         }
+        return enc.toOwnedSlice();
+    }
+
+    /// Encode HardFork interpreter (era summaries) for preprod.
+    /// cardano-cli needs this for slot/time conversion during `query tip`.
+    fn encodeInterpreter(self: *const N2CServer) ![]u8 {
+        var enc = Encoder.init(self.allocator);
+        errdefer enc.deinit();
+
+        // Preprod era boundaries (from genesis configs):
+        // Byron:   epochs 0-3, slots 0-86399, epoch_size=21600, slot_length=20000ms
+        // Shelley: epoch 4+,   slot 86400+,   epoch_size=432000, slot_length=1000ms
+        // All post-Shelley eras share the same params on preprod (no param changes at hard forks).
+        // We encode 7 eras: Byron, Shelley, Allegra, Mary, Alonzo, Babbage, Conway.
+        //
+        // Byron time: 4 epochs * 21600 slots * 20s = 1728000 seconds
+        const byron_end_slot: u64 = 86400;
+        const byron_end_epoch: u64 = 4;
+        const byron_end_time: u64 = byron_end_slot * 20; // 1728000 seconds
+        const shelley_epoch_size: u64 = 432000;
+        const shelley_slot_ms: u64 = 1000;
+        const stability_window: u64 = 129600; // 3k/f for safe zone
+
+        // On preprod, all Shelley+ eras hard-forked at the same epoch (epoch 4) with
+        // no gap between them. The Haskell node encodes them as separate eras with
+        // identical start/end boundaries for the intermediate ones (Allegra through Babbage).
+        // For simplicity, encode Byron + one Shelley-family era (current = Conway, unbounded).
+        // cardano-cli only needs at least 1 era summary to not crash.
+
+        try enc.encodeArrayLen(2); // 2 era summaries: Byron + Shelley-family
+
+        // Era 1: Byron
+        try enc.encodeArrayLen(3); // [eraStart, eraEnd, eraParams]
+        // eraStart: Bound [time, slot, epoch]
+        try enc.encodeArrayLen(3);
+        try enc.encodeUint(0); // time = 0 seconds
+        try enc.encodeUint(0); // slot = 0
+        try enc.encodeUint(0); // epoch = 0
+        // eraEnd: Bound [time, slot, epoch]
+        try enc.encodeArrayLen(3);
+        try enc.encodeUint(byron_end_time); // 1728000 seconds
+        try enc.encodeUint(byron_end_slot); // 86400
+        try enc.encodeUint(byron_end_epoch); // 4
+        // eraParams: [epochSize, slotLengthMs, safeZone, genesisWindow]
+        try enc.encodeArrayLen(4);
+        try enc.encodeUint(21600); // Byron epoch size
+        try enc.encodeUint(20000); // Byron slot length = 20 seconds = 20000ms
+        // SafeZone: StandardSafeZone = [0, safeFromTip, [0]]
+        try enc.encodeArrayLen(3);
+        try enc.encodeUint(0); // tag 0 = StandardSafeZone
+        try enc.encodeUint(4320); // Byron safe zone = 2k = 4320
+        try enc.encodeArrayLen(1);
+        try enc.encodeUint(0); // backward compat wrapper
+        try enc.encodeUint(4320); // Genesis window for Byron
+
+        // Era 2: Shelley+ (Conway, current — unbounded)
+        try enc.encodeArrayLen(3); // [eraStart, eraEnd, eraParams]
+        // eraStart: Bound [time, slot, epoch]
+        try enc.encodeArrayLen(3);
+        try enc.encodeUint(byron_end_time); // 1728000 seconds
+        try enc.encodeUint(byron_end_slot); // 86400
+        try enc.encodeUint(byron_end_epoch); // 4
+        // eraEnd: null (unbounded — current era)
+        try enc.encodeNull();
+        // eraParams: [epochSize, slotLengthMs, safeZone, genesisWindow]
+        try enc.encodeArrayLen(4);
+        try enc.encodeUint(shelley_epoch_size); // 432000
+        try enc.encodeUint(shelley_slot_ms); // 1000ms
+        // SafeZone: StandardSafeZone = [0, safeFromTip, [0]]
+        try enc.encodeArrayLen(3);
+        try enc.encodeUint(0); // tag 0 = StandardSafeZone
+        try enc.encodeUint(stability_window); // 129600
+        try enc.encodeArrayLen(1);
+        try enc.encodeUint(0); // backward compat wrapper
+        try enc.encodeUint(stability_window); // Genesis window
+
         return enc.toOwnedSlice();
     }
 
