@@ -265,22 +265,8 @@ fn performInitialIntersect(
     db_path: []const u8,
     result: *RunResult,
 ) !void {
-    if (runtime_snapshot) |snapshot| {
-        const intersect = try client.findIntersect(&[_]Point{snapshot.point});
-
-        switch (intersect) {
-            .intersect_found => {
-                result.resumed_from_snapshot = true;
-            },
-            .intersect_not_found => {
-                result.errors += 1;
-                return error.IntersectNotFound;
-            },
-            else => return error.UnexpectedMessage,
-        }
-        return;
-    }
-
+    // Try resume_points first (from previous sync sessions), then snapshot point.
+    // Resume points are ahead of the snapshot and avoid re-processing blocks.
     if (resume_points.items.len > 0) {
         const candidates = try newestFirstPoints(allocator, resume_points.items);
         defer allocator.free(candidates);
@@ -305,6 +291,22 @@ fn performInitialIntersect(
             else => {
                 _ = try client.findIntersectGenesis();
             },
+        }
+        return;
+    }
+
+    // Fall back to snapshot point if available
+    if (runtime_snapshot) |snapshot| {
+        const intersect = try client.findIntersect(&[_]Point{snapshot.point});
+        switch (intersect) {
+            .intersect_found => {
+                result.resumed_from_snapshot = true;
+            },
+            .intersect_not_found => {
+                result.errors += 1;
+                return error.IntersectNotFound;
+            },
+            else => return error.UnexpectedMessage,
         }
         return;
     }
