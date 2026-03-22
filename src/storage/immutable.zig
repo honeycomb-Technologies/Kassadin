@@ -79,6 +79,32 @@ pub const ImmutableDB = struct {
         self.mithril_boundary_chunk = last_chunk;
     }
 
+    /// Delete any chunks beyond the Mithril boundary and reset state.
+    /// Called on startup to ensure the immutable DB matches the Mithril snapshot
+    /// exactly — blocks we wrote in previous sessions (with length-prefix framing)
+    /// would have different hashes from the Mithril chain.
+    pub fn truncateAfterBoundary(self: *ImmutableDB, boundary_chunk: u32) !void {
+        // Close current chunk handle if open
+        if (self.chunk_file) |f| {
+            f.close();
+            self.chunk_file = null;
+        }
+
+        // Delete chunk files beyond the boundary
+        var path_buf: [256]u8 = undefined;
+        var chunk_no = boundary_chunk + 1;
+        while (chunk_no <= self.current_chunk + 1) : (chunk_no += 1) {
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{ self.base_path, chunk_no }) catch continue;
+            std.fs.cwd().deleteFile(path) catch {};
+        }
+
+        // Reset state and re-recover from remaining chunks
+        self.secondary_index.clearRetainingCapacity();
+        self.tip = null;
+        self.current_chunk = 0;
+        try self.recoverState();
+    }
+
     /// Append a block to the current chunk.
     pub fn appendBlock(self: *ImmutableDB, hash: HeaderHash, block_data: []const u8, slot: SlotNo, block_no: BlockNo) !void {
         // Skip past Mithril snapshot chunks to avoid corrupting them.

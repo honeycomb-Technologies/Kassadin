@@ -390,15 +390,22 @@ fn initializeSnapshotState(
     const current_tip = chain_db.getTip();
     if (current_tip.block_no == 0 and current_tip.slot == 0) {
         try chain_db.attachSnapshotTip(snapshot.point, snapshot.block_no);
-    } else if (current_tip.slot != snapshot.point.slot or
-        current_tip.block_no != snapshot.block_no or
-        !std.mem.eql(u8, &current_tip.hash, &snapshot.point.hash))
+    } else if (current_tip.slot == snapshot.point.slot and
+        current_tip.block_no == snapshot.block_no and
+        std.mem.eql(u8, &current_tip.hash, &snapshot.point.hash))
     {
-        // Chain has progressed past the snapshot tip (previous sync runs wrote
-        // blocks to the immutable DB). This is fine — we still load the ledger
-        // snapshot and replay from there. The snapshot tip just won't be used
-        // as the chain tip.
-        std.debug.print("Snapshot tip (slot {}) differs from chain tip (slot {}); loading ledger state from snapshot anyway.\n", .{ snapshot.point.slot, current_tip.slot });
+        // Tip already matches snapshot — no action needed
+    } else {
+        // Tip differs (possibly from immutable recovery). Force-attach the
+        // snapshot tip so incoming blocks can extend the chain correctly.
+        // This can happen if truncateAfterBoundary didn't fully align the
+        // immutable tip with the snapshot tip due to CBOR vs length-prefix
+        // framing differences in the last Mithril chunk.
+        std.debug.print("Resetting chain tip from slot {} to snapshot tip slot {}.\n", .{ current_tip.slot, snapshot.point.slot });
+        chain_db.tip_slot = snapshot.point.slot;
+        chain_db.tip_hash = snapshot.point.hash;
+        chain_db.tip_block_no = snapshot.block_no;
+        chain_db.base_tip = .{ .point = snapshot.point, .block_no = snapshot.block_no };
     }
 
     if (snapshot.layout.ledger_path) |ledger_path| {
@@ -615,9 +622,12 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     defer chain_db.close();
     chain_db.ledger.setRewardAccountNetwork(networkFromMagic(config.network_magic));
 
-    // Protect Mithril snapshot chunks from being appended to.
+    // Protect Mithril snapshot chunks and clean up any chunks we wrote
+    // in previous sessions (they use length-prefix framing that differs
+    // from the Mithril/Haskell raw CBOR format).
     if (runtime_snapshot) |snapshot| {
         chain_db.immutable.setMithrilBoundary(snapshot.last_chunk);
+        chain_db.immutable.truncateAfterBoundary(snapshot.last_chunk) catch {};
     }
 
     if (loaded_protocol_params) |protocol_params| {

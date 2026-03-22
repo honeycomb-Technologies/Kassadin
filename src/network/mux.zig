@@ -59,18 +59,13 @@ pub fn decodeHeader(bytes: *const [header_length]u8) SDUHeader {
 /// Bearer abstraction for reading/writing SDUs over a stream (TCP or Unix socket).
 pub const Bearer = struct {
     stream: std.net.Stream,
-    leftover: std.ArrayList(u8) = .empty,
-    leftover_allocator: ?std.mem.Allocator = null,
-    /// Per-protocol incoming queues so SDUs for non-target protocols are buffered
-    /// instead of silently discarded. Keyed by mini-protocol number.
+    /// Per-protocol incoming queues for both non-target SDU payloads and
+    /// leftover bytes from pipelined messages. Keyed by mini-protocol number.
+    /// Replaces the old shared `leftover` buffer that caused cross-protocol
+    /// contamination (Haskell uses per-protocol TVar queues in Mux/Ingress.hs).
     protocol_queues: ?std.AutoHashMap(u15, std.ArrayList(u8)) = null,
 
     pub fn deinit(self: *Bearer) void {
-        if (self.leftover_allocator) |allocator| {
-            self.leftover.deinit(allocator);
-            self.leftover = .empty;
-            self.leftover_allocator = null;
-        }
         if (self.protocol_queues) |*pq| {
             var it = pq.valueIterator();
             while (it.next()) |queue| {
@@ -150,11 +145,6 @@ pub const Bearer = struct {
     pub fn readProtocolMessage(self: *Bearer, protocol_num: u15, allocator: std.mem.Allocator) ![]u8 {
         const Decoder = @import("../cbor/decoder.zig").Decoder;
 
-        // Initialize leftover buffer if needed
-        if (self.leftover_allocator == null) {
-            self.leftover_allocator = allocator;
-            self.leftover = .empty;
-        }
         if (self.protocol_queues == null) {
             self.protocol_queues = std.AutoHashMap(u15, std.ArrayList(u8)).init(allocator);
         }
@@ -162,7 +152,7 @@ pub const Bearer = struct {
         var accumulated: std.ArrayList(u8) = .empty;
         defer accumulated.deinit(allocator);
 
-        // Start with any queued data for this protocol
+        // Check per-protocol queue for this protocol (queued SDUs + leftover from previous calls)
         if (self.protocol_queues.?.getPtr(protocol_num)) |queue| {
             if (queue.items.len > 0) {
                 try accumulated.appendSlice(allocator, queue.items);
@@ -172,6 +162,7 @@ pub const Bearer = struct {
                 if (dec.sliceOfNextValue()) |complete_msg| {
                     const result = try allocator.alloc(u8, complete_msg.len);
                     @memcpy(result, complete_msg);
+                    // Save remaining bytes back to THIS protocol's queue
                     const remaining = accumulated.items[dec.pos..];
                     if (remaining.len > 0) {
                         try queue.appendSlice(allocator, remaining);
@@ -181,30 +172,12 @@ pub const Bearer = struct {
             }
         }
 
-        // Then check same-protocol leftover (pipelined messages)
-        if (self.leftover.items.len > 0) {
-            try accumulated.appendSlice(allocator, self.leftover.items);
-            self.leftover.clearRetainingCapacity();
-
-            var dec = Decoder.init(accumulated.items);
-            if (dec.sliceOfNextValue()) |complete_msg| {
-                const result = try allocator.alloc(u8, complete_msg.len);
-                @memcpy(result, complete_msg);
-                const remaining = accumulated.items[dec.pos..];
-                if (remaining.len > 0) {
-                    try self.leftover.appendSlice(allocator, remaining);
-                }
-                return result;
-            } else |_| {}
-        }
-
         var sdu_buf: [max_sdu_payload]u8 = undefined;
 
         while (true) {
-            // Read one SDU from the wire
             const sdu = try self.readSDU(&sdu_buf);
 
-            // Queue SDUs for non-target protocols instead of discarding
+            // Queue SDUs for non-target protocols
             if (sdu.header.protocol_num != protocol_num) {
                 var pq = &self.protocol_queues.?;
                 const gop = try pq.getOrPut(sdu.header.protocol_num);
@@ -217,23 +190,24 @@ pub const Bearer = struct {
 
             try accumulated.appendSlice(allocator, sdu.payload);
 
-            // Try to parse a complete CBOR value from accumulated data
             var dec = Decoder.init(accumulated.items);
             if (dec.sliceOfNextValue()) |complete_msg| {
-                // Found a complete CBOR message
                 const result = try allocator.alloc(u8, complete_msg.len);
                 @memcpy(result, complete_msg);
 
-                // Save remaining bytes as leftover for the next call
+                // Save remaining bytes to THIS protocol's queue (not shared)
                 const remaining = accumulated.items[dec.pos..];
                 if (remaining.len > 0) {
-                    try self.leftover.appendSlice(allocator, remaining);
+                    var pq = &self.protocol_queues.?;
+                    const gop = try pq.getOrPut(protocol_num);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .empty;
+                    }
+                    try gop.value_ptr.appendSlice(allocator, remaining);
                 }
 
                 return result;
-            } else |_| {
-                // Incomplete CBOR — need more SDUs
-            }
+            } else |_| {}
         }
     }
 
