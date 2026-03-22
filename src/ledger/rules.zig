@@ -292,9 +292,20 @@ pub fn evaluateWithdrawalEffect(
         // once reward balances are tracked locally, withdrawals must target a
         // known reward account and must drain that balance exactly.
         const current_balance = ledger.lookupRewardBalance(withdrawal.account) orelse {
+            const h = withdrawal.account.credential.hash;
+            std.debug.print("  InvalidWithdrawal: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... NOT FOUND in reward balances\n", .{
+                h[0], h[1], h[2], h[3],
+            });
             return error.InvalidWithdrawal;
         };
-        if (withdrawal.amount != current_balance) return error.InvalidWithdrawal;
+        if (withdrawal.amount != current_balance) {
+            const h = withdrawal.account.credential.hash;
+            std.debug.print("  InvalidWithdrawal: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... withdrawal_amount={} current_balance={}\n", .{
+                h[0], h[1], h[2], h[3],
+                withdrawal.amount, current_balance,
+            });
+            return error.InvalidWithdrawal;
+        }
 
         withdrawn += current_balance;
         try reward_changes.append(allocator, .{

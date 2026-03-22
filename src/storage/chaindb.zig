@@ -430,7 +430,7 @@ pub const ChainDB = struct {
                     // our Mithril snapshot pool registry is inherently stale — pools
                     // may have registered or rotated VRF keys since the snapshot.
                     // The block was already validated by the producing node.
-                    if (err == error.VRFLeaderValueTooBig or err == error.VRFKeyUnknown) {
+                    if (err == error.VRFLeaderValueTooBig or err == error.VRFKeyUnknown or err == error.VRFBadProof) {
                         self.vrf_threshold_warnings += 1;
                     } else {
                         if (!builtin.is_test) {
