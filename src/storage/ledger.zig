@@ -1582,7 +1582,14 @@ pub const LedgerDB = struct {
                 );
                 if (reward == 0) continue;
 
-                if (self.isRegisteredRewardCredential(delegated.credential)) {
+                const is_registered = self.isRegisteredRewardCredential(delegated.credential);
+                // Debug: track specific credential from withdrawal failure
+                if (delegated.credential.hash[0] == 0x35 and delegated.credential.hash[1] == 0x23) {
+                    std.debug.print("  TRACE cred=3523...: reward={} registered={} pool_reward={} active_stake={} pool_active={}\n", .{
+                        reward, is_registered, pool_reward, delegated.active_stake, pool_stake.active_stake,
+                    });
+                }
+                if (is_registered) {
                     try appendPoolReapRewardChange(
                         allocator,
                         &reward_changes,
