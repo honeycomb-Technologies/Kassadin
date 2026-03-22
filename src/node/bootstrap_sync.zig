@@ -182,6 +182,7 @@ pub fn bootstrapSync(
                 chain_db.getProtocolParams(),
                 if (chain_db.shelley_governance_config) |config| config.epoch_length else null,
                 if (chain_db.shelley_governance_config) |config| config.reward_params else rewards_mod.RewardParams.mainnet_defaults,
+                if (chain_db.shelley_governance_config) |config| config.era_start_slot else 0,
             ) catch |err| switch (err) {
                 error.Interrupted => {
                     result.stopped_by_signal = true;

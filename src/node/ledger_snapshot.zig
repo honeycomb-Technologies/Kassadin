@@ -199,6 +199,7 @@ pub fn replayImmutableFromSlot(
     pp: rules.ProtocolParams,
     epoch_length: ?u64,
     reward_params: rewards_mod.RewardParams,
+    era_start_slot: u64,
 ) !ReplayResult {
     var result = ReplayResult{
         .blocks_replayed = 0,
@@ -235,8 +236,15 @@ pub fn replayImmutableFromSlot(
 
             var ledger_diffs_applied: u32 = 0;
             if (epoch_length) |slots_per_epoch| {
-                const current_epoch = types.slotToEpoch(last_slot, slots_per_epoch);
-                const target_epoch = types.slotToEpoch(block.header.slot, slots_per_epoch);
+                // Use era-aware epoch calculation to match chaindb.zig
+                const eraSlotToEpoch = struct {
+                    fn f(slot: SlotNo, start: u64, len: u64) u64 {
+                        if (slot < start) return 0;
+                        return (slot - start) / len;
+                    }
+                }.f;
+                const current_epoch = eraSlotToEpoch(last_slot, era_start_slot, slots_per_epoch);
+                const target_epoch = eraSlotToEpoch(block.header.slot, era_start_slot, slots_per_epoch);
                 if (target_epoch > current_epoch) {
                     if (block.era == .conway) {
                         ledger.setPointerInstantStakeEnabled(false);
