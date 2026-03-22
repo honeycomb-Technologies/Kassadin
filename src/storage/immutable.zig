@@ -79,10 +79,10 @@ pub const ImmutableDB = struct {
         self.mithril_boundary_chunk = last_chunk;
     }
 
-    /// Delete any chunks beyond the Mithril boundary and reset state.
-    /// Called on startup to ensure the immutable DB matches the Mithril snapshot
-    /// exactly — blocks we wrote in previous sessions (with length-prefix framing)
-    /// would have different hashes from the Mithril chain.
+    /// Clean up state for Mithril snapshot coexistence.
+    /// Deletes any chunks WE wrote beyond the boundary, and clears the
+    /// in-memory secondary index so Mithril blocks (parsed with wrong
+    /// framing assumptions) don't cause false `already_known` rejections.
     pub fn truncateAfterBoundary(self: *ImmutableDB, boundary_chunk: u32) !void {
         // Close current chunk handle if open
         if (self.chunk_file) |f| {
@@ -98,11 +98,13 @@ pub const ImmutableDB = struct {
             std.fs.cwd().deleteFile(path) catch {};
         }
 
-        // Reset state and re-recover from remaining chunks
+        // Clear the in-memory index entirely. Our recoverChunk uses
+        // length-prefix framing, but Mithril chunks are raw CBOR — some
+        // blocks parse by coincidence and create false index entries.
+        // New blocks written after the boundary will re-populate the index.
         self.secondary_index.clearRetainingCapacity();
         self.tip = null;
-        self.current_chunk = 0;
-        try self.recoverState();
+        self.current_chunk = boundary_chunk + 1;
     }
 
     /// Append a block to the current chunk.
