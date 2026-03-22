@@ -209,7 +209,7 @@ pub fn stageTxUpdate(
     slot: u64,
     tx_update: *const TxProtocolUpdate,
 ) !void {
-    const current_epoch = types.slotToEpoch(slot, config.epoch_length);
+    const current_epoch = config.slotToEpoch(slot);
     const point_of_no_return = epochBoundaryPointOfNoReturn(config, current_epoch);
     const target_epoch = if (slot < point_of_no_return) current_epoch else current_epoch + 1;
     if (tx_update.target_epoch != target_epoch) return error.WrongEpoch;
@@ -232,7 +232,7 @@ pub fn advanceToSlot(
     active_params: *rules.ProtocolParams,
     slot: u64,
 ) !void {
-    const block_epoch = types.slotToEpoch(slot, config.epoch_length);
+    const block_epoch = config.slotToEpoch(slot);
     while (state.current_epoch < block_epoch) {
         if (state.future_params) |next| {
             active_params.* = next;
@@ -255,7 +255,7 @@ pub fn setCurrentEpochFromSlot(
     state: *GovernanceState,
     slot: u64,
 ) void {
-    state.current_epoch = types.slotToEpoch(slot, config.epoch_length);
+    state.current_epoch = config.slotToEpoch(slot);
 }
 
 pub fn loadOwnedVotesForTesting(

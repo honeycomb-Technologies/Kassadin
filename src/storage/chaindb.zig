@@ -218,7 +218,7 @@ pub const ChainDB = struct {
         }
         self.governance_state.deinit(self.allocator);
         self.governance_state = .{};
-        self.governance_state.setCurrentEpoch(types.slotToEpoch(self.tip_slot, config.epoch_length));
+        self.governance_state.setCurrentEpoch(config.slotToEpoch(self.tip_slot));
         self.praos_epoch_length = config.epoch_length;
         self.praos_era_start_slot = config.era_start_slot;
         self.praos_stability_window = config.stability_window;
@@ -775,8 +775,10 @@ pub const ChainDB = struct {
     ) !u32 {
         const config = self.shelley_governance_config orelse return 0;
 
-        const current_epoch = types.slotToEpoch(self.tip_slot, config.epoch_length);
-        const target_epoch = types.slotToEpoch(slot, config.epoch_length);
+        // Use era-aware epoch calculation (accounts for Byron→Shelley era_start_slot).
+        // types.slotToEpoch ignores era_start_slot and gives wrong epoch numbers on testnets.
+        const current_epoch = config.slotToEpoch(self.tip_slot);
+        const target_epoch = config.slotToEpoch(slot);
         if (target_epoch <= current_epoch) return 0;
 
         var applied: u32 = 0;

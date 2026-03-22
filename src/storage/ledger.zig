@@ -1503,6 +1503,17 @@ pub const LedgerDB = struct {
             blocks_total,
         );
 
+        std.debug.print("  Epoch reward calc: reserves={} fees={} total_blocks_made={} blocks_total={} pool_rewards={} go_total_stake={} pools={} delegators={}\n", .{
+            self.reserves_balance,
+            self.snapshot_fees,
+            total_blocks_made,
+            blocks_total,
+            epoch_rewards.pool_rewards,
+            go_dist.total_stake,
+            go_dist.pools.count(),
+            go_dist.delegators.count(),
+        });
+
         var reward_changes: std.ArrayList(RewardBalanceChange) = .empty;
         defer reward_changes.deinit(allocator);
 

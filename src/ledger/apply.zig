@@ -277,16 +277,9 @@ fn applyShelleyLikeBlock(
                 else => false,
             },
         ) catch |err| {
-            if (err == error.InvalidWithdrawal or err == error.InvalidCertificate) {
-                // Our reward/stake tracking may diverge from Haskell's at epoch
-                // boundaries. Since this block is on the canonical chain, treat
-                // these mismatches as non-fatal and skip the tx.
-                if (!builtin.is_test) {
-                    std.debug.print("    Tx {}: skipped ({}, ledger state divergence)\n", .{ tx_idx, err });
-                }
-                result.txs_skipped += 1;
-                continue;
-            }
+            // TODO: InvalidWithdrawal and InvalidCertificate indicate ledger
+            // state divergence from Haskell. These must be root-caused and fixed,
+            // not masked. Diagnostic logging preserved for investigation.
             if (!builtin.is_test) {
                 std.debug.print("    Tx {}: validation failed: {}\n", .{ tx_idx, err });
             }
