@@ -339,14 +339,8 @@ pub const ChainDB = struct {
     /// First validates it's not a duplicate, then stores in volatile DB.
     pub fn addBlock(self: *ChainDB, hash: HeaderHash, block_data: []const u8, slot: SlotNo, block_no: BlockNo, prev_hash: ?HeaderHash) !AddBlockResult {
         // Check if already known
-        if (self.@"volatile".getBlock(hash) != null) {
-            if (!builtin.is_test) std.debug.print("addBlock KNOWN(vol): block {} slot {}\n", .{ block_no, slot });
-            return .already_known;
-        }
-        if (self.immutable.getBlock(hash) catch null != null) {
-            if (!builtin.is_test) std.debug.print("addBlock KNOWN(imm): block {} slot {}\n", .{ block_no, slot });
-            return .already_known;
-        }
+        if (self.@"volatile".getBlock(hash) != null) return .already_known;
+        if (self.immutable.getBlock(hash) catch null != null) return .already_known;
 
         var extends_current_chain = false;
         if (self.tip_block_no == 0 and self.base_tip == null and self.current_chain.items.len == 0) {
@@ -356,15 +350,6 @@ pub const ChainDB = struct {
         }
 
         if (!extends_current_chain) {
-            if (!builtin.is_test) {
-                if (prev_hash) |ph| {
-                    std.debug.print("addBlock FORK: block {} slot {} prev_hash={x:0>2}{x:0>2}{x:0>2}{x:0>2}... tip_hash={x:0>2}{x:0>2}{x:0>2}{x:0>2}... tip_block={}\n", .{
-                        block_no, slot, ph[0], ph[1], ph[2], ph[3],
-                        self.tip_hash[0], self.tip_hash[1], self.tip_hash[2], self.tip_hash[3],
-                        self.tip_block_no,
-                    });
-                }
-            }
             try self.@"volatile".putBlock(hash, block_data, slot, block_no, prev_hash);
             return .added_to_fork;
         }
