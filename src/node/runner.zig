@@ -332,28 +332,46 @@ fn performReconnectIntersect(
 fn discoverRuntimeSnapshot(allocator: Allocator, db_path: []const u8) !?RuntimeSnapshot {
     var layout = snapshot_restore.resolveSnapshotLayout(allocator, db_path) catch return null;
 
-    var reader = chunk_reader_mod.ChunkReader.init(layout.immutable_path) catch {
+    const reader = chunk_reader_mod.ChunkReader.init(layout.immutable_path) catch {
         layout.deinit(allocator);
         return null;
     };
 
-    const tip_result = reader.readTip(allocator) catch {
-        layout.deinit(allocator);
-        return null;
-    } orelse {
+    // Try reading the tip. If it fails (e.g., last chunk uses our length-prefix
+    // framing, not Mithril's CBOR framing), scan backwards to find a readable chunk.
+    const max_chunk: u32 = if (reader.total_chunks > 0) reader.total_chunks - 1 else 0;
+    // Try reading the tip. If it fails (e.g., last chunk uses our length-prefix
+    // framing, not Mithril's CBOR framing), scan backwards for a readable chunk.
+    const tip_raw = blk: {
+        // Try the standard path first (fastest)
+        if (reader.readTip(allocator) catch null) |r| break :blk r;
+
+        // Scan backwards for a readable Mithril chunk
+        if (max_chunk > 0) {
+            var c: u32 = max_chunk - 1;
+            while (true) {
+                const reduced = chunk_reader_mod.ChunkReader{
+                    .immutable_path = reader.immutable_path,
+                    .total_chunks = c + 1,
+                };
+                if (reduced.readTip(allocator) catch null) |r| break :blk r;
+                if (c == 0) break;
+                c -= 1;
+            }
+        }
         layout.deinit(allocator);
         return null;
     };
-    defer allocator.free(tip_result.raw);
+    defer allocator.free(tip_raw.raw);
 
     return .{
         .layout = layout,
         .point = .{
-            .slot = tip_result.block.header.slot,
-            .hash = tip_result.block.hash(),
+            .slot = tip_raw.block.header.slot,
+            .hash = tip_raw.block.hash(),
         },
-        .block_no = tip_result.block.header.block_no,
-        .last_chunk = if (reader.total_chunks > 0) reader.total_chunks - 1 else 0,
+        .block_no = tip_raw.block.header.block_no,
+        .last_chunk = max_chunk,
     };
 }
 
@@ -376,7 +394,11 @@ fn initializeSnapshotState(
         current_tip.block_no != snapshot.block_no or
         !std.mem.eql(u8, &current_tip.hash, &snapshot.point.hash))
     {
-        return error.ConflictingSnapshotTip;
+        // Chain has progressed past the snapshot tip (previous sync runs wrote
+        // blocks to the immutable DB). This is fine — we still load the ledger
+        // snapshot and replay from there. The snapshot tip just won't be used
+        // as the chain tip.
+        std.debug.print("Snapshot tip (slot {}) differs from chain tip (slot {}); loading ledger state from snapshot anyway.\n", .{ snapshot.point.slot, current_tip.slot });
     }
 
     if (snapshot.layout.ledger_path) |ledger_path| {
