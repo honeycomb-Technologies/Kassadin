@@ -1495,6 +1495,14 @@ fn importAccountEntry(
         .pointer = account.pointer,
     });
 
+    // Trace specific credentials for debugging
+    if (credential.hash[0] == 0x8b and credential.hash[1] == 0x69) {
+        std.debug.print("  SNAPSHOT IMPORT: cred=8b69... balance={} deposit={} registered=true\n", .{ account.balance, account.deposit });
+    }
+    if (credential.hash[0] == 0x35 and credential.hash[1] == 0x23) {
+        std.debug.print("  SNAPSHOT IMPORT: cred=3523... balance={} deposit={} registered=true\n", .{ account.balance, account.deposit });
+    }
+
     if (account.balance > 0) {
         parse_import_result.reward_accounts_loaded += 1;
     }
