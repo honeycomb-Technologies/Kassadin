@@ -1,0 +1,16 @@
+{
+  "protocolParams": {
+    "minFeeA": 44,
+    "minFeeB": 155381,
+    "maxBlockBodySize": 90112,
+    "maxTxSize": 16384,
+    "keyDeposit": 2000000,
+    "poolDeposit": 500000000,
+    "minUTxOValue": 0,
+    "minPoolCost": 170000000,
+    "nOpt": 500,
+    "a0": 0.3,
+    "rho": 0.003,
+    "tau": 0.2
+  }
+}

@@ -1,8 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../types.zig");
 const block_mod = @import("block.zig");
 const transaction = @import("transaction.zig");
 const cert_mod = @import("certificates.zig");
+const rewards_mod = @import("rewards.zig");
 const LedgerDB = @import("../storage/ledger.zig").LedgerDB;
 const UtxoEntry = @import("../storage/ledger.zig").UtxoEntry;
 const RewardBalanceChange = @import("../storage/ledger.zig").RewardBalanceChange;
@@ -27,6 +29,8 @@ const DRepDelegationChange = @import("../storage/ledger.zig").DRepDelegationChan
 const StakePointerChange = @import("../storage/ledger.zig").StakePointerChange;
 
 pub const TxIn = types.TxIn;
+pub const Credential = types.Credential;
+pub const RewardAccount = types.RewardAccount;
 pub const Coin = types.Coin;
 pub const DeltaCoin = types.DeltaCoin;
 pub const TxBody = transaction.TxBody;
@@ -62,6 +66,20 @@ pub const ProtocolParams = struct {
     key_deposit: Coin, // deposit for stake key registration
     pool_deposit: Coin, // deposit for pool registration
     max_block_body_size: u32,
+    optimal_pool_count: u16 = rewards_mod.RewardParams.mainnet_defaults.n_opt,
+    pool_pledge_influence: types.UnitInterval = .{ .numerator = 3, .denominator = 10 },
+    monetary_expand_rate: types.UnitInterval = .{ .numerator = 3, .denominator = 1000 },
+    treasury_growth_rate: types.UnitInterval = .{ .numerator = 2, .denominator = 10 },
+    min_pool_cost: Coin = 340_000_000,
+
+    pub fn rewardParams(self: ProtocolParams, base: rewards_mod.RewardParams) rewards_mod.RewardParams {
+        var params = base;
+        params.n_opt = self.optimal_pool_count;
+        params.a0 = self.pool_pledge_influence;
+        params.rho = self.monetary_expand_rate;
+        params.tau = self.treasury_growth_rate;
+        return params;
+    }
 
     /// Mainnet defaults (approximate, for testing)
     pub const mainnet_defaults = ProtocolParams{
@@ -72,6 +90,11 @@ pub const ProtocolParams = struct {
         .key_deposit = 2_000_000,
         .pool_deposit = 500_000_000,
         .max_block_body_size = 90112,
+        .optimal_pool_count = 500,
+        .pool_pledge_influence = .{ .numerator = 3, .denominator = 10 },
+        .monetary_expand_rate = .{ .numerator = 3, .denominator = 1000 },
+        .treasury_growth_rate = .{ .numerator = 2, .denominator = 10 },
+        .min_pool_cost = 340_000_000,
     };
 
     /// Temporary compatibility defaults for bootstrap/runtime validation before
@@ -84,6 +107,11 @@ pub const ProtocolParams = struct {
         .key_deposit = 2_000_000,
         .pool_deposit = 500_000_000,
         .max_block_body_size = 90112,
+        .optimal_pool_count = 500,
+        .pool_pledge_influence = .{ .numerator = 3, .denominator = 10 },
+        .monetary_expand_rate = .{ .numerator = 3, .denominator = 1000 },
+        .treasury_growth_rate = .{ .numerator = 2, .denominator = 10 },
+        .min_pool_cost = 340_000_000,
     };
 };
 
@@ -191,6 +219,36 @@ pub const WithdrawalEffect = struct {
     }
 };
 
+fn debugPrintDuplicateStakeRegistration(ledger: *const LedgerDB, cert_name: []const u8, credential: Credential) void {
+    if (builtin.is_test) return;
+
+    const reward_account = RewardAccount{
+        .network = ledger.reward_account_network,
+        .credential = credential,
+    };
+    const reward_balance = ledger.lookupRewardBalance(reward_account) orelse 0;
+    const deposit = ledger.lookupStakeDeposit(credential);
+    const pointer = ledger.lookupStakePointer(credential);
+    const pool = ledger.lookupStakePoolDelegation(credential);
+    const drep = ledger.lookupDRepDelegation(credential);
+    std.debug.print(
+        "      Duplicate {s}: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... registered={} deposit={any} reward={} pointer={} pool={} drep={}\n",
+        .{
+            cert_name,
+            credential.hash[0],
+            credential.hash[1],
+            credential.hash[2],
+            credential.hash[3],
+            ledger.isStakeCredentialRegistered(credential),
+            deposit,
+            reward_balance,
+            pointer != null,
+            pool != null,
+            drep != null,
+        },
+    );
+}
+
 /// Calculate the minimum fee for a transaction.
 /// fee = min_fee_b + (tx_size * min_fee_a)
 pub fn calculateMinFee(pp: ProtocolParams, tx_size: usize) Coin {
@@ -293,17 +351,33 @@ pub fn evaluateWithdrawalEffect(
         // known reward account and must drain that balance exactly.
         const current_balance = ledger.lookupRewardBalance(withdrawal.account) orelse {
             const h = withdrawal.account.credential.hash;
-            std.debug.print("  InvalidWithdrawal: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... NOT FOUND in reward balances\n", .{
-                h[0], h[1], h[2], h[3],
-            });
+            const deposit = ledger.lookupStakeDeposit(withdrawal.account.credential);
+            if (!builtin.is_test) {
+                if (ledger.lookupStakePoolDelegation(withdrawal.account.credential)) |pool| {
+                    std.debug.print("  InvalidWithdrawal: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... NOT FOUND in reward balances (withdrawal_amount={} deposit={?} pool={x:0>2}{x:0>2}{x:0>2}{x:0>2}...)\n", .{
+                        h[0], h[1], h[2], h[3], withdrawal.amount, deposit, pool[0], pool[1], pool[2], pool[3],
+                    });
+                } else {
+                    std.debug.print("  InvalidWithdrawal: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... NOT FOUND in reward balances (withdrawal_amount={} deposit={?} pool=null)\n", .{
+                        h[0], h[1], h[2], h[3], withdrawal.amount, deposit,
+                    });
+                }
+            }
             return error.InvalidWithdrawal;
         };
         if (withdrawal.amount != current_balance) {
             const h = withdrawal.account.credential.hash;
-            std.debug.print("  InvalidWithdrawal: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... withdrawal_amount={} current_balance={}\n", .{
-                h[0], h[1], h[2], h[3],
-                withdrawal.amount, current_balance,
-            });
+            if (!builtin.is_test) {
+                if (ledger.lookupStakePoolDelegation(withdrawal.account.credential)) |pool| {
+                    std.debug.print("  InvalidWithdrawal: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... withdrawal_amount={} current_balance={} pool={x:0>2}{x:0>2}{x:0>2}{x:0>2}...\n", .{
+                        h[0], h[1], h[2], h[3], withdrawal.amount, current_balance, pool[0], pool[1], pool[2], pool[3],
+                    });
+                } else {
+                    std.debug.print("  InvalidWithdrawal: cred={x:0>2}{x:0>2}{x:0>2}{x:0>2}... withdrawal_amount={} current_balance={} pool=null\n", .{
+                        h[0], h[1], h[2], h[3], withdrawal.amount, current_balance,
+                    });
+                }
+            }
             return error.InvalidWithdrawal;
         }
 
@@ -381,6 +455,7 @@ pub fn evaluateCertificateEffectWithContext(
         switch (cert) {
             .stake_registration => |cred| {
                 if (findPendingStakeNext(stake_changes.items, cred) != null or ledger.lookupStakeDeposit(cred) != null) {
+                    debugPrintDuplicateStakeRegistration(ledger, "stake_registration", cred);
                     return error.InvalidCertificate;
                 }
                 deposits += pp.key_deposit;
@@ -580,6 +655,7 @@ pub fn evaluateCertificateEffectWithContext(
             },
             .reg_deposit => |reg| {
                 if (findPendingStakeNext(stake_changes.items, reg.cred) != null or ledger.lookupStakeDeposit(reg.cred) != null) {
+                    debugPrintDuplicateStakeRegistration(ledger, "reg_deposit", reg.cred);
                     return error.InvalidCertificate;
                 }
                 if (reg.deposit != pp.key_deposit) return error.InvalidCertificate;
@@ -644,6 +720,7 @@ pub fn evaluateCertificateEffectWithContext(
             },
             .stake_reg_delegation => |reg| {
                 if (findPendingStakeNext(stake_changes.items, reg.cred) != null or ledger.lookupStakeDeposit(reg.cred) != null) {
+                    debugPrintDuplicateStakeRegistration(ledger, "stake_reg_delegation", reg.cred);
                     return error.InvalidCertificate;
                 }
                 if (reg.deposit != pp.key_deposit) return error.InvalidCertificate;
@@ -664,6 +741,7 @@ pub fn evaluateCertificateEffectWithContext(
             },
             .vote_reg_delegation => |reg| {
                 if (findPendingStakeNext(stake_changes.items, reg.cred) != null or ledger.lookupStakeDeposit(reg.cred) != null) {
+                    debugPrintDuplicateStakeRegistration(ledger, "vote_reg_delegation", reg.cred);
                     return error.InvalidCertificate;
                 }
                 if (reg.deposit != pp.key_deposit) return error.InvalidCertificate;
@@ -684,6 +762,7 @@ pub fn evaluateCertificateEffectWithContext(
             },
             .stake_vote_reg_delegation => |reg| {
                 if (findPendingStakeNext(stake_changes.items, reg.cred) != null or ledger.lookupStakeDeposit(reg.cred) != null) {
+                    debugPrintDuplicateStakeRegistration(ledger, "stake_vote_reg_delegation", reg.cred);
                     return error.InvalidCertificate;
                 }
                 if (reg.deposit != pp.key_deposit) return error.InvalidCertificate;

@@ -27,47 +27,12 @@ fn checkpointPath(allocator: Allocator, db_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/praos.resume", .{db_path});
 }
 
-fn writeFlavor(writer: anytype, flavor: praos.Flavor) !void {
-    try writer.writeByte(@intFromEnum(flavor));
-}
-
-fn readFlavor(reader: anytype) !praos.Flavor {
-    return std.meta.intToEnum(praos.Flavor, try reader.readByte()) catch error.InvalidCheckpoint;
-}
-
-fn writeNonce(writer: anytype, nonce: types.Nonce) !void {
-    switch (nonce) {
-        .neutral => {
-            try writer.writeByte(0);
-            try writer.writeByteNTimes(0, 32);
-        },
-        .hash => |hash| {
-            try writer.writeByte(1);
-            try writer.writeAll(&hash);
-        },
-    }
-}
-
-fn readNonce(reader: anytype) !types.Nonce {
-    const tag = try reader.readByte();
-    var hash: [32]u8 = undefined;
-    try reader.readNoEof(&hash);
-    return switch (tag) {
-        0 => .neutral,
-        1 => .{ .hash = hash },
-        else => error.InvalidCheckpoint,
-    };
-}
-
-pub fn load(
+fn loadFromCheckpointPath(
     allocator: Allocator,
-    db_path: []const u8,
+    path: []const u8,
     point: types.Point,
     config: *const protocol_update.GovernanceConfig,
 ) !?LoadResult {
-    const path = try checkpointPath(allocator, db_path);
-    defer allocator.free(path);
-
     const data = std.fs.cwd().readFileAlloc(allocator, path, max_file_size) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -117,19 +82,14 @@ pub fn load(
     };
 }
 
-pub fn save(
+fn saveToCheckpointPath(
     allocator: Allocator,
-    db_path: []const u8,
+    path: []const u8,
     point: types.Point,
     config: *const protocol_update.GovernanceConfig,
     state: praos.PraosState,
     ocert_counters: *const std.AutoHashMap(types.KeyHash, u64),
 ) !void {
-    const path = try checkpointPath(allocator, db_path);
-    defer allocator.free(path);
-
-    std.fs.cwd().makePath(db_path) catch {};
-
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(allocator);
     try bytes.ensureTotalCapacity(allocator, 512 + ocert_counters.count() * 36);
@@ -160,6 +120,84 @@ pub fn save(
         .sub_path = path,
         .data = bytes.items,
     });
+}
+
+fn writeFlavor(writer: anytype, flavor: praos.Flavor) !void {
+    try writer.writeByte(@intFromEnum(flavor));
+}
+
+fn readFlavor(reader: anytype) !praos.Flavor {
+    return std.meta.intToEnum(praos.Flavor, try reader.readByte()) catch error.InvalidCheckpoint;
+}
+
+fn writeNonce(writer: anytype, nonce: types.Nonce) !void {
+    switch (nonce) {
+        .neutral => {
+            try writer.writeByte(0);
+            try writer.writeByteNTimes(0, 32);
+        },
+        .hash => |hash| {
+            try writer.writeByte(1);
+            try writer.writeAll(&hash);
+        },
+    }
+}
+
+fn readNonce(reader: anytype) !types.Nonce {
+    const tag = try reader.readByte();
+    var hash: [32]u8 = undefined;
+    try reader.readNoEof(&hash);
+    return switch (tag) {
+        0 => .neutral,
+        1 => .{ .hash = hash },
+        else => error.InvalidCheckpoint,
+    };
+}
+
+pub fn load(
+    allocator: Allocator,
+    db_path: []const u8,
+    point: types.Point,
+    config: *const protocol_update.GovernanceConfig,
+) !?LoadResult {
+    const path = try checkpointPath(allocator, db_path);
+    defer allocator.free(path);
+    return loadFromCheckpointPath(allocator, path, point, config);
+}
+
+pub fn save(
+    allocator: Allocator,
+    db_path: []const u8,
+    point: types.Point,
+    config: *const protocol_update.GovernanceConfig,
+    state: praos.PraosState,
+    ocert_counters: *const std.AutoHashMap(types.KeyHash, u64),
+) !void {
+    const path = try checkpointPath(allocator, db_path);
+    defer allocator.free(path);
+
+    std.fs.cwd().makePath(db_path) catch {};
+    try saveToCheckpointPath(allocator, path, point, config, state, ocert_counters);
+}
+
+pub fn loadAtPath(
+    allocator: Allocator,
+    path: []const u8,
+    point: types.Point,
+    config: *const protocol_update.GovernanceConfig,
+) !?LoadResult {
+    return loadFromCheckpointPath(allocator, path, point, config);
+}
+
+pub fn saveAtPath(
+    allocator: Allocator,
+    path: []const u8,
+    point: types.Point,
+    config: *const protocol_update.GovernanceConfig,
+    state: praos.PraosState,
+    ocert_counters: *const std.AutoHashMap(types.KeyHash, u64),
+) !void {
+    return saveToCheckpointPath(allocator, path, point, config, state, ocert_counters);
 }
 
 test "praos checkpoint: round trip with OCert counters" {

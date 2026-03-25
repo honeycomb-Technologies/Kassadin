@@ -14,6 +14,12 @@ pub const ChunkReader = struct {
     immutable_path: []const u8,
     total_chunks: u32,
 
+    pub const TipResult = struct {
+        block: block_mod.Block,
+        raw: []const u8,
+        chunk_no: u32,
+    };
+
     pub fn init(immutable_path: []const u8) !ChunkReader {
         // Count chunk files to find the range
         var max_chunk: u32 = 0;
@@ -63,13 +69,11 @@ pub const ChunkReader = struct {
         return count;
     }
 
-    /// Read the last block's raw CBOR bytes from the last chunk.
+    /// Read the last block's raw CBOR bytes from a specific chunk.
     /// Caller owns the returned allocation — block slices point into it.
-    pub fn readTipRaw(self: *const ChunkReader, allocator: Allocator) !?[]const u8 {
-        if (self.total_chunks == 0) return null;
-
+    fn readTipRawFromChunk(self: *const ChunkReader, allocator: Allocator, chunk_num: u32) !?[]const u8 {
         var path_buf: [512]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{ self.immutable_path, self.total_chunks - 1 });
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{ self.immutable_path, chunk_num });
 
         const data = try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024 * 1024);
 
@@ -99,12 +103,38 @@ pub const ChunkReader = struct {
         return block_bytes;
     }
 
-    /// Read the last block from the last chunk (the tip of the immutable chain).
+    /// Read the latest raw-CBOR block tip from the immutable snapshot.
+    /// Scans backwards because a live database may also contain newer Kassadin-
+    /// written chunks that use length-prefix framing instead of Mithril's raw CBOR.
+    pub fn readTipWithChunk(self: *const ChunkReader, allocator: Allocator) !?TipResult {
+        var remaining = self.total_chunks;
+        while (remaining > 0) {
+            remaining -= 1;
+            const chunk_no = remaining;
+
+            const raw = self.readTipRawFromChunk(allocator, chunk_no) catch continue orelse continue;
+            const block = block_mod.parseBlock(raw) catch {
+                allocator.free(raw);
+                continue;
+            };
+            return .{
+                .block = block,
+                .raw = raw,
+                .chunk_no = chunk_no,
+            };
+        }
+
+        return null;
+    }
+
+    /// Read the latest raw-CBOR block tip from the immutable snapshot.
     /// The returned block's raw slices point into tip_raw — keep tip_raw alive!
     pub fn readTip(self: *const ChunkReader, allocator: Allocator) !?struct { block: block_mod.Block, raw: []const u8 } {
-        const raw = try self.readTipRaw(allocator) orelse return null;
-        const block = try block_mod.parseBlock(raw);
-        return .{ .block = block, .raw = raw };
+        const tip = try self.readTipWithChunk(allocator) orelse return null;
+        return .{
+            .block = tip.block,
+            .raw = tip.raw,
+        };
     }
 };
 
@@ -129,9 +159,47 @@ test "chunk_reader: count blocks in last chunk" {
 
     var reader = ChunkReader.init("db/preprod/immutable") catch return;
 
-    const count = try reader.readChunk(allocator, reader.total_chunks - 1, &struct {
+    const tip_result = try reader.readTipWithChunk(allocator) orelse return;
+    defer allocator.free(tip_result.raw);
+
+    const count = try reader.readChunk(allocator, tip_result.chunk_no, &struct {
         fn callback(_: []const u8, _: u64) void {}
     }.callback);
 
     try std.testing.expect(count > 0);
+}
+
+test "chunk_reader: skips non-cbor trailing chunk and returns last readable snapshot chunk" {
+    const allocator = std.testing.allocator;
+    const base_path = "/tmp/kassadin-test-chunk-reader-mixed";
+
+    std.fs.cwd().deleteTree(base_path) catch {};
+    defer std.fs.cwd().deleteTree(base_path) catch {};
+    try std.fs.cwd().makePath(base_path);
+
+    const block_data = std.fs.cwd().readFileAlloc(
+        allocator,
+        "tests/vectors/alonzo_block.cbor",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(block_data);
+
+    try std.fs.cwd().writeFile(.{
+        .sub_path = "/tmp/kassadin-test-chunk-reader-mixed/00000.chunk",
+        .data = block_data,
+    });
+    try std.fs.cwd().writeFile(.{
+        .sub_path = "/tmp/kassadin-test-chunk-reader-mixed/00001.chunk",
+        .data = &[_]u8{ 0x00, 0x01, 0x02, 0x03 },
+    });
+
+    var reader = try ChunkReader.init(base_path);
+    const tip_result = try reader.readTipWithChunk(allocator) orelse return error.TestUnexpectedResult;
+    defer allocator.free(tip_result.raw);
+
+    try std.testing.expectEqual(@as(u32, 0), tip_result.chunk_no);
+    try std.testing.expectEqual(block_mod.Era.alonzo, tip_result.block.era);
 }

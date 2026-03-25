@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const stake_mod = @import("stake.zig");
+const RationalInt = u512;
+const WideInt = u1024;
 
 pub const KeyHash = types.KeyHash;
 pub const Coin = types.Coin;
@@ -62,18 +64,26 @@ pub const PoolRewardSplit = struct {
 };
 
 const Rational = struct {
-    numerator: u128,
-    denominator: u128,
+    numerator: RationalInt,
+    denominator: RationalInt,
 
     fn init(numerator: u128, denominator: u128) Rational {
+        return initWide(numerator, denominator);
+    }
+
+    fn initWide(numerator: WideInt, denominator: WideInt) Rational {
         std.debug.assert(denominator != 0);
         if (numerator == 0) {
             return .{ .numerator = 0, .denominator = 1 };
         }
-        const divisor = gcdU128(numerator, denominator);
+        const divisor = gcdInt(WideInt, numerator, denominator);
+        const reduced_numerator = numerator / divisor;
+        const reduced_denominator = denominator / divisor;
+        std.debug.assert(reduced_numerator <= std.math.maxInt(RationalInt));
+        std.debug.assert(reduced_denominator <= std.math.maxInt(RationalInt));
         return .{
-            .numerator = numerator / divisor,
-            .denominator = denominator / divisor,
+            .numerator = @intCast(reduced_numerator),
+            .denominator = @intCast(reduced_denominator),
         };
     }
 
@@ -82,27 +92,33 @@ const Rational = struct {
     }
 
     fn add(a: Rational, b: Rational) Rational {
-        return init(
-            (a.numerator * b.denominator) + (b.numerator * a.denominator),
-            a.denominator * b.denominator,
+        return initWide(
+            (@as(WideInt, a.numerator) * @as(WideInt, b.denominator)) + (@as(WideInt, b.numerator) * @as(WideInt, a.denominator)),
+            @as(WideInt, a.denominator) * @as(WideInt, b.denominator),
         );
     }
 
     fn sub(a: Rational, b: Rational) Rational {
         std.debug.assert(compare(a, b) != .lt);
-        return init(
-            (a.numerator * b.denominator) - (b.numerator * a.denominator),
-            a.denominator * b.denominator,
+        return initWide(
+            (@as(WideInt, a.numerator) * @as(WideInt, b.denominator)) - (@as(WideInt, b.numerator) * @as(WideInt, a.denominator)),
+            @as(WideInt, a.denominator) * @as(WideInt, b.denominator),
         );
     }
 
     fn mul(a: Rational, b: Rational) Rational {
-        return init(a.numerator * b.numerator, a.denominator * b.denominator);
+        return initWide(
+            @as(WideInt, a.numerator) * @as(WideInt, b.numerator),
+            @as(WideInt, a.denominator) * @as(WideInt, b.denominator),
+        );
     }
 
     fn div(a: Rational, b: Rational) Rational {
         std.debug.assert(b.numerator != 0);
-        return init(a.numerator * b.denominator, a.denominator * b.numerator);
+        return initWide(
+            @as(WideInt, a.numerator) * @as(WideInt, b.denominator),
+            @as(WideInt, a.denominator) * @as(WideInt, b.numerator),
+        );
     }
 
     fn min(a: Rational, b: Rational) Rational {
@@ -113,15 +129,15 @@ const Rational = struct {
     }
 
     fn compare(a: Rational, b: Rational) std.math.Order {
-        const left = a.numerator * b.denominator;
-        const right = b.numerator * a.denominator;
+        const left = @as(WideInt, a.numerator) * @as(WideInt, b.denominator);
+        const right = @as(WideInt, b.numerator) * @as(WideInt, a.denominator);
         if (left < right) return .lt;
         if (left > right) return .gt;
         return .eq;
     }
 };
 
-fn gcdU128(a: u128, b: u128) u128 {
+fn gcdInt(comptime T: type, a: T, b: T) T {
     var x = a;
     var y = b;
     while (y != 0) {
@@ -134,11 +150,13 @@ fn gcdU128(a: u128, b: u128) u128 {
 
 fn floorRationalProduct(
     amount: Coin,
-    numerator: u128,
-    denominator: u128,
+    numerator: RationalInt,
+    denominator: RationalInt,
 ) Coin {
     if (amount == 0 or numerator == 0 or denominator == 0) return 0;
-    return @as(Coin, @intCast((@as(u128, amount) * numerator) / denominator));
+    const result = (@as(WideInt, amount) * @as(WideInt, numerator)) / @as(WideInt, denominator);
+    std.debug.assert(result <= std.math.maxInt(Coin));
+    return @intCast(result);
 }
 
 pub fn calculateExpectedBlocks(
@@ -173,7 +191,7 @@ fn calculateApparentPerformance(
     pool_active_stake: Coin,
     total_active_stake: Coin,
     blocks_produced: u64,
-    blocks_total: u64,
+    total_blocks_produced: u64,
 ) Rational {
     if (pool_active_stake == 0 or total_active_stake == 0 or blocks_produced == 0) {
         return Rational.init(0, 1);
@@ -186,7 +204,9 @@ fn calculateApparentPerformance(
         return Rational.init(1, 1);
     }
 
-    const beta = Rational.init(blocks_produced, @max(blocks_total, 1));
+    // Haskell's β is the fraction of all blocks actually produced in the epoch,
+    // not the expected non-overlay slot count.
+    const beta = Rational.init(blocks_produced, @max(total_blocks_produced, 1));
     return Rational.div(beta, sigma_a);
 }
 
@@ -254,7 +274,7 @@ pub fn calculatePoolReward(
     pool_pledge: Coin,
     params: RewardParams,
     blocks_produced: u64,
-    blocks_total: u64,
+    total_blocks_produced: u64,
 ) Coin {
     if (pool_rewards_pot == 0 or total_stake == 0 or total_active_stake == 0 or params.n_opt == 0 or blocks_produced == 0) {
         return 0;
@@ -290,7 +310,7 @@ pub fn calculatePoolReward(
         pool_stake,
         total_active_stake,
         blocks_produced,
-        blocks_total,
+        total_blocks_produced,
     );
     return floorRationalProduct(max_pool_reward, app_perf.numerator, app_perf.denominator);
 }
@@ -424,6 +444,18 @@ test "rewards: reward update preserves balance sheet" {
     try std.testing.expectEqual(-@as(DeltaCoin, @intCast(epoch_rewards.fees_collected)), update.deltaF);
 }
 
+test "rewards: rational compare handles large cross products" {
+    const large_denominator: u128 = (@as(u128, 1) << 80) + 7;
+    const larger = Rational.init(large_denominator - 1, large_denominator);
+    const smaller = Rational.init(large_denominator - 2, large_denominator);
+
+    try std.testing.expectEqual(std.math.Order.gt, Rational.compare(larger, smaller));
+
+    const diff = Rational.sub(larger, smaller);
+    try std.testing.expectEqual(@as(RationalInt, 1), diff.numerator);
+    try std.testing.expectEqual(@as(RationalInt, large_denominator), diff.denominator);
+}
+
 test "rewards: undistributed fee pot returns to reserves" {
     const params = RewardParams.mainnet_defaults;
     const epoch_rewards = calculateEpochRewards(
@@ -454,6 +486,21 @@ test "rewards: pool reward calculation" {
     );
 
     try std.testing.expect(pool_reward > 0);
+}
+
+test "rewards: pool reward handles large realistic stake ratios" {
+    const reward = calculatePoolReward(
+        30_000_000_000_000,
+        31_824_132_237_660_190,
+        548_348_261_056_515,
+        23_582_964_964_583,
+        20_000_000_000_000,
+        RewardParams.mainnet_defaults,
+        35,
+        21_600,
+    );
+
+    try std.testing.expect(reward > 0);
 }
 
 test "rewards: higher pledge increases pool reward" {
@@ -504,6 +551,31 @@ test "rewards: better performance increases pool reward" {
     );
 
     try std.testing.expect(at_target > underperforming);
+}
+
+test "rewards: sparser produced epochs increase apparent performance" {
+    const dense_epoch = calculatePoolReward(
+        10_000_000_000_000,
+        31_000_000_000_000_000,
+        200_000_000_000_000,
+        42_000_000_000_000,
+        300_000_000_000,
+        RewardParams.mainnet_defaults,
+        100,
+        21_600,
+    );
+    const sparse_epoch = calculatePoolReward(
+        10_000_000_000_000,
+        31_000_000_000_000_000,
+        200_000_000_000_000,
+        42_000_000_000_000,
+        300_000_000_000,
+        RewardParams.mainnet_defaults,
+        100,
+        16_100,
+    );
+
+    try std.testing.expect(sparse_epoch > dense_epoch);
 }
 
 test "rewards: split pool reward into leader and member shares" {

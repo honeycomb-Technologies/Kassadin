@@ -91,7 +91,7 @@ pub fn bootstrapSync(
     std.debug.print("Reading snapshot tip from {s}...\n", .{layout.immutable_path});
     var reader = try chunk_reader_mod.ChunkReader.init(layout.immutable_path);
 
-    const tip_result = try reader.readTip(allocator) orelse {
+    const tip_result = try reader.readTipWithChunk(allocator) orelse {
         std.debug.print("Empty snapshot.\n", .{});
         return error.EmptySnapshot;
     };
@@ -111,12 +111,12 @@ pub fn bootstrapSync(
         result.snapshot_tip_slot,
     });
 
-    var chain_db = try ChainDB.open(allocator, db_path, 2160);
+    var chain_db = try ChainDB.openWithMithrilBoundary(allocator, db_path, 2160, tip_result.chunk_no);
     defer chain_db.close();
     chain_db.ledger.setRewardAccountNetwork(networkFromMagic(network_magic));
 
     if (shelley_genesis_path) |path| {
-        if (genesis_mod.loadLedgerProtocolParams(allocator, path) catch null) |protocol_params| {
+        if (genesis_mod.loadLedgerProtocolParamsWithOverride(allocator, path) catch null) |protocol_params| {
             chain_db.setProtocolParams(protocol_params);
         }
         if (genesis_mod.loadShelleyConsensusParams(allocator, path) catch null) |consensus_params| {
@@ -179,9 +179,14 @@ pub fn bootstrapSync(
                 &chain_db.ledger,
                 layout.immutable_path,
                 load_result.slot,
+                tip_result.chunk_no,
                 chain_db.getProtocolParams(),
                 if (chain_db.shelley_governance_config) |config| config.epoch_length else null,
-                if (chain_db.shelley_governance_config) |config| config.reward_params else rewards_mod.RewardParams.mainnet_defaults,
+                if (chain_db.shelley_governance_config) |config|
+                    chain_db.getProtocolParams().rewardParams(config.reward_params)
+                else
+                    rewards_mod.RewardParams.mainnet_defaults,
+                if (chain_db.shelley_governance_config) |config| config.era_start_epoch else 0,
                 if (chain_db.shelley_governance_config) |config| config.era_start_slot else 0,
             ) catch |err| switch (err) {
                 error.Interrupted => {
@@ -206,6 +211,7 @@ pub fn bootstrapSync(
                         allocator,
                         layout.immutable_path,
                         tip_block.header.slot,
+                        tip_result.chunk_no,
                         &config,
                     ) catch |err| switch (err) {
                         error.Interrupted => {

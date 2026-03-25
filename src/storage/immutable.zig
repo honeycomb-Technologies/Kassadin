@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const Blake2b256 = @import("../crypto/hash.zig").Blake2b256;
 const block_mod = @import("../ledger/block.zig");
+const Decoder = @import("../cbor/decoder.zig").Decoder;
 
 pub const SlotNo = types.SlotNo;
 pub const HeaderHash = types.HeaderHash;
@@ -49,6 +50,14 @@ pub const ImmutableDB = struct {
     mithril_boundary_chunk: ?u32 = null,
 
     pub fn open(allocator: Allocator, base_path: []const u8) !ImmutableDB {
+        return openWithMithrilBoundary(allocator, base_path, null);
+    }
+
+    pub fn openWithMithrilBoundary(
+        allocator: Allocator,
+        base_path: []const u8,
+        mithril_boundary_chunk: ?u32,
+    ) !ImmutableDB {
         // Ensure directory exists
         std.fs.cwd().makePath(base_path) catch |err| {
             if (err != error.PathAlreadyExists) return err;
@@ -61,10 +70,14 @@ pub const ImmutableDB = struct {
             .tip = null,
             .secondary_index = std.AutoHashMap(HeaderHash, BlockInfo).init(allocator),
             .chunk_file = null,
+            .mithril_boundary_chunk = mithril_boundary_chunk,
         };
 
-        // Scan for existing chunks to find the tip
-        try db.recoverState();
+        if (mithril_boundary_chunk) |boundary| {
+            try db.recoverStateWithMithrilBoundary(boundary);
+        } else {
+            try db.recoverState();
+        }
 
         return db;
     }
@@ -194,6 +207,18 @@ pub const ImmutableDB = struct {
 
         try file.seekTo(offset);
 
+        if (self.mithril_boundary_chunk) |boundary| {
+            if (chunk_no <= boundary) {
+                const block = try self.allocator.alloc(u8, size);
+                const data_read = try file.readAll(block);
+                if (data_read != size) {
+                    self.allocator.free(block);
+                    return error.UnexpectedEndOfFile;
+                }
+                return block;
+            }
+        }
+
         // Read length prefix
         var len_buf: [4]u8 = undefined;
         const len_read = try file.readAll(&len_buf);
@@ -238,6 +263,45 @@ pub const ImmutableDB = struct {
         self.current_chunk = discovered.items[discovered.items.len - 1];
 
         for (discovered.items) |chunk_no| {
+            try self.recoverChunk(chunk_no);
+        }
+    }
+
+    fn recoverStateWithMithrilBoundary(self: *ImmutableDB, boundary_chunk: u32) !void {
+        var dir = std.fs.cwd().openDir(self.base_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var discovered: std.ArrayList(u32) = .empty;
+        defer discovered.deinit(self.allocator);
+
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (!std.mem.endsWith(u8, entry.name, ".chunk")) continue;
+            const chunk_str = entry.name[0 .. entry.name.len - ".chunk".len];
+            const chunk_no = std.fmt.parseInt(u32, chunk_str, 10) catch continue;
+            try discovered.append(self.allocator, chunk_no);
+        }
+
+        if (discovered.items.len == 0) {
+            self.current_chunk = boundary_chunk;
+            self.tip = null;
+            return;
+        }
+
+        std.mem.sort(u32, discovered.items, {}, comptime std.sort.asc(u32));
+        self.current_chunk = @max(discovered.items[discovered.items.len - 1], boundary_chunk);
+
+        var idx = discovered.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const chunk_no = discovered.items[idx];
+            if (chunk_no > boundary_chunk) continue;
+            self.tip = try self.recoverRawChunkTip(chunk_no);
+            if (self.tip != null) break;
+        }
+
+        for (discovered.items) |chunk_no| {
+            if (chunk_no <= boundary_chunk) continue;
             try self.recoverChunk(chunk_no);
         }
     }
@@ -291,6 +355,32 @@ pub const ImmutableDB = struct {
 
             offset += len_buf.len + block_len;
         }
+    }
+
+    fn recoverRawChunkTip(self: *ImmutableDB, chunk_no: u32) !?ImmutableTip {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{d:0>5}.chunk", .{ self.base_path, chunk_no });
+        const data = try std.fs.cwd().readFileAlloc(self.allocator, path, 256 * 1024 * 1024);
+        defer self.allocator.free(data);
+
+        var pos: usize = 0;
+        var tip: ?ImmutableTip = null;
+        while (pos < data.len) {
+            var dec = Decoder.init(data[pos..]);
+            const block_slice = dec.sliceOfNextValue() catch break;
+            const raw = data[pos .. pos + block_slice.len];
+            pos += block_slice.len;
+
+            const block = block_mod.parseBlock(raw) catch break;
+            tip = .{
+                .slot = block.header.slot,
+                .hash = block.hash(),
+                .block_no = block.header.block_no,
+                .chunk_no = chunk_no,
+            };
+        }
+
+        return tip;
     }
 
     pub const Error = error{
@@ -406,5 +496,63 @@ test "immutabledb: crash recovery rebuilds tip and index" {
         try std.testing.expect(block != null);
         defer allocator.free(block.?);
         try std.testing.expectEqualSlices(u8, block2_data, block.?);
+    }
+}
+
+test "immutabledb: mixed Mithril boundary preserves local chunks" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-test-imm-mixed";
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+
+    std.fs.cwd().makePath(path) catch {};
+
+    const snapshot_block = std.fs.cwd().readFileAlloc(
+        allocator,
+        "tests/vectors/alonzo_block.cbor",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(snapshot_block);
+
+    const local_block = std.fs.cwd().readFileAlloc(
+        allocator,
+        "tests/vectors/real_conway_block.cbor",
+        10 * 1024 * 1024,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(local_block);
+
+    const snapshot_path = try std.fmt.allocPrint(allocator, "{s}/00000.chunk", .{path});
+    defer allocator.free(snapshot_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = snapshot_path,
+        .data = snapshot_block,
+    });
+
+    const local = try block_mod.parseBlock(local_block);
+
+    {
+        var db = try ImmutableDB.openWithMithrilBoundary(allocator, path, 0);
+        defer db.close();
+        try db.appendBlock(local.hash(), local_block, local.header.slot, local.header.block_no);
+    }
+
+    {
+        var db = try ImmutableDB.openWithMithrilBoundary(allocator, path, 0);
+        defer db.close();
+
+        const tip = db.getTip().?;
+        try std.testing.expectEqual(local.header.slot, tip.slot);
+        try std.testing.expectEqual(local.header.block_no, tip.block_no);
+
+        const loaded = try db.getBlock(local.hash());
+        try std.testing.expect(loaded != null);
+        defer allocator.free(loaded.?);
+        try std.testing.expectEqualSlices(u8, local_block, loaded.?);
     }
 }

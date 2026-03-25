@@ -23,6 +23,8 @@ pub const SupportedProtocolParamUpdate = struct {
     key_deposit: ?u64 = null,
     pool_deposit: ?u64 = null,
     max_block_body_size: ?u32 = null,
+    optimal_pool_count: ?u16 = null,
+    min_pool_cost: ?u64 = null,
 };
 
 pub const UpdateVote = struct {
@@ -57,7 +59,11 @@ pub const GovernanceConfig = struct {
     decentralization_param: types.UnitInterval,
     reward_params: rewards_mod.RewardParams,
     initial_genesis_delegations: []GenesisDelegation,
-    /// First Shelley-era slot. Epoch computation uses (slot - era_start_slot) / epoch_length.
+    /// First absolute epoch covered by Shelley-era rules.
+    /// On mainnet this is 208, on preprod 4, on preview 0.
+    era_start_epoch: u64 = 0,
+    /// First Shelley-era slot. Absolute epoch computation uses era_start_epoch +
+    /// ((slot - era_start_slot) / epoch_length).
     /// On mainnet this is 89856000 (= 208 * 432000), on preprod 86400.
     era_start_slot: u64 = 0,
 
@@ -65,15 +71,15 @@ pub const GovernanceConfig = struct {
         allocator.free(self.initial_genesis_delegations);
     }
 
-    /// Compute the Shelley-era epoch for a given slot.
+    /// Compute the absolute epoch number for a given Shelley-era slot.
     pub fn slotToEpoch(self: *const GovernanceConfig, slot: u64) u64 {
         if (slot < self.era_start_slot) return 0;
-        return (slot - self.era_start_slot) / self.epoch_length;
+        return self.era_start_epoch + (slot - self.era_start_slot) / self.epoch_length;
     }
 
-    /// First slot of a Shelley-era epoch.
+    /// First slot of an absolute Shelley-era epoch.
     pub fn epochFirstSlot(self: *const GovernanceConfig, epoch: u64) u64 {
-        return self.era_start_slot + epoch * self.epoch_length;
+        return self.era_start_slot + (epoch -| self.era_start_epoch) * self.epoch_length;
     }
 };
 
@@ -198,6 +204,8 @@ pub fn applySupportedUpdate(
     if (update.key_deposit) |value| next.key_deposit = value;
     if (update.pool_deposit) |value| next.pool_deposit = value;
     if (update.max_block_body_size) |value| next.max_block_body_size = value;
+    if (update.optimal_pool_count) |value| next.optimal_pool_count = value;
+    if (update.min_pool_cost) |value| next.min_pool_cost = value;
     return next;
 }
 
@@ -313,9 +321,17 @@ fn decodeUpdateField(dec: *Decoder, update: *SupportedProtocolParamUpdate) !void
         3 => update.max_tx_size = try decodeUint32(dec),
         5 => update.key_deposit = try dec.decodeUint(),
         6 => update.pool_deposit = try dec.decodeUint(),
+        8 => update.optimal_pool_count = try decodeUint16(dec),
         15 => update.min_utxo_value = try dec.decodeUint(),
+        16 => update.min_pool_cost = try dec.decodeUint(),
         else => try dec.skipValue(),
     }
+}
+
+fn decodeUint16(dec: *Decoder) !u16 {
+    const value = try dec.decodeUint();
+    if (value > std.math.maxInt(u16)) return error.Overflow;
+    return @intCast(value);
 }
 
 fn decodeUint32(dec: *Decoder) !u32 {
@@ -325,7 +341,7 @@ fn decodeUint32(dec: *Decoder) !u32 {
 }
 
 fn epochBoundaryPointOfNoReturn(config: *const GovernanceConfig, epoch: EpochNo) u64 {
-    const next_epoch_first_slot = types.epochFirstSlot(epoch + 1, config.epoch_length);
+    const next_epoch_first_slot = config.epochFirstSlot(epoch + 1);
     return next_epoch_first_slot -| (2 * config.stability_window);
 }
 
@@ -469,11 +485,13 @@ test "protocol update: parse tx update with supported fields" {
     try enc.encodeArrayLen(2);
     try enc.encodeMapLen(1);
     try enc.encodeBytes(&([_]u8{0x11} ** 28));
-    try enc.encodeMapLen(2);
+    try enc.encodeMapLen(3);
     try enc.encodeUint(0);
     try enc.encodeUint(77);
     try enc.encodeUint(3);
     try enc.encodeUint(16390);
+    try enc.encodeUint(8);
+    try enc.encodeUint(500);
     try enc.encodeUint(9);
 
     const raw = try enc.toOwnedSlice();
@@ -486,6 +504,7 @@ test "protocol update: parse tx update with supported fields" {
     try std.testing.expectEqual(@as(usize, 1), update.votes.len);
     try std.testing.expectEqual(@as(u64, 77), update.votes[0].update.min_fee_a.?);
     try std.testing.expectEqual(@as(u32, 16390), update.votes[0].update.max_tx_size.?);
+    try std.testing.expectEqual(@as(u16, 500), update.votes[0].update.optimal_pool_count.?);
 }
 
 test "protocol update: stage and adopt updates across epoch boundary" {
@@ -544,6 +563,26 @@ test "protocol update: stage and adopt updates across epoch boundary" {
     try advanceToSlot(allocator, &config, &state, &active, 100);
     try std.testing.expectEqual(@as(u64, 44), active.min_fee_a);
     try std.testing.expectEqual(@as(u64, 1), state.current_epoch);
+}
+
+test "protocol update: epoch mapping uses absolute epochs after hard fork" {
+    const config = GovernanceConfig{
+        .epoch_length = 432_000,
+        .stability_window = 2_160,
+        .update_quorum = 1,
+        .initial_nonce = @import("../consensus/praos.zig").initialNonce(),
+        .extra_entropy = .neutral,
+        .decentralization_param = .{ .numerator = 0, .denominator = 1 },
+        .reward_params = rewards_mod.RewardParams.mainnet_defaults,
+        .initial_genesis_delegations = &.{},
+        .era_start_epoch = 4,
+        .era_start_slot = 86_400,
+    };
+
+    try std.testing.expectEqual(@as(u64, 4), config.slotToEpoch(86_400));
+    try std.testing.expectEqual(@as(u64, 278), config.slotToEpoch(118_754_184));
+    try std.testing.expectEqual(@as(u64, 118_886_400), config.epochFirstSlot(279));
+    try std.testing.expectEqual(@as(u64, 118_882_080), epochBoundaryPointOfNoReturn(&config, 278));
 }
 
 test "protocol update: reject non-genesis proposer" {

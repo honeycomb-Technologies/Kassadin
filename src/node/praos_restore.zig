@@ -18,6 +18,7 @@ pub fn reconstructFromImmutable(
     allocator: Allocator,
     immutable_path: []const u8,
     target_slot: types.SlotNo,
+    raw_cbor_boundary: ?u32,
     config: *const protocol_update.GovernanceConfig,
 ) !RestoreResult {
     var result = RestoreResult{};
@@ -47,14 +48,26 @@ pub fn reconstructFromImmutable(
         const chunk_data = try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024 * 1024);
         defer allocator.free(chunk_data);
 
+        const raw_cbor_chunk = raw_cbor_boundary != null and chunk_idx <= raw_cbor_boundary.?;
         var pos: usize = 0;
         while (pos < chunk_data.len) {
             if (runtime_control.stopRequested()) return error.Interrupted;
 
-            var dec = Decoder.init(chunk_data[pos..]);
-            const block_slice = dec.sliceOfNextValue() catch break;
-            const raw = chunk_data[pos .. pos + block_slice.len];
-            pos += block_slice.len;
+            const raw = if (raw_cbor_chunk) blk: {
+                var dec = Decoder.init(chunk_data[pos..]);
+                const block_slice = dec.sliceOfNextValue() catch break;
+                const raw = chunk_data[pos .. pos + block_slice.len];
+                pos += block_slice.len;
+                break :blk raw;
+            } else blk: {
+                if (chunk_data.len - pos < 4) break;
+                const block_len = std.mem.readInt(u32, chunk_data[pos..][0..4], .big);
+                pos += 4;
+                if (block_len == 0 or block_len > chunk_data.len - pos) break;
+                const raw = chunk_data[pos .. pos + block_len];
+                pos += block_len;
+                break :blk raw;
+            };
 
             const block = block_mod.parseBlock(raw) catch break; // end of parseable immutable data
             result.blocks_scanned += 1;

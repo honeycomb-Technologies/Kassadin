@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const certificates = @import("../ledger/certificates.zig");
@@ -745,6 +746,10 @@ pub const LedgerDB = struct {
         try self.setStakeAccountDRepDelegation(credential, drep);
     }
 
+    pub fn importDRepDeposit(self: *LedgerDB, credential: Credential, deposit: Coin) !void {
+        try self.drep_deposits.put(credential, deposit);
+    }
+
     pub fn importStakePointer(self: *LedgerDB, credential: Credential, pointer: Pointer) !void {
         try self.stake_account_pointers.put(credential, pointer);
         try self.stake_credentials_by_pointer.put(pointer, credential);
@@ -841,6 +846,34 @@ pub const LedgerDB = struct {
         return &self.stake_snapshots;
     }
 
+    pub fn rewardBalanceCount(self: *const LedgerDB) usize {
+        return self.reward_balances.count();
+    }
+
+    pub fn nonZeroRewardAccountCount(self: *const LedgerDB) usize {
+        var count: usize = 0;
+
+        var stake_account_it = self.stake_accounts.iterator();
+        while (stake_account_it.next()) |entry| {
+            if (!entry.value_ptr.registered) continue;
+            if (entry.value_ptr.reward_balance == 0) continue;
+            count += 1;
+        }
+
+        var reward_it = self.reward_balances.iterator();
+        while (reward_it.next()) |entry| {
+            if (entry.key_ptr.network == self.reward_account_network) continue;
+            if (entry.value_ptr.* == 0) continue;
+            count += 1;
+        }
+
+        return count;
+    }
+
+    pub fn stakeDepositCount(self: *const LedgerDB) usize {
+        return self.stake_deposits.count();
+    }
+
     pub fn lookupPoolDeposit(self: *const LedgerDB, pool: KeyHash) ?Coin {
         return self.pool_deposits.get(pool);
     }
@@ -852,6 +885,12 @@ pub const LedgerDB = struct {
     pub fn lookupIssuerVrfKeyHash(self: *const LedgerDB, issuer: KeyHash) ?types.Hash32 {
         if (self.lookupPoolConfig(issuer)) |config| {
             if (config.vrf_keyhash) |vrf| return vrf;
+        }
+
+        if (self.stake_snapshots.getLeaderDistribution()) |distribution| {
+            if (distribution.getPool(issuer)) |pool| {
+                if (pool.vrf_keyhash) |vrf| return vrf;
+            }
         }
 
         var it = self.genesis_delegations.iterator();
@@ -1315,6 +1354,16 @@ pub const LedgerDB = struct {
                 });
 
                 if (self.lookupPoolRewardAccount(pool)) |reward_account| {
+                    // Trace pool reap refunds to failing credentials
+                    if (!builtin.is_test) {
+                        if ((reward_account.credential.hash[0] == 0x35 and reward_account.credential.hash[1] == 0x23) or
+                            (reward_account.credential.hash[0] == 0x8b and reward_account.credential.hash[1] == 0x69))
+                        {
+                            std.debug.print("  POOL REAP TRACE: cred={x:0>2}{x:0>2}...: pool refund deposit={}\n", .{
+                                reward_account.credential.hash[0], reward_account.credential.hash[1], deposit,
+                            });
+                        }
+                    }
                     if (self.lookupRewardBalance(reward_account) != null or self.lookupStakeDeposit(reward_account.credential) != null) {
                         try appendPoolReapRewardChange(
                             allocator,
@@ -1503,16 +1552,18 @@ pub const LedgerDB = struct {
             blocks_total,
         );
 
-        std.debug.print("  Epoch reward calc: reserves={} fees={} total_blocks_made={} blocks_total={} pool_rewards={} go_total_stake={} pools={} delegators={}\n", .{
-            self.reserves_balance,
-            self.snapshot_fees,
-            total_blocks_made,
-            blocks_total,
-            epoch_rewards.pool_rewards,
-            go_dist.total_stake,
-            go_dist.pools.count(),
-            go_dist.delegators.count(),
-        });
+        if (!builtin.is_test) {
+            std.debug.print("  Epoch reward calc: reserves={} fees={} total_blocks_made={} blocks_total={} pool_rewards={} go_total_stake={} pools={} delegators={}\n", .{
+                self.reserves_balance,
+                self.snapshot_fees,
+                total_blocks_made,
+                blocks_total,
+                epoch_rewards.pool_rewards,
+                go_dist.total_stake,
+                go_dist.pools.count(),
+                go_dist.delegators.count(),
+            });
+        }
 
         var reward_changes: std.ArrayList(RewardBalanceChange) = .empty;
         defer reward_changes.deinit(allocator);
@@ -1537,7 +1588,7 @@ pub const LedgerDB = struct {
                 pool_stake.pledge,
                 params,
                 blocks_made,
-                blocks_total,
+                total_blocks_made,
             );
             if (pool_reward == 0) continue;
 
@@ -1583,11 +1634,30 @@ pub const LedgerDB = struct {
                 if (reward == 0) continue;
 
                 const is_registered = self.isRegisteredRewardCredential(delegated.credential);
-                // Debug: track specific credential from withdrawal failure
-                if (delegated.credential.hash[0] == 0x35 and delegated.credential.hash[1] == 0x23) {
-                    std.debug.print("  TRACE cred=3523...: reward={} registered={} pool_reward={} active_stake={} pool_active={}\n", .{
-                        reward, is_registered, pool_reward, delegated.active_stake, pool_stake.active_stake,
-                    });
+                // Debug: track specific credentials from withdrawal failure
+                if (!builtin.is_test) {
+                    if ((delegated.credential.hash[0] == 0x35 and delegated.credential.hash[1] == 0x23) or
+                        (delegated.credential.hash[0] == 0x8b and delegated.credential.hash[1] == 0x69))
+                    {
+                        std.debug.print("  REWARD TRACE: cred={x:0>2}{x:0>2}...: reward={} registered={} pool_reward={} active_stake={} pool_active={}\n", .{
+                            delegated.credential.hash[0], delegated.credential.hash[1],
+                            reward,                       is_registered,
+                            pool_reward,                  delegated.active_stake,
+                            pool_stake.active_stake,
+                        });
+                        std.debug.print(
+                            "    pool inputs: blocks_made={} pledge={} cost={} margin={}/{} owner_stake={} total_prev_blocks={}\n",
+                            .{
+                                blocks_made,
+                                pool_stake.pledge,
+                                pool_stake.cost,
+                                pool_stake.margin.numerator,
+                                pool_stake.margin.denominator,
+                                pool_stake.self_delegated_owner_stake,
+                                total_blocks_made,
+                            },
+                        );
+                    }
                 }
                 if (is_registered) {
                     try appendPoolReapRewardChange(
@@ -1605,6 +1675,21 @@ pub const LedgerDB = struct {
         }
 
         const total_distributed = total_registered_distributed + total_unregistered_distributed;
+
+        // Check if failing credentials got any reward in this epoch
+        if (!builtin.is_test) {
+            for (reward_changes.items) |change| {
+                if ((change.account.credential.hash[0] == 0x35 and change.account.credential.hash[1] == 0x23) or
+                    (change.account.credential.hash[0] == 0x8b and change.account.credential.hash[1] == 0x69))
+                {
+                    std.debug.print("  EPOCH REWARD RESULT: cred={x:0>2}{x:0>2}...: previous={?} next={?}\n", .{
+                        change.account.credential.hash[0], change.account.credential.hash[1],
+                        change.previous,                   change.next,
+                    });
+                }
+            }
+        }
+
         const reward_update = try rewards_mod.calculateRewardUpdate(epoch_rewards, total_distributed);
         if (!reward_update.isBalanced()) return error.InvalidRewardAccounting;
 
@@ -1666,6 +1751,16 @@ pub const LedgerDB = struct {
         var total_reserves_payout: Coin = 0;
         var reserve_it = self.mir_reserves.iterator();
         while (reserve_it.next()) |entry| {
+            // Trace failing credentials in MIR reserves
+            if (!builtin.is_test) {
+                if ((entry.key_ptr.hash[0] == 0x35 and entry.key_ptr.hash[1] == 0x23) or
+                    (entry.key_ptr.hash[0] == 0x8b and entry.key_ptr.hash[1] == 0x69))
+                {
+                    std.debug.print("  MIR RESERVES TRACE: cred={x:0>2}{x:0>2}...: amount={}\n", .{
+                        entry.key_ptr.hash[0], entry.key_ptr.hash[1], entry.value_ptr.*,
+                    });
+                }
+            }
             try mir_reserves_changes.append(allocator, .{
                 .credential = entry.key_ptr.*,
                 .previous = entry.value_ptr.*,
@@ -1685,6 +1780,16 @@ pub const LedgerDB = struct {
         var total_treasury_payout: Coin = 0;
         var treasury_it = self.mir_treasury.iterator();
         while (treasury_it.next()) |entry| {
+            // Trace failing credentials in MIR treasury
+            if (!builtin.is_test) {
+                if ((entry.key_ptr.hash[0] == 0x35 and entry.key_ptr.hash[1] == 0x23) or
+                    (entry.key_ptr.hash[0] == 0x8b and entry.key_ptr.hash[1] == 0x69))
+                {
+                    std.debug.print("  MIR TREASURY TRACE: cred={x:0>2}{x:0>2}...: amount={}\n", .{
+                        entry.key_ptr.hash[0], entry.key_ptr.hash[1], entry.value_ptr.*,
+                    });
+                }
+            }
             try mir_treasury_changes.append(allocator, .{
                 .credential = entry.key_ptr.*,
                 .previous = entry.value_ptr.*,
@@ -1764,7 +1869,7 @@ pub const LedgerDB = struct {
 
         // Header: magic + version + tip_slot
         try file.writeAll("KLED");
-        std.mem.writeInt(u32, buf[0..4], 12, .big);
+        std.mem.writeInt(u32, buf[0..4], 13, .big);
         try file.writeAll(buf[0..4]);
         std.mem.writeInt(u64, &buf, self.tip_slot orelse 0, .big);
         try file.writeAll(&buf);
@@ -1781,9 +1886,24 @@ pub const LedgerDB = struct {
         try file.writeAll(&buf);
         try file.writeAll(&[_]u8{if (self.reward_balances_tracked) 1 else 0});
 
-        // Section 2: UTxO count (we skip UTxOs — loaded from Mithril snapshot)
-        std.mem.writeInt(u64, &buf, 0, .big);
+        // Section 2: UTxOs
+        std.mem.writeInt(u64, &buf, @intCast(self.utxo_set.count()), .big);
         try file.writeAll(&buf);
+        var utxo_it = self.utxo_set.iterator();
+        while (utxo_it.next()) |entry| {
+            try file.writeAll(&entry.key_ptr.tx_id);
+            var tx_ix_buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &tx_ix_buf, entry.key_ptr.tx_ix, .big);
+            try file.writeAll(&tx_ix_buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.value, .big);
+            try file.writeAll(&buf);
+            try writeOptionalCredentialToFile(file, entry.value_ptr.stake_credential);
+            try writeOptionalPointerToFile(file, entry.value_ptr.stake_pointer);
+            var raw_len_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &raw_len_buf, @intCast(entry.value_ptr.raw_cbor.len), .big);
+            try file.writeAll(&raw_len_buf);
+            try file.writeAll(entry.value_ptr.raw_cbor);
+        }
 
         // Section 3: Reward balances
         std.mem.writeInt(u64, &buf, @intCast(self.reward_balances.count()), .big);
@@ -2028,6 +2148,11 @@ pub const LedgerDB = struct {
             try writeOptionalDRepToFile(file, entry.value_ptr.drep_delegation);
             try writeOptionalPointerToFile(file, entry.value_ptr.pointer);
         }
+
+        // Section 27: Stake snapshots
+        try writeOptionalStakeDistributionToFile(file, self.stake_snapshots.mark);
+        try writeOptionalStakeDistributionToFile(file, self.stake_snapshots.set);
+        try writeOptionalStakeDistributionToFile(file, self.stake_snapshots.go);
     }
 
     /// Load ledger state from a binary checkpoint file.
@@ -2051,7 +2176,7 @@ pub const LedgerDB = struct {
         var ver_buf: [4]u8 = undefined;
         _ = file.readAll(&ver_buf) catch return false;
         const version = std.mem.readInt(u32, &ver_buf, .big);
-        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9 and version != 10 and version != 11 and version != 12) return false;
+        if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 9 and version != 10 and version != 11 and version != 12 and version != 13) return false;
 
         _ = file.readAll(&buf) catch return false;
         const tip_slot_val = std.mem.readInt(u64, &buf, .big);
@@ -2072,18 +2197,50 @@ pub const LedgerDB = struct {
         _ = try file.readAll(&tracked_buf);
         self.reward_balances_tracked = tracked_buf[0] != 0;
 
-        // Section 2: UTxO count (skipped — loaded from Mithril)
+        // Section 2: UTxOs
+        var i: u64 = 0;
         _ = try file.readAll(&buf);
+        const utxo_count = std.mem.readInt(u64, &buf, .big);
+        if (version >= 13) {
+            i = 0;
+            while (i < utxo_count) : (i += 1) {
+                var tx_id: types.TxId = undefined;
+                _ = try file.readAll(&tx_id);
+                var tx_ix_buf: [2]u8 = undefined;
+                _ = try file.readAll(&tx_ix_buf);
+                _ = try file.readAll(&buf);
+                const value = std.mem.readInt(u64, &buf, .big);
+                const stake_credential = try readOptionalCredentialFromFile(file);
+                const stake_pointer = try readOptionalPointerFromFile(file);
+                var raw_len_buf: [4]u8 = undefined;
+                _ = try file.readAll(&raw_len_buf);
+                const raw_len = std.mem.readInt(u32, &raw_len_buf, .big);
+                const raw_cbor = try self.allocator.alloc(u8, raw_len);
+                errdefer self.allocator.free(raw_cbor);
+                _ = try file.readAll(raw_cbor);
+                const tx_in = TxIn{
+                    .tx_id = tx_id,
+                    .tx_ix = std.mem.readInt(u16, &tx_ix_buf, .big),
+                };
+                try self.utxo_set.put(tx_in, .{
+                    .tx_in = tx_in,
+                    .value = value,
+                    .stake_credential = stake_credential,
+                    .stake_pointer = stake_pointer,
+                    .raw_cbor = raw_cbor,
+                });
+            }
+        }
 
         // Section 3: Reward balances
         _ = try file.readAll(&buf);
         const reward_count = std.mem.readInt(u64, &buf, .big);
-        var i: u64 = 0;
+        i = 0;
         while (i < reward_count) : (i += 1) {
             var entry_buf: [1 + 1 + 28 + 8]u8 = undefined;
             _ = try file.readAll(&entry_buf);
-            const network: types.Network = @enumFromInt(entry_buf[0]);
-            const cred_type: types.CredentialType = @enumFromInt(entry_buf[1]);
+            const network = try networkFromByte(entry_buf[0]);
+            const cred_type = try credentialTypeFromByte(entry_buf[1]);
             var hash: types.Hash28 = undefined;
             @memcpy(&hash, entry_buf[2..30]);
             const amount = std.mem.readInt(u64, entry_buf[30..38], .big);
@@ -2100,7 +2257,7 @@ pub const LedgerDB = struct {
         while (i < stake_count) : (i += 1) {
             var entry_buf: [1 + 28 + 8]u8 = undefined;
             _ = try file.readAll(&entry_buf);
-            const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+            const cred_type = try credentialTypeFromByte(entry_buf[0]);
             var hash: types.Hash28 = undefined;
             @memcpy(&hash, entry_buf[1..29]);
             const amount = std.mem.readInt(u64, entry_buf[29..37], .big);
@@ -2129,8 +2286,8 @@ pub const LedgerDB = struct {
             _ = try file.readAll(&entry_buf);
             var pool: KeyHash = undefined;
             @memcpy(&pool, entry_buf[0..28]);
-            const network: types.Network = @enumFromInt(entry_buf[28]);
-            const cred_type: types.CredentialType = @enumFromInt(entry_buf[29]);
+            const network = try networkFromByte(entry_buf[28]);
+            const cred_type = try credentialTypeFromByte(entry_buf[29]);
             var hash: types.Hash28 = undefined;
             @memcpy(&hash, entry_buf[30..58]);
             try self.pool_reward_accounts.put(pool, .{
@@ -2159,7 +2316,7 @@ pub const LedgerDB = struct {
         while (i < deleg_count) : (i += 1) {
             var entry_buf: [1 + 28 + 28]u8 = undefined;
             _ = try file.readAll(&entry_buf);
-            const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+            const cred_type = try credentialTypeFromByte(entry_buf[0]);
             var hash: types.Hash28 = undefined;
             @memcpy(&hash, entry_buf[1..29]);
             var pool: KeyHash = undefined;
@@ -2174,7 +2331,7 @@ pub const LedgerDB = struct {
         while (i < drep_dep_count) : (i += 1) {
             var entry_buf: [1 + 28 + 8]u8 = undefined;
             _ = try file.readAll(&entry_buf);
-            const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+            const cred_type = try credentialTypeFromByte(entry_buf[0]);
             var hash: types.Hash28 = undefined;
             @memcpy(&hash, entry_buf[1..29]);
             const amount = std.mem.readInt(u64, entry_buf[29..37], .big);
@@ -2188,7 +2345,7 @@ pub const LedgerDB = struct {
         while (i < drep_deleg_count) : (i += 1) {
             var entry_buf: [1 + 28]u8 = undefined;
             _ = try file.readAll(&entry_buf);
-            const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+            const cred_type = try credentialTypeFromByte(entry_buf[0]);
             var hash: types.Hash28 = undefined;
             @memcpy(&hash, entry_buf[1..29]);
             const drep = try readDRepFromFile(file);
@@ -2231,8 +2388,8 @@ pub const LedgerDB = struct {
                 const cost = std.mem.readInt(u64, entry_buf[8..16], .big);
                 const margin = try readUnitIntervalFromFile(file);
                 _ = try file.readAll(entry_buf[16..46]);
-                const network: types.Network = @enumFromInt(entry_buf[16]);
-                const cred_type: types.CredentialType = @enumFromInt(entry_buf[17]);
+                const network = try networkFromByte(entry_buf[16]);
+                const cred_type = try credentialTypeFromByte(entry_buf[17]);
                 var hash: types.Hash28 = undefined;
                 @memcpy(&hash, entry_buf[18..46]);
                 try self.future_pool_params.put(pool, .{
@@ -2320,7 +2477,7 @@ pub const LedgerDB = struct {
             while (i < mir_reserves_count) : (i += 1) {
                 var entry_buf: [1 + 28 + 8]u8 = undefined;
                 _ = try file.readAll(&entry_buf);
-                const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+                const cred_type = try credentialTypeFromByte(entry_buf[0]);
                 var hash: types.Hash28 = undefined;
                 @memcpy(&hash, entry_buf[1..29]);
                 const amount = std.mem.readInt(u64, entry_buf[29..37], .big);
@@ -2333,7 +2490,7 @@ pub const LedgerDB = struct {
             while (i < mir_treasury_count) : (i += 1) {
                 var entry_buf: [1 + 28 + 8]u8 = undefined;
                 _ = try file.readAll(&entry_buf);
-                const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+                const cred_type = try credentialTypeFromByte(entry_buf[0]);
                 var hash: types.Hash28 = undefined;
                 @memcpy(&hash, entry_buf[1..29]);
                 const amount = std.mem.readInt(u64, entry_buf[29..37], .big);
@@ -2348,7 +2505,7 @@ pub const LedgerDB = struct {
             while (i < pointer_count) : (i += 1) {
                 var entry_buf: [1 + 28]u8 = undefined;
                 _ = try file.readAll(&entry_buf);
-                const cred_type: types.CredentialType = @enumFromInt(entry_buf[0]);
+                const cred_type = try credentialTypeFromByte(entry_buf[0]);
                 var hash: types.Hash28 = undefined;
                 @memcpy(&hash, entry_buf[1..29]);
                 _ = try file.readAll(&buf);
@@ -2427,8 +2584,8 @@ pub const LedgerDB = struct {
             while (i < stake_account_count) : (i += 1) {
                 var header_buf: [1 + 1 + 28 + 1 + 8 + 8]u8 = undefined;
                 _ = try file.readAll(&header_buf);
-                const network: types.Network = @enumFromInt(header_buf[0]);
-                const cred_type: types.CredentialType = @enumFromInt(header_buf[1]);
+                const network = try networkFromByte(header_buf[0]);
+                const cred_type = try credentialTypeFromByte(header_buf[1]);
                 var hash: types.Hash28 = undefined;
                 @memcpy(&hash, header_buf[2..30]);
                 const registered = header_buf[30] != 0;
@@ -2455,6 +2612,23 @@ pub const LedgerDB = struct {
         } else {
             try self.rebuildStakeAccounts();
         }
+
+        if (version >= 13) {
+            var snapshots = StakeSnapshots.init(self.allocator);
+            errdefer snapshots.deinit();
+            snapshots.mark = try readOptionalStakeDistributionFromFile(self.allocator, file);
+            snapshots.set = try readOptionalStakeDistributionFromFile(self.allocator, file);
+            snapshots.go = try readOptionalStakeDistributionFromFile(self.allocator, file);
+            snapshots.current_epoch = if (snapshots.mark) |dist|
+                dist.epoch
+            else if (snapshots.set) |dist|
+                dist.epoch
+            else if (snapshots.go) |dist|
+                dist.epoch
+            else
+                0;
+            self.replaceStakeSnapshots(snapshots);
+        }
         return true;
     }
 
@@ -2469,6 +2643,9 @@ pub const LedgerDB = struct {
         self.mir_delta_treasury = 0;
         self.reward_balances_tracked = false;
         self.pointer_instant_stake_enabled = true;
+        var utxo_it = self.utxo_set.valueIterator();
+        while (utxo_it.next()) |entry| self.allocator.free(entry.raw_cbor);
+        self.utxo_set.clearRetainingCapacity();
         self.stake_accounts.clearRetainingCapacity();
         self.stake_account_pointers.clearRetainingCapacity();
         self.stake_credentials_by_pointer.clearRetainingCapacity();
@@ -2769,6 +2946,14 @@ fn writeDRepToFile(file: std.fs.File, drep: DRep) !void {
     }
 }
 
+fn networkFromByte(value: u8) !types.Network {
+    return std.meta.intToEnum(types.Network, value) catch error.InvalidCheckpoint;
+}
+
+fn credentialTypeFromByte(value: u8) !types.CredentialType {
+    return std.meta.intToEnum(types.CredentialType, value) catch error.InvalidCheckpoint;
+}
+
 fn writeOptionalKeyHashToFile(file: std.fs.File, maybe_hash: ?KeyHash) !void {
     if (maybe_hash) |hash| {
         try file.writeAll(&[_]u8{1});
@@ -2782,6 +2967,16 @@ fn writeOptionalHash32ToFile(file: std.fs.File, maybe_hash: ?types.Hash32) !void
     if (maybe_hash) |hash| {
         try file.writeAll(&[_]u8{1});
         try file.writeAll(&hash);
+    } else {
+        try file.writeAll(&[_]u8{0});
+    }
+}
+
+fn writeOptionalCredentialToFile(file: std.fs.File, maybe_credential: ?Credential) !void {
+    if (maybe_credential) |credential| {
+        try file.writeAll(&[_]u8{1});
+        try file.writeAll(&[_]u8{@intFromEnum(credential.cred_type)});
+        try file.writeAll(&credential.hash);
     } else {
         try file.writeAll(&[_]u8{0});
     }
@@ -2817,6 +3012,56 @@ fn writeUnitIntervalToFile(file: std.fs.File, interval: UnitInterval) !void {
     try file.writeAll(&buf);
     std.mem.writeInt(u64, &buf, interval.denominator, .big);
     try file.writeAll(&buf);
+}
+
+fn writeOptionalStakeDistributionToFile(file: std.fs.File, maybe_distribution: ?StakeDistribution) !void {
+    if (maybe_distribution) |distribution| {
+        var buf: [8]u8 = undefined;
+        try file.writeAll(&[_]u8{1});
+        std.mem.writeInt(u64, &buf, distribution.epoch, .big);
+        try file.writeAll(&buf);
+
+        std.mem.writeInt(u64, &buf, @intCast(distribution.pools.count()), .big);
+        try file.writeAll(&buf);
+        var pool_it = distribution.pools.iterator();
+        while (pool_it.next()) |entry| {
+            try file.writeAll(entry.key_ptr);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.active_stake, .big);
+            try file.writeAll(&buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.self_delegated_owner_stake, .big);
+            try file.writeAll(&buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.pledge, .big);
+            try file.writeAll(&buf);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.cost, .big);
+            try file.writeAll(&buf);
+            try writeUnitIntervalToFile(file, entry.value_ptr.margin);
+            try file.writeAll(&[_]u8{@intFromEnum(entry.value_ptr.reward_account.network)});
+            try file.writeAll(&[_]u8{@intFromEnum(entry.value_ptr.reward_account.credential.cred_type)});
+            try file.writeAll(&entry.value_ptr.reward_account.credential.hash);
+            try writeOptionalHash32ToFile(file, entry.value_ptr.vrf_keyhash);
+        }
+
+        std.mem.writeInt(u64, &buf, @intCast(distribution.owner_memberships.count()), .big);
+        try file.writeAll(&buf);
+        var owner_it = distribution.owner_memberships.iterator();
+        while (owner_it.next()) |entry| {
+            try file.writeAll(&entry.key_ptr.pool);
+            try file.writeAll(&entry.key_ptr.owner);
+        }
+
+        std.mem.writeInt(u64, &buf, @intCast(distribution.delegators.count()), .big);
+        try file.writeAll(&buf);
+        var delegator_it = distribution.delegators.iterator();
+        while (delegator_it.next()) |entry| {
+            try file.writeAll(&[_]u8{@intFromEnum(entry.key_ptr.cred_type)});
+            try file.writeAll(&entry.key_ptr.hash);
+            try file.writeAll(&entry.value_ptr.pool_id);
+            std.mem.writeInt(u64, &buf, entry.value_ptr.active_stake, .big);
+            try file.writeAll(&buf);
+        }
+    } else {
+        try file.writeAll(&[_]u8{0});
+    }
 }
 
 fn writeDeltaCoinToFile(file: std.fs.File, delta: DeltaCoin) void {
@@ -2865,6 +3110,21 @@ fn readOptionalHash32FromFile(file: std.fs.File) !?types.Hash32 {
     return hash;
 }
 
+fn readOptionalCredentialFromFile(file: std.fs.File) !?Credential {
+    var present_buf: [1]u8 = undefined;
+    _ = try file.readAll(&present_buf);
+    if (present_buf[0] == 0) return null;
+
+    var header_buf: [1 + 28]u8 = undefined;
+    _ = try file.readAll(&header_buf);
+    var hash: types.Hash28 = undefined;
+    @memcpy(&hash, header_buf[1..29]);
+    return .{
+        .cred_type = try credentialTypeFromByte(header_buf[0]),
+        .hash = hash,
+    };
+}
+
 fn readOptionalDRepFromFile(file: std.fs.File) !?DRep {
     var present_buf: [1]u8 = undefined;
     _ = try file.readAll(&present_buf);
@@ -2889,6 +3149,85 @@ fn readOptionalPointerFromFile(file: std.fs.File) !?Pointer {
         .tx_ix = tx_ix,
         .cert_ix = cert_ix,
     };
+}
+
+fn readOptionalStakeDistributionFromFile(allocator: Allocator, file: std.fs.File) !?StakeDistribution {
+    var present_buf: [1]u8 = undefined;
+    _ = try file.readAll(&present_buf);
+    if (present_buf[0] == 0) return null;
+
+    var buf: [8]u8 = undefined;
+    _ = try file.readAll(&buf);
+    var distribution = StakeDistribution.init(allocator, std.mem.readInt(u64, &buf, .big));
+    errdefer distribution.deinit();
+
+    _ = try file.readAll(&buf);
+    const pool_count = std.mem.readInt(u64, &buf, .big);
+    var i: u64 = 0;
+    while (i < pool_count) : (i += 1) {
+        var pool: KeyHash = undefined;
+        _ = try file.readAll(&pool);
+        _ = try file.readAll(&buf);
+        const active_stake = std.mem.readInt(u64, &buf, .big);
+        _ = try file.readAll(&buf);
+        const self_delegated_owner_stake = std.mem.readInt(u64, &buf, .big);
+        _ = try file.readAll(&buf);
+        const pledge = std.mem.readInt(u64, &buf, .big);
+        _ = try file.readAll(&buf);
+        const cost = std.mem.readInt(u64, &buf, .big);
+        const margin = try readUnitIntervalFromFile(file);
+        var reward_account_buf: [1 + 1 + 28]u8 = undefined;
+        _ = try file.readAll(&reward_account_buf);
+        const reward_account = RewardAccount{
+            .network = try networkFromByte(reward_account_buf[0]),
+            .credential = .{
+                .cred_type = try credentialTypeFromByte(reward_account_buf[1]),
+                .hash = reward_account_buf[2..30].*,
+            },
+        };
+        const vrf_keyhash = try readOptionalHash32FromFile(file);
+        try distribution.setPoolStakeWithVrf(
+            pool,
+            active_stake,
+            self_delegated_owner_stake,
+            pledge,
+            cost,
+            margin,
+            reward_account,
+            vrf_keyhash,
+        );
+    }
+
+    _ = try file.readAll(&buf);
+    const owner_count = std.mem.readInt(u64, &buf, .big);
+    i = 0;
+    while (i < owner_count) : (i += 1) {
+        var membership_buf: [56]u8 = undefined;
+        _ = try file.readAll(&membership_buf);
+        try distribution.setPoolOwnerMembership(
+            membership_buf[0..28].*,
+            membership_buf[28..56].*,
+        );
+    }
+
+    _ = try file.readAll(&buf);
+    const delegator_count = std.mem.readInt(u64, &buf, .big);
+    i = 0;
+    while (i < delegator_count) : (i += 1) {
+        var delegator_buf: [1 + 28 + 28 + 8]u8 = undefined;
+        _ = try file.readAll(&delegator_buf);
+        try distribution.setDelegatedStake(
+            .{
+                .cred_type = try credentialTypeFromByte(delegator_buf[0]),
+                .hash = delegator_buf[1..29].*,
+            },
+            delegator_buf[29..57].*,
+            std.mem.readInt(u64, delegator_buf[57..65], .big),
+        );
+    }
+
+    distribution.finalize();
+    return distribution;
 }
 
 fn readUnitIntervalFromFile(file: std.fs.File) !UnitInterval {
@@ -4269,6 +4608,42 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try db.importPreviousEpochBlocksMade(pool, 7);
         try db.importCurrentEpochBlocksMade(pool, 3);
 
+        const utxo_raw = try allocator.dupe(u8, "checkpoint-utxo");
+        defer allocator.free(utxo_raw);
+        const utxos = [_]UtxoEntry{.{
+            .tx_in = .{ .tx_id = [_]u8{0xee} ** 32, .tx_ix = 3 },
+            .value = 12_345_678,
+            .stake_credential = account.credential,
+            .stake_pointer = pointer,
+            .raw_cbor = utxo_raw,
+        }};
+        _ = try db.primeUtxos(&utxos);
+
+        var snapshots = StakeSnapshots.init(allocator);
+        snapshots.current_epoch = 13;
+        snapshots.mark = StakeDistribution.init(allocator, 13);
+        snapshots.set = StakeDistribution.init(allocator, 12);
+        snapshots.go = StakeDistribution.init(allocator, 11);
+        if (snapshots.mark) |*mark| {
+            try mark.setPoolStakeWithVrf(pool, 111, 22, 250_000_000, 340_000_000, .{ .numerator = 1, .denominator = 20 }, account, [_]u8{0xb1} ** 32);
+            try mark.setPoolOwnerMembership(pool, [_]u8{0xbd} ** 28);
+            try mark.setDelegatedStake(account.credential, pool, 111);
+            mark.finalize();
+        }
+        if (snapshots.set) |*set| {
+            try set.setPoolStakeWithVrf(pool, 222, 33, 250_000_000, 340_000_000, .{ .numerator = 1, .denominator = 20 }, account, [_]u8{0xb1} ** 32);
+            try set.setPoolOwnerMembership(pool, [_]u8{0xbd} ** 28);
+            try set.setDelegatedStake(account.credential, pool, 222);
+            set.finalize();
+        }
+        if (snapshots.go) |*go| {
+            try go.setPoolStakeWithVrf(pool, 333, 44, 250_000_000, 340_000_000, .{ .numerator = 1, .denominator = 20 }, account, [_]u8{0xb1} ** 32);
+            try go.setPoolOwnerMembership(pool, [_]u8{0xbd} ** 28);
+            try go.setDelegatedStake(account.credential, pool, 333);
+            go.finalize();
+        }
+        db.replaceStakeSnapshots(snapshots);
+
         const drep_cred = Credential{ .cred_type = .script_hash, .hash = [_]u8{0xcc} ** 28 };
         try db.importMirReward(.reserves, account.credential, 9);
         try db.importMirReward(.treasury, drep_cred, 11);
@@ -4298,6 +4673,8 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try std.testing.expectEqual(@as(Coin, 100), db2.getSnapshotFees());
         try std.testing.expect(db2.areRewardBalancesTracked());
         try std.testing.expectEqual(@as(?SlotNo, 12345), db2.getTipSlot());
+        try std.testing.expectEqual(@as(usize, 1), db2.utxoCount());
+        try std.testing.expectEqual(@as(usize, 1), db2.nonZeroRewardAccountCount());
 
         const account = RewardAccount{
             .network = .testnet,
@@ -4311,6 +4688,11 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try std.testing.expectEqual(@as(?Coin, 7_000), db2.lookupRewardBalance(account));
         try std.testing.expectEqual(@as(?Coin, 2_000_000), db2.lookupStakeDeposit(account.credential));
         try std.testing.expectEqual(pointer, db2.lookupStakePointer(account.credential).?);
+        const loaded_utxo = db2.lookupUtxo(.{ .tx_id = [_]u8{0xee} ** 32, .tx_ix = 3 }).?;
+        try std.testing.expectEqual(@as(Coin, 12_345_678), loaded_utxo.value);
+        try std.testing.expectEqual(account.credential, loaded_utxo.stake_credential.?);
+        try std.testing.expectEqual(pointer, loaded_utxo.stake_pointer.?);
+        try std.testing.expectEqualSlices(u8, "checkpoint-utxo", loaded_utxo.raw_cbor);
         try std.testing.expect(db2.isStakeCredentialRegistered(empty_account.credential));
         try std.testing.expectEqual(@as(?Coin, 0), db2.lookupRewardBalance(empty_account));
         try std.testing.expectEqual(@as(?Coin, 0), db2.lookupStakeDeposit(empty_account.credential));
@@ -4361,6 +4743,10 @@ test "ledgerdb: checkpoint save and load round-trip" {
         try std.testing.expect(db2.lookupDRepDelegation(drep_cred) != null);
         try std.testing.expectEqual(@as(?Coin, 500_000_000), db2.lookupDRepDeposit(drep_cred));
         try std.testing.expect(!db2.isPointerInstantStakeEnabled());
+        try std.testing.expectEqual(@as(usize, 1), db2.getStakeSnapshots().mark.?.poolCount());
+        try std.testing.expectEqual(@as(usize, 1), db2.getStakeSnapshots().set.?.poolCount());
+        try std.testing.expectEqual(@as(usize, 1), db2.getStakeSnapshots().go.?.poolCount());
+        try std.testing.expectEqual(@as(Coin, 333), db2.getStakeSnapshots().go.?.getPool(pool).?.active_stake);
     }
 }
 
@@ -4894,6 +5280,37 @@ test "ledgerdb: rotate stake snapshots resolves pointer-backed stake" {
     const delegated = mark.getDelegatedStake(cred).?;
     try std.testing.expectEqual(pool, delegated.pool_id);
     try std.testing.expectEqual(@as(Coin, 7_000_000), delegated.active_stake);
+}
+
+test "ledgerdb: active stake snapshot supplies VRF key for retired pool lookup" {
+    const allocator = std.testing.allocator;
+    var db = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-snapshot-vrf");
+    defer db.deinit();
+
+    const pool = [_]u8{0xb1} ** 28;
+    const vrf = [_]u8{0xc2} ** 32;
+    const reward_account = RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xd3} ** 28 },
+    };
+
+    var snapshots = StakeSnapshots.init(allocator);
+    var go = stake_mod.StakeDistribution.init(allocator, 0);
+    try go.setPoolStakeWithVrf(
+        pool,
+        1_000_000_000,
+        0,
+        0,
+        0,
+        .{ .numerator = 0, .denominator = 1 },
+        reward_account,
+        vrf,
+    );
+    go.finalize();
+    snapshots.go = go;
+    db.replaceStakeSnapshots(snapshots);
+
+    try std.testing.expectEqual(vrf, db.lookupIssuerVrfKeyHash(pool).?);
 }
 
 test "ledgerdb: conway-style instant stake ignores pointer-backed stake" {

@@ -122,38 +122,30 @@ pub fn verifyCertifiedVrfRaw(raw: []const u8, vk: VRF.VerKey, seed: [32]u8) ?VRF
 ///   f = active slot coefficient (1/20 on mainnet)
 ///   σ = relative stake (pool_stake / total_active_stake)
 ///
-/// To avoid floating point, we use the approximation:
-///   Check that: certifiedNatural * denominator < 2^512 * (1 - (1-f)^σ) * denominator
-///
-/// For simplicity and correctness, we use the logarithmic approximation:
-///   1 - (1-f)^σ ≈ 1 - exp(-f*σ) ≈ f*σ (for small f)
-///   So the check becomes: certifiedNatural < 2^512 * f * σ
-///
-/// This is the same approximation used by the Haskell node for the
-/// active slot coefficient check.
+/// We compare the normalized VRF output against the exact threshold
+/// `1 - (1 - f)^σ`. The output comparison still uses the leading 64 bits of the
+/// 512-bit VRF output as a normalized fraction, but avoids the old `f * σ`
+/// approximation that was too strict for some real near-threshold blocks.
 pub fn meetsLeaderThreshold(
     vrf_output: VRF.Output,
     relative_stake_num: u64,
     relative_stake_den: u64,
     active_slot_coeff: praos.ActiveSlotCoeff,
 ) bool {
-    if (relative_stake_den == 0) return false;
+    if (relative_stake_den == 0 or active_slot_coeff.denominator == 0) return false;
 
-    // Interpret first 8 bytes of VRF output as big-endian u64
-    // (simplified — full check uses all 64 bytes as a 512-bit number,
-    // but for the threshold comparison, the top 8 bytes dominate)
     const cert_natural = std.mem.readInt(u64, vrf_output[0..8], .big);
+    const cert_fraction = @as(f128, @floatFromInt(cert_natural)) /
+        @as(f128, 18_446_744_073_709_551_616.0);
+    const f = @as(f128, @floatFromInt(active_slot_coeff.numerator)) /
+        @as(f128, @floatFromInt(active_slot_coeff.denominator));
+    const sigma = @as(f128, @floatFromInt(relative_stake_num)) /
+        @as(f128, @floatFromInt(relative_stake_den));
+    if (sigma <= 0 or f <= 0) return false;
+    if (f >= 1) return true;
 
-    // Threshold: 2^64 * f * σ (using the top 64 bits of the 512-bit space)
-    // = 2^64 * (f_num / f_den) * (stake_num / stake_den)
-    // = (2^64 * f_num * stake_num) / (f_den * stake_den)
-    //
-    // To avoid overflow, compute in 128 bits:
-    const max_val: u128 = std.math.maxInt(u64);
-    const threshold: u128 = (max_val * @as(u128, active_slot_coeff.numerator) * @as(u128, relative_stake_num)) /
-        (@as(u128, active_slot_coeff.denominator) * @as(u128, relative_stake_den));
-
-    return @as(u128, cert_natural) < threshold;
+    const threshold = @as(f128, 1.0) - @exp(sigma * @log(@as(f128, 1.0) - f));
+    return cert_fraction < threshold;
 }
 
 /// Full VRF leader check: generate VRF proof and check threshold.

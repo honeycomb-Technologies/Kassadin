@@ -9,18 +9,26 @@ const praos_checkpoint = @import("praos_checkpoint.zig");
 const praos_restore = @import("praos_restore.zig");
 const runtime_control = @import("runtime_control.zig");
 const snapshot_restore = @import("snapshot_restore.zig");
+const volatile_checkpoint = @import("volatile_checkpoint.zig");
 const topology_mod = @import("topology.zig");
 const block_mod = @import("../ledger/block.zig");
+const praos = @import("../consensus/praos.zig");
 const protocol_update = @import("../ledger/protocol_update.zig");
 const rewards_mod = @import("../ledger/rewards.zig");
 const ledger_rules = @import("../ledger/rules.zig");
 const ChainDB = @import("../storage/chaindb.zig").ChainDB;
+const AddBlockResult = @import("../storage/chaindb.zig").AddBlockResult;
+const BaseTip = @import("../storage/chaindb.zig").BaseTip;
+const VolatileDB = @import("../storage/volatile.zig").VolatileDB;
 const protocol = @import("../network/protocol.zig");
 const N2CServer = @import("n2c_server.zig").N2CServer;
 
 const Point = types.Point;
 const checkpoint_version: u32 = 1;
+// Bump when resume semantics change so stale on-disk checkpoints are ignored.
+const ledger_checkpoint_anchor_version: u32 = 4;
 const max_resume_points: usize = 8;
+const min_tip_checkpoint_blocks: usize = 512;
 
 /// Node runner configuration.
 pub const RunConfig = struct {
@@ -116,6 +124,113 @@ const PeerEndpoint = struct {
 
 fn checkpointPath(allocator: Allocator, db_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/sync.resume", .{db_path});
+}
+
+fn ledgerCheckpointPath(allocator: Allocator, db_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/ledger.resume", .{db_path});
+}
+
+fn ledgerCheckpointAnchorPath(allocator: Allocator, db_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/ledger.resume.anchor", .{db_path});
+}
+
+fn tipLedgerCheckpointPath(allocator: Allocator, db_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/ledger.tip.resume", .{db_path});
+}
+
+fn tipLedgerCheckpointAnchorPath(allocator: Allocator, db_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/ledger.tip.resume.anchor", .{db_path});
+}
+
+fn tipPraosCheckpointPath(allocator: Allocator, db_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/praos.tip.resume", .{db_path});
+}
+
+fn deleteLedgerCheckpoint(allocator: Allocator, db_path: []const u8) void {
+    const checkpoint_path = ledgerCheckpointPath(allocator, db_path) catch return;
+    defer allocator.free(checkpoint_path);
+    const anchor_path = ledgerCheckpointAnchorPath(allocator, db_path) catch return;
+    defer allocator.free(anchor_path);
+
+    std.fs.cwd().deleteFile(checkpoint_path) catch {};
+    std.fs.cwd().deleteFile(anchor_path) catch {};
+}
+
+fn deleteTipLedgerCheckpoint(allocator: Allocator, db_path: []const u8) void {
+    const checkpoint_path = tipLedgerCheckpointPath(allocator, db_path) catch return;
+    defer allocator.free(checkpoint_path);
+    const anchor_path = tipLedgerCheckpointAnchorPath(allocator, db_path) catch return;
+    defer allocator.free(anchor_path);
+    const praos_path = tipPraosCheckpointPath(allocator, db_path) catch return;
+    defer allocator.free(praos_path);
+
+    std.fs.cwd().deleteFile(checkpoint_path) catch {};
+    std.fs.cwd().deleteFile(anchor_path) catch {};
+    std.fs.cwd().deleteFile(praos_path) catch {};
+}
+
+fn saveLedgerCheckpointAnchor(allocator: Allocator, db_path: []const u8, base: BaseTip) !void {
+    const path = try ledgerCheckpointAnchorPath(allocator, db_path);
+    defer allocator.free(path);
+
+    return saveCheckpointAnchor(path, db_path, base);
+}
+
+fn saveTipLedgerCheckpointAnchor(allocator: Allocator, db_path: []const u8, base: BaseTip) !void {
+    const path = try tipLedgerCheckpointAnchorPath(allocator, db_path);
+    defer allocator.free(path);
+
+    return saveCheckpointAnchor(path, db_path, base);
+}
+
+fn saveCheckpointAnchor(path: []const u8, db_path: []const u8, base: BaseTip) !void {
+    std.fs.cwd().makePath(db_path) catch {};
+
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    var buf: [8]u8 = undefined;
+    var version_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &version_buf, ledger_checkpoint_anchor_version, .big);
+    try file.writeAll(&version_buf);
+    std.mem.writeInt(u64, &buf, base.point.slot, .big);
+    try file.writeAll(&buf);
+    try file.writeAll(&base.point.hash);
+    std.mem.writeInt(u64, &buf, base.block_no, .big);
+    try file.writeAll(&buf);
+}
+
+fn loadLedgerCheckpointAnchor(allocator: Allocator, db_path: []const u8) !?BaseTip {
+    const path = try ledgerCheckpointAnchorPath(allocator, db_path);
+    defer allocator.free(path);
+
+    return loadCheckpointAnchor(path, allocator);
+}
+
+fn loadTipLedgerCheckpointAnchor(allocator: Allocator, db_path: []const u8) !?BaseTip {
+    const path = try tipLedgerCheckpointAnchorPath(allocator, db_path);
+    defer allocator.free(path);
+
+    return loadCheckpointAnchor(path, allocator);
+}
+
+fn loadCheckpointAnchor(path: []const u8, allocator: Allocator) !?BaseTip {
+    const data = std.fs.cwd().readFileAlloc(allocator, path, 52) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(data);
+
+    if (data.len != 52) return null;
+    if (std.mem.readInt(u32, data[0..4], .big) != ledger_checkpoint_anchor_version) return null;
+
+    return .{
+        .point = .{
+            .slot = std.mem.readInt(u64, data[4..12], .big),
+            .hash = data[12..44].*,
+        },
+        .block_no = std.mem.readInt(u64, data[44..52], .big),
+    };
 }
 
 fn loadResumePoints(allocator: Allocator, db_path: []const u8) ![]Point {
@@ -237,13 +352,14 @@ fn peerForAttempt(config: RunConfig, attempt: usize) PeerEndpoint {
 fn savePraosCheckpoint(allocator: Allocator, chain_db: *const ChainDB, db_path: []const u8) void {
     if (!chain_db.isPraosTrackingReady()) return;
     const config = chain_db.shelley_governance_config orelse return;
-    const tip = currentTipPoint(chain_db) orelse return;
+    const checkpoint_point = if (chain_db.getBaseTip()) |base| base.point else currentTipPoint(chain_db) orelse return;
+    const checkpoint_state = if (chain_db.getBasePraosState()) |base_state| base_state else chain_db.getPraosState();
     praos_checkpoint.save(
         allocator,
         db_path,
-        tip,
+        checkpoint_point,
         &config,
-        chain_db.getPraosState(),
+        checkpoint_state,
         chain_db.getOcertCounters(),
     ) catch {};
 }
@@ -257,21 +373,554 @@ fn currentTipPoint(chain_db: *const ChainDB) ?Point {
     };
 }
 
+fn populateLedgerPrimingResult(chain_db: *const ChainDB, result: *RunResult) void {
+    result.base_utxos_primed = chain_db.ledger.utxoCount();
+    result.snapshot_reward_accounts_primed = chain_db.ledger.nonZeroRewardAccountCount();
+    result.snapshot_stake_deposits_primed = chain_db.ledger.stakeDepositCount();
+    const snapshots = chain_db.ledger.getStakeSnapshots();
+    result.snapshot_stake_mark_pools_primed = if (snapshots.mark) |dist| dist.poolCount() else 0;
+    result.snapshot_stake_set_pools_primed = if (snapshots.set) |dist| dist.poolCount() else 0;
+    result.snapshot_stake_go_pools_primed = if (snapshots.go) |dist| dist.poolCount() else 0;
+    result.local_ledger_snapshot_slot = chain_db.ledger.getTipSlot() orelse 0;
+}
+
+fn restorePraosForAnchor(
+    allocator: Allocator,
+    chain_db: *ChainDB,
+    db_path: []const u8,
+    immutable_path: []const u8,
+    raw_cbor_boundary: ?u32,
+    anchor: Point,
+) !void {
+    if (chain_db.shelley_governance_config) |config| {
+        if (try praos_checkpoint.load(allocator, db_path, anchor, &config)) |loaded| {
+            var owned = loaded;
+            defer owned.deinit(allocator);
+            chain_db.attachPraosState(owned.state);
+            chain_db.attachOcertCounters(owned.ocert_counters);
+            std.debug.print("Loaded persisted Praos state + {} OCert counters for resume anchor.\n", .{owned.ocert_counters.len});
+        } else {
+            const praos_result = try praos_restore.reconstructFromImmutable(
+                allocator,
+                immutable_path,
+                anchor.slot,
+                raw_cbor_boundary,
+                &config,
+            );
+            if (praos_result.state) |reconstructed_state| {
+                const state = reconstructed_state;
+                chain_db.attachPraosState(state);
+                praos_checkpoint.save(allocator, db_path, anchor, &config, state, chain_db.getOcertCounters()) catch {};
+                std.debug.print(
+                    "Praos state reconstructed from {} Shelley+ immutable blocks.\n",
+                    .{praos_result.shelley_blocks_scanned},
+                );
+            }
+        }
+    }
+}
+
+fn saveBaseLedgerCheckpoint(allocator: Allocator, chain_db: *const ChainDB, db_path: []const u8) void {
+    if (!chain_db.isLedgerValidationEnabled()) return;
+    if (chain_db.currentChainBlockCount() != 0) return;
+    const base = chain_db.getBaseTip() orelse return;
+
+    const path = ledgerCheckpointPath(allocator, db_path) catch return;
+    defer allocator.free(path);
+
+    chain_db.ledger.saveCheckpoint(path) catch return;
+    saveLedgerCheckpointAnchor(allocator, db_path, base) catch {};
+}
+
+fn saveBaseLedgerCheckpointForShutdown(allocator: Allocator, chain_db: *ChainDB, db_path: []const u8) void {
+    if (!chain_db.isLedgerValidationEnabled()) return;
+    if (chain_db.getBaseTip() == null) return;
+
+    if (chain_db.currentChainBlockCount() > 0) {
+        _ = chain_db.rollbackToPoint(chain_db.getBaseTip().?.point) catch return;
+    }
+
+    saveBaseLedgerCheckpoint(allocator, chain_db, db_path);
+}
+
+fn loadBaseLedgerCheckpoint(
+    allocator: Allocator,
+    chain_db: *ChainDB,
+    snapshot: *const RuntimeSnapshot,
+    db_path: []const u8,
+    result: *RunResult,
+) !bool {
+    const base = chain_db.getBaseTip() orelse return false;
+    const anchor = try loadLedgerCheckpointAnchor(allocator, db_path) orelse return false;
+    if (anchor.block_no > base.block_no or anchor.point.slot > base.point.slot) {
+        deleteLedgerCheckpoint(allocator, db_path);
+        return false;
+    }
+    if (anchor.block_no == base.block_no and !Point.eql(anchor.point, base.point)) {
+        deleteLedgerCheckpoint(allocator, db_path);
+        return false;
+    }
+
+    const path = try ledgerCheckpointPath(allocator, db_path);
+    defer allocator.free(path);
+
+    const loaded = chain_db.ledger.loadCheckpoint(path) catch {
+        deleteLedgerCheckpoint(allocator, db_path);
+        return false;
+    };
+    if (!loaded) {
+        deleteLedgerCheckpoint(allocator, db_path);
+        return false;
+    }
+
+    var immutable_blocks_replayed: u64 = 0;
+    if (!Point.eql(anchor.point, base.point) or anchor.block_no != base.block_no) {
+        const reward_params = if (chain_db.shelley_governance_config) |config|
+            chain_db.getProtocolParams().rewardParams(config.reward_params)
+        else
+            rewards_mod.RewardParams.mainnet_defaults;
+        const replay = ledger_snapshot.replayImmutableFromSlot(
+            allocator,
+            &chain_db.ledger,
+            snapshot.layout.immutable_path,
+            anchor.point.slot,
+            snapshot.last_chunk,
+            chain_db.getProtocolParams(),
+            if (chain_db.shelley_governance_config) |config| config.epoch_length else null,
+            reward_params,
+            if (chain_db.shelley_governance_config) |config| config.era_start_epoch else 0,
+            if (chain_db.shelley_governance_config) |config| config.era_start_slot else 0,
+        ) catch {
+            deleteLedgerCheckpoint(allocator, db_path);
+            return false;
+        };
+        if (replay.blocks_replayed == 0 or chain_db.ledger.getTipSlot() != base.point.slot) {
+            deleteLedgerCheckpoint(allocator, db_path);
+            return false;
+        }
+        immutable_blocks_replayed = replay.blocks_replayed;
+    }
+
+    try restorePraosForAnchor(
+        allocator,
+        chain_db,
+        db_path,
+        snapshot.layout.immutable_path,
+        snapshot.last_chunk,
+        base.point,
+    );
+    try chain_db.enableLedgerValidation();
+    result.validation_enabled = true;
+    result.immutable_blocks_replayed = immutable_blocks_replayed;
+    if (immutable_blocks_replayed > 0) {
+        saveBaseLedgerCheckpoint(allocator, chain_db, db_path);
+    }
+    populateLedgerPrimingResult(chain_db, result);
+    if (immutable_blocks_replayed > 0) {
+        std.debug.print(
+            "Loaded local ledger checkpoint at slot {} and replayed {} immutable blocks to slot {}.\n",
+            .{ anchor.point.slot, immutable_blocks_replayed, base.point.slot },
+        );
+    } else {
+        std.debug.print(
+            "Loaded local ledger checkpoint at slot {} with {} UTxOs.\n",
+            .{ base.point.slot, result.base_utxos_primed },
+        );
+    }
+    return true;
+}
+
+fn loadRuntimeSnapshotBaseline(
+    allocator: Allocator,
+    chain_db: *ChainDB,
+    snapshot: *const RuntimeSnapshot,
+    db_path: []const u8,
+    network: types.Network,
+    result: *RunResult,
+) !void {
+    result.snapshot_anchor_used = true;
+    result.snapshot_tip_slot = snapshot.point.slot;
+    result.snapshot_tip_block = snapshot.block_no;
+
+    const loaded_base_checkpoint = try loadBaseLedgerCheckpoint(
+        allocator,
+        chain_db,
+        snapshot,
+        db_path,
+        result,
+    );
+    if (loaded_base_checkpoint) return;
+
+    try initializeSnapshotState(
+        allocator,
+        chain_db,
+        snapshot,
+        db_path,
+        network,
+        result,
+    );
+    saveBaseLedgerCheckpoint(allocator, chain_db, db_path);
+}
+
+fn persistTipLedgerCheckpoint(allocator: Allocator, chain_db: *const ChainDB, db_path: []const u8) void {
+    const tip = currentTipPoint(chain_db) orelse return;
+    const base = chain_db.getBaseTip() orelse return;
+    if (Point.eql(base.point, tip) and base.block_no == chain_db.getTip().block_no) {
+        deleteTipLedgerCheckpoint(allocator, db_path);
+        return;
+    }
+    const config = chain_db.shelley_governance_config orelse return;
+
+    const ledger_path = tipLedgerCheckpointPath(allocator, db_path) catch return;
+    defer allocator.free(ledger_path);
+    const praos_path = tipPraosCheckpointPath(allocator, db_path) catch return;
+    defer allocator.free(praos_path);
+
+    chain_db.ledger.saveCheckpoint(ledger_path) catch return;
+    saveTipLedgerCheckpointAnchor(allocator, db_path, .{
+        .point = tip,
+        .block_no = chain_db.getTip().block_no,
+    }) catch {
+        deleteTipLedgerCheckpoint(allocator, db_path);
+        return;
+    };
+    praos_checkpoint.saveAtPath(
+        allocator,
+        praos_path,
+        tip,
+        &config,
+        chain_db.getPraosState(),
+        chain_db.getOcertCounters(),
+    ) catch {
+        deleteTipLedgerCheckpoint(allocator, db_path);
+    };
+}
+
+fn saveTipLedgerCheckpoint(allocator: Allocator, chain_db: *const ChainDB, db_path: []const u8) void {
+    if (!chain_db.isLedgerValidationEnabled()) return;
+    if (chain_db.currentChainBlockCount() < min_tip_checkpoint_blocks) {
+        return;
+    }
+    persistTipLedgerCheckpoint(allocator, chain_db, db_path);
+}
+
+fn loadTipLedgerCheckpoint(
+    allocator: Allocator,
+    chain_db: *ChainDB,
+    db_path: []const u8,
+    tip_checkpoint: BaseTip,
+    result: *RunResult,
+) !bool {
+    const ledger_path = try tipLedgerCheckpointPath(allocator, db_path);
+    defer allocator.free(ledger_path);
+
+    const loaded = chain_db.ledger.loadCheckpoint(ledger_path) catch {
+        deleteTipLedgerCheckpoint(allocator, db_path);
+        return false;
+    };
+    if (!loaded) {
+        deleteTipLedgerCheckpoint(allocator, db_path);
+        return false;
+    }
+
+    if (chain_db.shelley_governance_config) |config| {
+        const praos_path = try tipPraosCheckpointPath(allocator, db_path);
+        defer allocator.free(praos_path);
+        var tip_praos = (try praos_checkpoint.loadAtPath(allocator, praos_path, tip_checkpoint.point, &config)) orelse {
+            deleteTipLedgerCheckpoint(allocator, db_path);
+            return false;
+        };
+        defer tip_praos.deinit(allocator);
+        chain_db.ocert_counters.clearRetainingCapacity();
+        chain_db.attachPraosState(tip_praos.state);
+        chain_db.attachOcertCounters(tip_praos.ocert_counters);
+    }
+
+    chain_db.tip_slot = tip_checkpoint.point.slot;
+    chain_db.tip_hash = tip_checkpoint.point.hash;
+    chain_db.tip_block_no = tip_checkpoint.block_no;
+    chain_db.base_tip = tip_checkpoint;
+    try chain_db.enableLedgerValidation();
+    result.validation_enabled = true;
+    result.immutable_blocks_replayed = 0;
+    populateLedgerPrimingResult(chain_db, result);
+    std.debug.print(
+        "Loaded local tip checkpoint at slot {} with {} UTxOs.\n",
+        .{ tip_checkpoint.point.slot, result.base_utxos_primed },
+    );
+    return true;
+}
+
+fn resetRuntimeResumeState(chain_db: *ChainDB) void {
+    for (chain_db.current_chain.items) |*entry| {
+        if (entry.governance_snapshot) |*snapshot| snapshot.deinit(chain_db.allocator);
+    }
+    chain_db.current_chain.clearRetainingCapacity();
+    chain_db.@"volatile".deinit();
+    chain_db.@"volatile" = VolatileDB.init(chain_db.allocator);
+    chain_db.ocert_counters.clearRetainingCapacity();
+    chain_db.tip_slot = 0;
+    chain_db.tip_hash = [_]u8{0} ** 32;
+    chain_db.tip_block_no = 0;
+    chain_db.base_tip = null;
+    chain_db.base_praos_state = null;
+    chain_db.praos_state = praos.PraosState.initWithNonce(chain_db.praos_initial_nonce);
+    chain_db.praos_tracking_ready = false;
+    chain_db.ledger_validation_enabled = false;
+    chain_db.ledger_ready = false;
+    chain_db.governance_state.deinit(chain_db.allocator);
+    chain_db.governance_state = .{};
+}
+
+fn restoreBaseResumeState(
+    allocator: Allocator,
+    chain_db: *ChainDB,
+    snapshot: *const RuntimeSnapshot,
+    db_path: []const u8,
+) !bool {
+    const base = try loadLedgerCheckpointAnchor(allocator, db_path) orelse return false;
+    const ledger_path = try ledgerCheckpointPath(allocator, db_path);
+    defer allocator.free(ledger_path);
+
+    resetRuntimeResumeState(chain_db);
+
+    const loaded = chain_db.ledger.loadCheckpoint(ledger_path) catch return false;
+    if (!loaded) return false;
+
+    chain_db.tip_slot = base.point.slot;
+    chain_db.tip_hash = base.point.hash;
+    chain_db.tip_block_no = base.block_no;
+    chain_db.base_tip = base;
+    if (chain_db.shelley_governance_config) |*config| {
+        protocol_update.setCurrentEpochFromSlot(config, &chain_db.governance_state, base.point.slot);
+    }
+    try restorePraosForAnchor(
+        allocator,
+        chain_db,
+        db_path,
+        snapshot.layout.immutable_path,
+        snapshot.last_chunk,
+        base.point,
+    );
+    try chain_db.enableLedgerValidation();
+    return true;
+}
+
+fn shouldFallbackFromTipCheckpoint(tip_checkpoint: BaseTip, rollback_point: ?Point) bool {
+    const point = rollback_point orelse return true;
+    return !Point.eql(point, tip_checkpoint.point) and point.slot <= tip_checkpoint.point.slot;
+}
+
+fn checkpointAnchor(chain_db: *const ChainDB) volatile_checkpoint.Anchor {
+    if (chain_db.getBaseTip()) |base| {
+        return .{ .point = .{
+            .point = base.point,
+            .block_no = base.block_no,
+        } };
+    }
+    return .{ .origin = {} };
+}
+
+fn rollbackToBaseAnchor(chain_db: *ChainDB) void {
+    const rollback_point = if (chain_db.getBaseTip()) |base| base.point else null;
+    _ = chain_db.rollbackToPoint(rollback_point) catch {};
+}
+
+fn syncVolatileCheckpoint(allocator: Allocator, chain_db: *const ChainDB, db_path: []const u8) void {
+    const count = chain_db.currentChainBlockCount();
+    if (count == 0) {
+        volatile_checkpoint.delete(allocator, db_path) catch {};
+        return;
+    }
+
+    const blocks = allocator.alloc(volatile_checkpoint.SaveBlock, count) catch return;
+    defer allocator.free(blocks);
+
+    for (blocks, 0..) |*out, idx| {
+        const block = chain_db.getCurrentChainBlock(idx) catch return;
+        out.* = .{
+            .hash = block.point.hash,
+            .slot = block.point.slot,
+            .block_no = block.block_no,
+            .prev_hash = block.prev_hash,
+            .data = block.data,
+        };
+    }
+
+    volatile_checkpoint.save(allocator, db_path, checkpointAnchor(chain_db), blocks) catch {};
+}
+
+fn loadVolatileCheckpoint(allocator: Allocator, chain_db: *ChainDB, db_path: []const u8) !u32 {
+    var loaded = volatile_checkpoint.load(allocator, db_path, checkpointAnchor(chain_db)) catch |err| switch (err) {
+        error.InvalidCheckpoint => {
+            volatile_checkpoint.delete(allocator, db_path) catch {};
+            return 0;
+        },
+        else => return err,
+    } orelse return 0;
+    defer loaded.deinit(allocator);
+
+    errdefer {
+        rollbackToBaseAnchor(chain_db);
+        volatile_checkpoint.delete(allocator, db_path) catch {};
+    }
+
+    var replayed: u32 = 0;
+    for (loaded.blocks) |block| {
+        const add_result = try chain_db.addBlock(
+            block.hash,
+            block.data,
+            block.slot,
+            block.block_no,
+            block.prev_hash,
+        );
+        if (add_result != .added_to_current_chain) return error.InvalidCheckpoint;
+        replayed += 1;
+    }
+
+    return replayed;
+}
+
+fn ensureVolatileCheckpointLoaded(
+    allocator: Allocator,
+    chain_db: *ChainDB,
+    db_path: []const u8,
+    loaded_once: *bool,
+) !u32 {
+    if (loaded_once.*) return 0;
+
+    const replayed = try loadVolatileCheckpoint(allocator, chain_db, db_path);
+    loaded_once.* = true;
+    return replayed;
+}
+
 fn performInitialIntersect(
     allocator: Allocator,
     client: *sync_mod.SyncClient,
+    chain_db: *ChainDB,
     runtime_snapshot: ?RuntimeSnapshot,
+    network: types.Network,
+    tip_checkpoint: ?BaseTip,
+    tip_checkpoint_preloaded: bool,
     resume_points: *std.ArrayList(Point),
     db_path: []const u8,
     result: *RunResult,
+    tip_checkpoint_active: *bool,
+    volatile_checkpoint_loaded: *bool,
 ) !void {
-    // If we have a snapshot, always intersect there — resume_points may be ahead
-    // of the ledger state (loaded from the snapshot, not from the previous run).
-    // Using stale resume_points causes InputNotInUtxo because the ledger hasn't
-    // seen the intermediate blocks' UTxO changes.
-    if (runtime_snapshot) |snapshot| {
-        const intersect = try client.findIntersect(&[_]Point{snapshot.point});
+    if (tip_checkpoint) |candidate| {
+        const intersect = try client.findIntersect(&[_]Point{candidate.point});
         switch (intersect) {
+            .intersect_found => {
+                if (tip_checkpoint_preloaded or
+                    try loadTipLedgerCheckpoint(allocator, chain_db, db_path, candidate, result))
+                {
+                    const replayed_current_chain = try ensureVolatileCheckpointLoaded(
+                        allocator,
+                        chain_db,
+                        db_path,
+                        volatile_checkpoint_loaded,
+                    );
+                    if (replayed_current_chain > 0) {
+                        std.debug.print("Replayed {} current-chain blocks from volatile checkpoint.\n", .{replayed_current_chain});
+                    }
+
+                    const resumed_tip_point = currentTipPoint(chain_db) orelse candidate.point;
+                    const resumed_intersect = try client.findIntersect(&[_]Point{resumed_tip_point});
+                    switch (resumed_intersect) {
+                        .intersect_found => {},
+                        .intersect_not_found => {
+                            if (replayed_current_chain > 0) {
+                                rollbackToBaseAnchor(chain_db);
+                                volatile_checkpoint.delete(allocator, db_path) catch {};
+                                const base_tip = chain_db.getTip();
+                                result.tip_slot = base_tip.slot;
+                                result.tip_block_no = base_tip.block_no;
+                            } else {
+                                deleteTipLedgerCheckpoint(allocator, db_path);
+                                return error.IntersectNotFound;
+                            }
+                        },
+                        else => return error.UnexpectedMessage,
+                    }
+
+                    tip_checkpoint_active.* = true;
+                    result.resumed_from_checkpoint = true;
+                    const tip = chain_db.getTip();
+                    result.tip_slot = tip.slot;
+                    result.tip_block_no = tip.block_no;
+                    return;
+                }
+            },
+            .intersect_not_found => {
+                deleteTipLedgerCheckpoint(allocator, db_path);
+                if (tip_checkpoint_preloaded) {
+                    resetRuntimeResumeState(chain_db);
+                    if (runtime_snapshot) |snapshot| {
+                        try loadRuntimeSnapshotBaseline(
+                            allocator,
+                            chain_db,
+                            &snapshot,
+                            db_path,
+                            network,
+                            result,
+                        );
+                    }
+                }
+            },
+            else => return error.UnexpectedMessage,
+        }
+    }
+
+    const replayed_current_chain = try ensureVolatileCheckpointLoaded(
+        allocator,
+        chain_db,
+        db_path,
+        volatile_checkpoint_loaded,
+    );
+    if (replayed_current_chain > 0) {
+        std.debug.print("Replayed {} current-chain blocks from volatile checkpoint.\n", .{replayed_current_chain});
+    }
+    const restored_tip = chain_db.getTip();
+    result.tip_slot = restored_tip.slot;
+    result.tip_block_no = restored_tip.block_no;
+
+    if (chain_db.currentChainBlockCount() > 0) {
+        const tip_point = currentTipPoint(chain_db) orelse return error.InvalidCheckpoint;
+        const intersect = try client.findIntersect(&[_]Point{tip_point});
+        switch (intersect) {
+            .intersect_found => {
+                result.resumed_from_checkpoint = true;
+                return;
+            },
+            .intersect_not_found => {
+                rollbackToBaseAnchor(chain_db);
+                volatile_checkpoint.delete(allocator, db_path) catch {};
+                const tip = chain_db.getTip();
+                result.tip_slot = tip.slot;
+                result.tip_block_no = tip.block_no;
+            },
+            else => return error.UnexpectedMessage,
+        }
+    }
+
+    if (runtime_snapshot) |snapshot| {
+        if (currentTipPoint(chain_db)) |tip_point| {
+            if (!Point.eql(tip_point, snapshot.point)) {
+                const intersect = try client.findIntersect(&[_]Point{tip_point});
+                switch (intersect) {
+                    .intersect_found => {
+                        result.resumed_from_checkpoint = true;
+                        return;
+                    },
+                    .intersect_not_found => {},
+                    else => return error.UnexpectedMessage,
+                }
+            }
+        }
+
+        const snapshot_intersect = try client.findIntersect(&[_]Point{snapshot.point});
+        switch (snapshot_intersect) {
             .intersect_found => {
                 result.resumed_from_snapshot = true;
             },
@@ -340,41 +989,23 @@ fn discoverRuntimeSnapshot(allocator: Allocator, db_path: []const u8) !?RuntimeS
         return null;
     };
 
-    // Try reading the tip. If it fails (e.g., last chunk uses our length-prefix
-    // framing, not Mithril's CBOR framing), scan backwards to find a readable chunk.
-    const max_chunk: u32 = if (reader.total_chunks > 0) reader.total_chunks - 1 else 0;
-    // Try reading the tip. If it fails (e.g., last chunk uses our length-prefix
-    // framing, not Mithril's CBOR framing), scan backwards for a readable chunk.
-    const tip_raw = blk: {
-        // Try the standard path first (fastest)
-        if (reader.readTip(allocator) catch null) |r| break :blk r;
-
-        // Scan backwards for a readable Mithril chunk
-        if (max_chunk > 0) {
-            var c: u32 = max_chunk - 1;
-            while (true) {
-                const reduced = chunk_reader_mod.ChunkReader{
-                    .immutable_path = reader.immutable_path,
-                    .total_chunks = c + 1,
-                };
-                if (reduced.readTip(allocator) catch null) |r| break :blk r;
-                if (c == 0) break;
-                c -= 1;
-            }
-        }
+    const tip_result = reader.readTipWithChunk(allocator) catch {
+        layout.deinit(allocator);
+        return null;
+    } orelse {
         layout.deinit(allocator);
         return null;
     };
-    defer allocator.free(tip_raw.raw);
+    defer allocator.free(tip_result.raw);
 
     return .{
         .layout = layout,
         .point = .{
-            .slot = tip_raw.block.header.slot,
-            .hash = tip_raw.block.hash(),
+            .slot = tip_result.block.header.slot,
+            .hash = tip_result.block.hash(),
         },
-        .block_no = tip_raw.block.header.block_no,
-        .last_chunk = max_chunk,
+        .block_no = tip_result.block.header.block_no,
+        .last_chunk = tip_result.chunk_no,
     };
 }
 
@@ -386,11 +1017,28 @@ fn initializeSnapshotState(
     network: types.Network,
     result: *RunResult,
 ) !void {
+    const RecoveredTip = struct {
+        slot: types.SlotNo,
+        hash: types.HeaderHash,
+        block_no: types.BlockNo,
+    };
+
     result.snapshot_anchor_used = true;
     result.snapshot_tip_slot = snapshot.point.slot;
     result.snapshot_tip_block = snapshot.block_no;
 
     const current_tip = chain_db.getTip();
+    const recovered_tip = if ((current_tip.block_no != 0 or current_tip.slot != 0) and
+        !(current_tip.slot == snapshot.point.slot and
+            current_tip.block_no == snapshot.block_no and
+            std.mem.eql(u8, &current_tip.hash, &snapshot.point.hash)))
+        RecoveredTip{
+            .slot = current_tip.slot,
+            .hash = current_tip.hash,
+            .block_no = current_tip.block_no,
+        }
+    else
+        null;
     if (current_tip.block_no == 0 and current_tip.slot == 0) {
         try chain_db.attachSnapshotTip(snapshot.point, snapshot.block_no);
     } else if (current_tip.slot == snapshot.point.slot and
@@ -399,11 +1047,9 @@ fn initializeSnapshotState(
     {
         // Tip already matches snapshot — no action needed
     } else {
-        // Tip differs (possibly from immutable recovery). Force-attach the
-        // snapshot tip so incoming blocks can extend the chain correctly.
-        // This can happen if truncateAfterBoundary didn't fully align the
-        // immutable tip with the snapshot tip due to CBOR vs length-prefix
-        // framing differences in the last Mithril chunk.
+        // Start from the Mithril anchor while we rebuild the ledger from the
+        // local snapshot plus immutable tail. If we successfully replay a
+        // later local immutable tip below, we'll restore that tip afterwards.
         std.debug.print("Resetting chain tip from slot {} to snapshot tip slot {}.\n", .{ current_tip.slot, snapshot.point.slot });
         chain_db.tip_slot = snapshot.point.slot;
         chain_db.tip_hash = snapshot.point.hash;
@@ -437,31 +1083,65 @@ fn initializeSnapshotState(
                 &chain_db.ledger,
                 snapshot.layout.immutable_path,
                 load_result.slot,
+                snapshot.last_chunk,
                 chain_db.getProtocolParams(),
                 if (chain_db.shelley_governance_config) |config| config.epoch_length else null,
-                if (chain_db.shelley_governance_config) |config| config.reward_params else rewards_mod.RewardParams.mainnet_defaults,
+                if (chain_db.shelley_governance_config) |config|
+                    chain_db.getProtocolParams().rewardParams(config.reward_params)
+                else
+                    rewards_mod.RewardParams.mainnet_defaults,
+                if (chain_db.shelley_governance_config) |config| config.era_start_epoch else 0,
                 if (chain_db.shelley_governance_config) |config| config.era_start_slot else 0,
             );
             result.immutable_blocks_replayed = replay.blocks_replayed;
 
+            const praos_anchor = if (recovered_tip) |tip|
+                if (tip.slot > snapshot.point.slot or
+                    (tip.slot == snapshot.point.slot and tip.block_no >= snapshot.block_no))
+                    Point{ .slot = tip.slot, .hash = tip.hash }
+                else
+                    snapshot.point
+            else
+                snapshot.point;
+            const praos_anchor_block_no = if (recovered_tip) |tip|
+                if (tip.slot > snapshot.point.slot or
+                    (tip.slot == snapshot.point.slot and tip.block_no >= snapshot.block_no))
+                    tip.block_no
+                else
+                    snapshot.block_no
+            else
+                snapshot.block_no;
+
+            if (!Point.eql(praos_anchor, snapshot.point)) {
+                chain_db.tip_slot = praos_anchor.slot;
+                chain_db.tip_hash = praos_anchor.hash;
+                chain_db.tip_block_no = praos_anchor_block_no;
+                chain_db.base_tip = .{ .point = praos_anchor, .block_no = praos_anchor_block_no };
+                std.debug.print(
+                    "Recovered local immutable tip at slot {} block {} after snapshot replay.\n",
+                    .{ praos_anchor.slot, praos_anchor_block_no },
+                );
+            }
+
             if (chain_db.shelley_governance_config) |config| {
-                if (try praos_checkpoint.load(allocator, db_path, snapshot.point, &config)) |loaded| {
+                if (try praos_checkpoint.load(allocator, db_path, praos_anchor, &config)) |loaded| {
                     var owned = loaded;
                     defer owned.deinit(allocator);
                     chain_db.attachPraosState(owned.state);
                     chain_db.attachOcertCounters(owned.ocert_counters);
-                    std.debug.print("Loaded persisted Praos state + {} OCert counters for snapshot tip.\n", .{owned.ocert_counters.len});
+                    std.debug.print("Loaded persisted Praos state + {} OCert counters for resume anchor.\n", .{owned.ocert_counters.len});
                 } else {
                     const praos_result = try praos_restore.reconstructFromImmutable(
                         allocator,
                         snapshot.layout.immutable_path,
-                        snapshot.point.slot,
+                        praos_anchor.slot,
+                        snapshot.last_chunk,
                         &config,
                     );
                     if (praos_result.state) |reconstructed_state| {
                         const state = reconstructed_state;
                         chain_db.attachPraosState(state);
-                        praos_checkpoint.save(allocator, db_path, snapshot.point, &config, state, chain_db.getOcertCounters()) catch {};
+                        praos_checkpoint.save(allocator, db_path, praos_anchor, &config, state, chain_db.getOcertCounters()) catch {};
                         std.debug.print(
                             "Praos state reconstructed from {} Shelley+ immutable blocks.\n",
                             .{praos_result.shelley_blocks_scanned},
@@ -567,7 +1247,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     // Load protocol params appropriate for the starting point.
     if (runtime_snapshot != null) {
         if (config.shelley_genesis_path) |path| {
-            if (genesis_mod.loadLedgerProtocolParams(allocator, path) catch null) |protocol_params| {
+            if (genesis_mod.loadLedgerProtocolParamsWithOverride(allocator, path) catch null) |protocol_params| {
                 loaded_protocol_params = protocol_params;
                 result.genesis_loaded = true;
             }
@@ -582,7 +1262,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
             result.genesis_loaded = true;
         }
         if (config.shelley_genesis_path) |shelley_path| {
-            if (genesis_mod.loadLedgerProtocolParams(allocator, shelley_path) catch null) |protocol_params| {
+            if (genesis_mod.loadLedgerProtocolParamsWithOverride(allocator, shelley_path) catch null) |protocol_params| {
                 deferred_shelley_protocol_params = protocol_params;
                 pending_shelley_protocol_switch = true;
                 result.genesis_loaded = true;
@@ -593,7 +1273,7 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
             }
         }
     } else if (config.shelley_genesis_path) |path| {
-        if (genesis_mod.loadLedgerProtocolParams(allocator, path) catch null) |protocol_params| {
+        if (genesis_mod.loadLedgerProtocolParamsWithOverride(allocator, path) catch null) |protocol_params| {
             loaded_protocol_params = protocol_params;
             result.genesis_loaded = true;
         }
@@ -616,23 +1296,25 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
         if (byron) |byron_genesis| {
             var bg = byron_genesis;
             defer bg.deinit(allocator);
-            const hard_fork_epoch = config.hard_fork_epoch orelse 208;
+            const hard_fork_epoch = config.hard_fork_epoch orelse switch (config.network_magic) {
+                1 => @as(u64, 4), // preprod
+                2 => @as(u64, 0), // preview (Shelley from genesis)
+                else => @as(u64, 208), // mainnet
+            };
+            loaded_governance_config.?.era_start_epoch = hard_fork_epoch;
             loaded_governance_config.?.era_start_slot = genesis_mod.computeEraStartSlot(&bg, hard_fork_epoch);
         }
     }
 
     // Open chain database
-    var chain_db = try ChainDB.open(allocator, config.db_path, 2160);
+    var chain_db = try ChainDB.openWithMithrilBoundary(
+        allocator,
+        config.db_path,
+        2160,
+        if (runtime_snapshot) |snapshot| snapshot.last_chunk else null,
+    );
     defer chain_db.close();
     chain_db.ledger.setRewardAccountNetwork(networkFromMagic(config.network_magic));
-
-    // Protect Mithril snapshot chunks and clean up any chunks we wrote
-    // in previous sessions (they use length-prefix framing that differs
-    // from the Mithril/Haskell raw CBOR format).
-    if (runtime_snapshot) |snapshot| {
-        chain_db.immutable.setMithrilBoundary(snapshot.last_chunk);
-        chain_db.immutable.truncateAfterBoundary(snapshot.last_chunk) catch {};
-    }
 
     if (loaded_protocol_params) |protocol_params| {
         chain_db.setProtocolParams(protocol_params);
@@ -649,17 +1331,45 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     }
 
     if (runtime_snapshot) |*snapshot| {
-        initializeSnapshotState(allocator, &chain_db, snapshot, config.db_path, networkFromMagic(config.network_magic), &result) catch |err| switch (err) {
-            error.Interrupted => {
-                const interrupted_tip = chain_db.getTip();
-                result.tip_slot = interrupted_tip.slot;
-                result.tip_block_no = interrupted_tip.block_no;
-                result.validation_enabled = chain_db.isLedgerValidationEnabled();
-                result.stopped_by_signal = true;
-                return result;
-            },
-            else => return err,
-        };
+        const network = networkFromMagic(config.network_magic);
+        var startup_tip_checkpoint = try loadTipLedgerCheckpointAnchor(allocator, config.db_path);
+        var tip_checkpoint_preloaded = false;
+
+        if (startup_tip_checkpoint) |candidate| {
+            tip_checkpoint_preloaded = try loadTipLedgerCheckpoint(
+                allocator,
+                &chain_db,
+                config.db_path,
+                candidate,
+                &result,
+            );
+            if (!tip_checkpoint_preloaded) startup_tip_checkpoint = null;
+        }
+
+        if (!tip_checkpoint_preloaded) {
+            loadRuntimeSnapshotBaseline(
+                allocator,
+                &chain_db,
+                snapshot,
+                config.db_path,
+                network,
+                &result,
+            ) catch |err| switch (err) {
+                error.Interrupted => {
+                    const interrupted_tip = chain_db.getTip();
+                    result.tip_slot = interrupted_tip.slot;
+                    result.tip_block_no = interrupted_tip.block_no;
+                    result.validation_enabled = chain_db.isLedgerValidationEnabled();
+                    result.stopped_by_signal = true;
+                    return result;
+                },
+                else => return err,
+            };
+        } else {
+            result.snapshot_anchor_used = true;
+            result.snapshot_tip_slot = snapshot.point.slot;
+            result.snapshot_tip_block = snapshot.block_no;
+        }
     } else if (config.byron_genesis_path) |path| {
         const current_tip = chain_db.getTip();
         if (current_tip.block_no == 0 and current_tip.slot == 0) {
@@ -683,6 +1393,22 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     try resume_points.appendSlice(allocator, loaded_points);
 
     const max = if (config.max_headers == 0) std.math.maxInt(u64) else config.max_headers;
+    const initial_tip_checkpoint = if (runtime_snapshot != null)
+        try loadTipLedgerCheckpointAnchor(allocator, config.db_path)
+    else
+        null;
+    const initial_tip_checkpoint_preloaded = if (initial_tip_checkpoint) |candidate|
+        if (chain_db.isLedgerValidationEnabled())
+            if (chain_db.getBaseTip()) |base|
+                Point.eql(base.point, candidate.point) and base.block_no == candidate.block_no and
+                    currentTipPoint(&chain_db) != null and Point.eql(currentTipPoint(&chain_db).?, candidate.point) and
+                    chain_db.getTip().block_no == candidate.block_no
+            else
+                false
+        else
+            false
+    else
+        false;
 
     // Shared tip state for the N2C server thread.
     var n2c_tip = N2CServer.TipState{
@@ -714,6 +1440,9 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
     }
 
     var initial_intersect_done = false;
+    var tip_checkpoint_active = false;
+    var tip_checkpoint_base: ?BaseTip = null;
+    var volatile_checkpoint_loaded = false;
     var reconnect_count: u32 = 0;
     var batch_start_time = std.time.timestamp();
     var batch_block_count: u64 = 0;
@@ -759,10 +1488,16 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
             performInitialIntersect(
                 allocator,
                 &client,
+                &chain_db,
                 runtime_snapshot,
+                networkFromMagic(config.network_magic),
+                initial_tip_checkpoint,
+                initial_tip_checkpoint_preloaded,
                 &resume_points,
                 config.db_path,
                 &result,
+                &tip_checkpoint_active,
+                &volatile_checkpoint_loaded,
             ) catch |err| switch (err) {
                 error.IntersectNotFound => {
                     result.errors += 1;
@@ -777,6 +1512,9 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                 },
             };
             initial_intersect_done = true;
+            if (tip_checkpoint_active) {
+                tip_checkpoint_base = chain_db.getBaseTip();
+            }
             std.debug.print("Intersect found, syncing forward from slot {}...\n", .{result.tip_slot});
         } else {
             performReconnectIntersect(&client, &chain_db) catch |err| {
@@ -873,8 +1611,12 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                             try pushResumePoint(&resume_points, allocator, point);
                             saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
                             const promoted = try chain_db.promoteFinalized();
-                            if (promoted > 0) {
+                            if (promoted > 0 and !tip_checkpoint_active) {
                                 savePraosCheckpoint(allocator, &chain_db, config.db_path);
+                                saveBaseLedgerCheckpoint(allocator, &chain_db, config.db_path);
+                            }
+                            if (!tip_checkpoint_active) {
+                                syncVolatileCheckpoint(allocator, &chain_db, config.db_path);
                             }
                         },
                         .invalid => {
@@ -964,12 +1706,37 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
                     } else {
                         std.debug.print("Rollback to genesis (total rollbacks: {})\n", .{result.rollbacks});
                     }
+                    if (tip_checkpoint_active and tip_checkpoint_base != null and shouldFallbackFromTipCheckpoint(tip_checkpoint_base.?, rb.point)) {
+                        std.debug.print("Rollback below cached tip; restoring base + volatile resume state.\n", .{});
+                        const snapshot = runtime_snapshot orelse unreachable;
+                        if (!(try restoreBaseResumeState(allocator, &chain_db, &snapshot, config.db_path))) {
+                            result.errors += 1;
+                            break :reconnect;
+                        }
+                        _ = try loadVolatileCheckpoint(allocator, &chain_db, config.db_path);
+                        _ = chain_db.rollbackToPoint(rb.point) catch blk: {
+                            result.errors += 1;
+                            break :blk 0;
+                        };
+                        tip_checkpoint_active = false;
+                        tip_checkpoint_base = null;
+                        deleteTipLedgerCheckpoint(allocator, config.db_path);
+                        truncateResumePoints(&resume_points, rb.point);
+                        saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
+                        const recovered_tip = chain_db.getTip();
+                        result.tip_slot = recovered_tip.slot;
+                        result.tip_block_no = recovered_tip.block_no;
+                        continue;
+                    }
                     _ = chain_db.rollbackToPoint(rb.point) catch blk: {
                         result.errors += 1;
                         break :blk 0;
                     };
                     truncateResumePoints(&resume_points, rb.point);
                     saveResumePoints(allocator, config.db_path, resume_points.items) catch {};
+                    if (!tip_checkpoint_active) {
+                        syncVolatileCheckpoint(allocator, &chain_db, config.db_path);
+                    }
 
                     const tip = chain_db.getTip();
                     result.tip_slot = tip.slot;
@@ -989,6 +1756,9 @@ pub fn run(allocator: Allocator, config: RunConfig) !RunResult {
         break;
     }
 
+    saveTipLedgerCheckpoint(allocator, &chain_db, config.db_path);
+    syncVolatileCheckpoint(allocator, &chain_db, config.db_path);
+    saveBaseLedgerCheckpointForShutdown(allocator, &chain_db, config.db_path);
     savePraosCheckpoint(allocator, &chain_db, config.db_path);
     result.vrf_threshold_warnings = chain_db.vrf_threshold_warnings;
     return result;
@@ -1101,6 +1871,476 @@ test "runner: resume checkpoint round-trip" {
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
     try std.testing.expectEqual(points[0].slot, loaded[0].slot);
     try std.testing.expectEqualSlices(u8, &points[1].hash, &loaded[1].hash);
+}
+
+test "runner: volatile checkpoint replays current chain from origin" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-runner-volatile-origin";
+
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+
+    {
+        var db = try ChainDB.open(allocator, path, 2160);
+        defer db.close();
+
+        const hash0 = [_]u8{0x10} ** 32;
+        const hash1 = [_]u8{0x11} ** 32;
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(hash0, "block0", 10, 0, null),
+        );
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(hash1, "block1", 20, 1, hash0),
+        );
+
+        syncVolatileCheckpoint(allocator, &db, path);
+    }
+
+    var reopened = try ChainDB.open(allocator, path, 2160);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u32, 2), try loadVolatileCheckpoint(allocator, &reopened, path));
+    try std.testing.expectEqual(@as(usize, 2), reopened.currentChainBlockCount());
+    try std.testing.expectEqual(@as(u64, 20), reopened.getTip().slot);
+    try std.testing.expectEqual([_]u8{0x11} ** 32, reopened.getTip().hash);
+}
+
+test "runner: volatile checkpoint replays anchored current chain" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-runner-volatile-anchor";
+
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+
+    const anchor_hash = [_]u8{0xaa} ** 32;
+    const child_hash = [_]u8{0xbb} ** 32;
+    const grandchild_hash = [_]u8{0xcc} ** 32;
+
+    {
+        var db = try ChainDB.open(allocator, path, 2160);
+        defer db.close();
+
+        try db.attachSnapshotTip(.{ .slot = 100, .hash = anchor_hash }, 50);
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(child_hash, "child", 110, 51, anchor_hash),
+        );
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(grandchild_hash, "grandchild", 120, 52, child_hash),
+        );
+
+        syncVolatileCheckpoint(allocator, &db, path);
+    }
+
+    var reopened = try ChainDB.open(allocator, path, 2160);
+    defer reopened.close();
+    try reopened.attachSnapshotTip(.{ .slot = 100, .hash = anchor_hash }, 50);
+
+    try std.testing.expectEqual(@as(u32, 2), try loadVolatileCheckpoint(allocator, &reopened, path));
+    try std.testing.expectEqual(@as(usize, 2), reopened.currentChainBlockCount());
+    try std.testing.expectEqual(@as(u64, 52), reopened.getTip().block_no);
+    try std.testing.expectEqual(grandchild_hash, reopened.getTip().hash);
+}
+
+test "runner: volatile checkpoint only replays once per startup attempt" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-runner-volatile-once";
+
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+
+    {
+        var db = try ChainDB.open(allocator, path, 2160);
+        defer db.close();
+
+        const hash0 = [_]u8{0x31} ** 32;
+        const hash1 = [_]u8{0x32} ** 32;
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(hash0, "block0", 10, 0, null),
+        );
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(hash1, "block1", 20, 1, hash0),
+        );
+
+        syncVolatileCheckpoint(allocator, &db, path);
+    }
+
+    var reopened = try ChainDB.open(allocator, path, 2160);
+    defer reopened.close();
+
+    var loaded_once = false;
+    try std.testing.expectEqual(@as(u32, 2), try ensureVolatileCheckpointLoaded(allocator, &reopened, path, &loaded_once));
+    try std.testing.expectEqual(@as(usize, 2), reopened.currentChainBlockCount());
+    try std.testing.expect(loaded_once);
+
+    try std.testing.expectEqual(@as(u32, 0), try ensureVolatileCheckpointLoaded(allocator, &reopened, path, &loaded_once));
+    try std.testing.expectEqual(@as(usize, 2), reopened.currentChainBlockCount());
+    try std.testing.expectEqual(@as(u64, 20), reopened.getTip().slot);
+}
+
+test "runner: shutdown refresh saves base checkpoint from non-empty current chain" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-runner-base-checkpoint-shutdown";
+
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+
+    const base_hash = [_]u8{0xa7} ** 32;
+    const child_hash = [_]u8{0xb8} ** 32;
+    const tip_hash = [_]u8{0xc9} ** 32;
+    const reward_account = types.RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0xda} ** 28 },
+    };
+
+    {
+        var db = try ChainDB.open(allocator, path, 2160);
+        defer db.close();
+
+        db.ledger.setRewardAccountNetwork(.testnet);
+        try db.attachSnapshotTip(.{ .slot = 100, .hash = base_hash }, 50);
+        try db.ledger.importRewardBalance(reward_account, 7_000);
+        db.ledger.setTipSlot(100);
+
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(child_hash, "child", 110, 51, base_hash),
+        );
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(tip_hash, "tip", 120, 52, child_hash),
+        );
+
+        db.ledger_validation_enabled = true;
+        db.ledger_ready = true;
+        saveBaseLedgerCheckpointForShutdown(allocator, &db, path);
+
+        try std.testing.expectEqual(@as(usize, 0), db.currentChainBlockCount());
+        try std.testing.expectEqual(@as(u64, 100), db.getTip().slot);
+    }
+
+    const anchor = (try loadLedgerCheckpointAnchor(allocator, path)).?;
+    try std.testing.expectEqual(@as(u64, 100), anchor.point.slot);
+    try std.testing.expectEqual(base_hash, anchor.point.hash);
+    try std.testing.expectEqual(@as(u64, 50), anchor.block_no);
+
+    var reopened = try ChainDB.open(allocator, path, 2160);
+    defer reopened.close();
+    reopened.ledger.setRewardAccountNetwork(.testnet);
+
+    const checkpoint_path = try ledgerCheckpointPath(allocator, path);
+    defer allocator.free(checkpoint_path);
+    try std.testing.expect(try reopened.ledger.loadCheckpoint(checkpoint_path));
+    try std.testing.expectEqual(@as(?types.Coin, 7_000), reopened.ledger.lookupRewardBalance(reward_account));
+}
+
+test "runner: tip checkpoint round-trip restores exact tip state" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-runner-tip-checkpoint";
+
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+
+    const anchor_hash = [_]u8{0xa1} ** 32;
+    const tip_hash = [_]u8{0xb2} ** 32;
+    const reward_account = types.RewardAccount{
+        .network = .testnet,
+        .credential = .{
+            .cred_type = .key_hash,
+            .hash = [_]u8{0xc3} ** 28,
+        },
+    };
+
+    {
+        var db = try ChainDB.open(allocator, path, 2160);
+        defer db.close();
+
+        const governance_config = protocol_update.GovernanceConfig{
+            .epoch_length = 100,
+            .stability_window = 10,
+            .update_quorum = 1,
+            .initial_nonce = .{ .hash = [_]u8{0x11} ** 32 },
+            .extra_entropy = .neutral,
+            .decentralization_param = .{ .numerator = 0, .denominator = 1 },
+            .reward_params = rewards_mod.RewardParams.mainnet_defaults,
+            .initial_genesis_delegations = try allocator.alloc(protocol_update.GenesisDelegation, 0),
+        };
+        try db.configureShelleyGovernanceTracking(governance_config);
+
+        try db.attachSnapshotTip(.{ .slot = 100, .hash = anchor_hash }, 50);
+        _ = try db.primeBaseUtxos(&[_]@import("../storage/ledger.zig").UtxoEntry{
+            .{
+                .tx_in = .{ .tx_id = [_]u8{0xd4} ** 32, .tx_ix = 0 },
+                .value = 5_000_000,
+                .raw_cbor = &.{},
+            },
+        });
+        try db.enableLedgerValidation();
+        try db.ledger.importRewardBalance(reward_account, 7_000);
+        db.ledger.setTipSlot(120);
+        db.tip_slot = 120;
+        db.tip_hash = tip_hash;
+        db.tip_block_no = 52;
+        db.attachPraosState(.{
+            .flavor = .praos,
+            .evolving_nonce = .{ .hash = [_]u8{0x21} ** 32 },
+            .candidate_nonce = .{ .hash = [_]u8{0x22} ** 32 },
+            .epoch_nonce = .{ .hash = [_]u8{0x23} ** 32 },
+            .previous_epoch_nonce = .{ .hash = [_]u8{0x24} ** 32 },
+            .last_epoch_block_nonce = .{ .hash = [_]u8{0x25} ** 32 },
+            .lab_nonce = .{ .hash = [_]u8{0x26} ** 32 },
+        });
+        try db.ocert_counters.put([_]u8{0xe5} ** 28, 9);
+
+        persistTipLedgerCheckpoint(allocator, &db, path);
+    }
+
+    var reopened = try ChainDB.open(allocator, path, 2160);
+    defer reopened.close();
+    reopened.ledger.setRewardAccountNetwork(.testnet);
+    const governance_config = protocol_update.GovernanceConfig{
+        .epoch_length = 100,
+        .stability_window = 10,
+        .update_quorum = 1,
+        .initial_nonce = .{ .hash = [_]u8{0x11} ** 32 },
+        .extra_entropy = .neutral,
+        .decentralization_param = .{ .numerator = 0, .denominator = 1 },
+        .reward_params = rewards_mod.RewardParams.mainnet_defaults,
+        .initial_genesis_delegations = try allocator.alloc(protocol_update.GenesisDelegation, 0),
+    };
+    try reopened.configureShelleyGovernanceTracking(governance_config);
+
+    const tip_checkpoint = (try loadTipLedgerCheckpointAnchor(allocator, path)).?;
+    var result: RunResult = std.mem.zeroInit(RunResult, .{});
+    try std.testing.expect(try loadTipLedgerCheckpoint(allocator, &reopened, path, tip_checkpoint, &result));
+    try std.testing.expectEqual(@as(u64, 120), reopened.getTip().slot);
+    try std.testing.expectEqual(@as(u64, 52), reopened.getTip().block_no);
+    try std.testing.expectEqual(tip_hash, reopened.getTip().hash);
+    try std.testing.expectEqual(@as(usize, 1), reopened.ledger.utxoCount());
+    try std.testing.expectEqual(@as(?types.Coin, 7_000), reopened.ledger.lookupRewardBalance(reward_account));
+    try std.testing.expectEqual(@as(u64, 1), result.snapshot_reward_accounts_primed);
+    try std.testing.expectEqual(@as(?u64, 9), reopened.ocert_counters.get([_]u8{0xe5} ** 28));
+}
+
+test "runner: old checkpoint anchors are ignored" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-runner-old-anchor";
+
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+    try std.fs.cwd().makePath(path);
+
+    const anchor_path = try tipLedgerCheckpointAnchorPath(allocator, path);
+    defer allocator.free(anchor_path);
+
+    var file = try std.fs.cwd().createFile(anchor_path, .{ .truncate = true });
+    defer file.close();
+
+    var version_buf: [4]u8 = undefined;
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u32, &version_buf, ledger_checkpoint_anchor_version - 1, .big);
+    try file.writeAll(&version_buf);
+    std.mem.writeInt(u64, &buf, 123, .big);
+    try file.writeAll(&buf);
+    try file.writeAll(&([_]u8{0xee} ** 32));
+    std.mem.writeInt(u64, &buf, 456, .big);
+    try file.writeAll(&buf);
+
+    try std.testing.expectEqual(@as(?BaseTip, null), try loadTipLedgerCheckpointAnchor(allocator, path));
+}
+
+fn buildSignedShelleyRunnerTestBlock(
+    allocator: Allocator,
+    tx_bodies_raw: []const u8,
+    block_no: u64,
+    slot: u64,
+    prev_hash: ?[32]u8,
+    issuer_seed: [32]u8,
+    kes_seed: [32]u8,
+    vrf_seed: [32]u8,
+    opcert_sequence_no: u64,
+    body_hash: [32]u8,
+) ![]u8 {
+    const Encoder = @import("../cbor/encoder.zig").Encoder;
+    const Ed25519 = @import("../crypto/ed25519.zig").Ed25519;
+    const LiveKES = @import("../crypto/kes_sum.zig").KES;
+    const VRF = @import("../crypto/vrf.zig").VRF;
+    const opcert_mod = @import("../crypto/opcert.zig");
+    const leader = @import("../consensus/leader.zig");
+
+    const cold_kp = try Ed25519.keyFromSeed(issuer_seed);
+    const kes_kp = try LiveKES.generate(kes_seed);
+    const vrf_kp = try VRF.keyFromSeed(vrf_seed);
+    const current_kes_period: u32 = @intCast(slot / types.mainnet.slots_per_kes_period);
+    const vrf_result = try VRF.prove(&leader.makeInputVRF(slot, praos.initialNonce()), vrf_kp.sk);
+    const opcert = try opcert_mod.OperationalCert.create(
+        kes_kp.vk,
+        opcert_sequence_no,
+        current_kes_period,
+        cold_kp.sk,
+    );
+
+    var header_body_enc = Encoder.init(allocator);
+    defer header_body_enc.deinit();
+    try header_body_enc.encodeArrayLen(10);
+    try header_body_enc.encodeUint(block_no);
+    try header_body_enc.encodeUint(slot);
+    if (prev_hash) |hash| {
+        try header_body_enc.encodeBytes(&hash);
+    } else {
+        try header_body_enc.encodeNull();
+    }
+    try header_body_enc.encodeBytes(&cold_kp.vk);
+    try header_body_enc.encodeBytes(&vrf_kp.vk);
+    try header_body_enc.encodeArrayLen(2);
+    try header_body_enc.encodeBytes(&vrf_result.output);
+    try header_body_enc.encodeBytes(&vrf_result.proof);
+    try header_body_enc.encodeUint(tx_bodies_raw.len);
+    try header_body_enc.encodeBytes(&body_hash);
+    try header_body_enc.encodeArrayLen(4);
+    try header_body_enc.encodeBytes(&opcert.hot_vkey);
+    try header_body_enc.encodeUint(opcert.sequence_number);
+    try header_body_enc.encodeUint(opcert.kes_period);
+    try header_body_enc.encodeBytes(&opcert.cold_key_signature);
+    try header_body_enc.encodeArrayLen(2);
+    try header_body_enc.encodeUint(1);
+    try header_body_enc.encodeUint(0);
+    const header_body_raw = try header_body_enc.toOwnedSlice();
+    defer allocator.free(header_body_raw);
+
+    const kes_sig = try LiveKES.sign(current_kes_period, header_body_raw, &kes_kp.sk);
+
+    var header_enc = Encoder.init(allocator);
+    defer header_enc.deinit();
+    try header_enc.encodeArrayLen(2);
+    try header_enc.writeRaw(header_body_raw);
+    try header_enc.encodeBytes(&kes_sig);
+    const header_raw = try header_enc.toOwnedSlice();
+    defer allocator.free(header_raw);
+
+    var block_enc = Encoder.init(allocator);
+    defer block_enc.deinit();
+    try block_enc.encodeArrayLen(4);
+    try block_enc.writeRaw(header_raw);
+    try block_enc.writeRaw(tx_bodies_raw);
+    try block_enc.encodeArrayLen(0);
+    try block_enc.encodeMapLen(0);
+    return block_enc.toOwnedSlice();
+}
+
+test "runner: stale base checkpoint replays immutable tail and refreshes anchor" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/kassadin-runner-stale-base-checkpoint";
+
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+
+    const snapshot_hash = [_]u8{0x71} ** 32;
+    const reward_account = types.RewardAccount{
+        .network = .testnet,
+        .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x72} ** 28 },
+    };
+    const empty_tx_bodies = [_]u8{0x80};
+    const tx_body_hash = @import("../crypto/hash.zig").Blake2b256.hash(&empty_tx_bodies);
+
+    var block1_hash: [32]u8 = undefined;
+
+    {
+        var db = try ChainDB.openWithMithrilBoundary(allocator, path, 1, 0);
+        defer db.close();
+
+        db.ledger.setRewardAccountNetwork(.testnet);
+        try db.attachSnapshotTip(.{ .slot = 100, .hash = snapshot_hash }, 50);
+        db.ledger.setTipSlot(100);
+        db.ledger_validation_enabled = true;
+        db.ledger_ready = true;
+        try db.ledger.importRewardBalance(reward_account, 7_000);
+        saveBaseLedgerCheckpoint(allocator, &db, path);
+        db.ledger_validation_enabled = false;
+        db.ledger_ready = false;
+        const boundary_chunk_path = try std.fmt.allocPrint(allocator, "{s}/immutable/00000.chunk", .{path});
+        defer allocator.free(boundary_chunk_path);
+        var boundary_chunk = try std.fs.cwd().createFile(boundary_chunk_path, .{ .truncate = false });
+        boundary_chunk.close();
+
+        const block1_data = try buildSignedShelleyRunnerTestBlock(
+            allocator,
+            &empty_tx_bodies,
+            51,
+            110,
+            snapshot_hash,
+            [_]u8{0x81} ** 32,
+            [_]u8{0x82} ** 32,
+            [_]u8{0x83} ** 32,
+            0,
+            tx_body_hash,
+        );
+        defer allocator.free(block1_data);
+        const block1 = try block_mod.parseBlock(block1_data);
+        block1_hash = block1.hash();
+
+        const block2_data = try buildSignedShelleyRunnerTestBlock(
+            allocator,
+            &empty_tx_bodies,
+            52,
+            120,
+            block1_hash,
+            [_]u8{0x84} ** 32,
+            [_]u8{0x85} ** 32,
+            [_]u8{0x86} ** 32,
+            1,
+            tx_body_hash,
+        );
+        defer allocator.free(block2_data);
+        const block2 = try block_mod.parseBlock(block2_data);
+        const block2_hash = block2.hash();
+
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(block1_hash, block1_data, block1.header.slot, block1.header.block_no, block1.header.prev_hash),
+        );
+        try std.testing.expectEqual(
+            AddBlockResult.added_to_current_chain,
+            try db.addBlock(block2_hash, block2_data, block2.header.slot, block2.header.block_no, block2.header.prev_hash),
+        );
+        try std.testing.expectEqual(@as(u32, 1), try db.promoteFinalized());
+        try std.testing.expectEqual(@as(u64, 110), db.getBaseTip().?.point.slot);
+        try std.testing.expectEqual(@as(usize, 1), db.currentChainBlockCount());
+    }
+
+    var reopened = try ChainDB.openWithMithrilBoundary(allocator, path, 1, 0);
+    defer reopened.close();
+    reopened.ledger.setRewardAccountNetwork(.testnet);
+
+    var snapshot = RuntimeSnapshot{
+        .layout = .{
+            .root_path = try allocator.dupe(u8, path),
+            .immutable_path = try std.fmt.allocPrint(allocator, "{s}/immutable", .{path}),
+            .ledger_path = null,
+        },
+        .point = .{ .slot = 100, .hash = snapshot_hash },
+        .block_no = 50,
+        .last_chunk = 0,
+    };
+    defer snapshot.deinit(allocator);
+
+    var result: RunResult = std.mem.zeroInit(RunResult, .{});
+    try std.testing.expect(try loadBaseLedgerCheckpoint(allocator, &reopened, &snapshot, path, &result));
+    try std.testing.expectEqual(@as(u64, 110), reopened.getTip().slot);
+    try std.testing.expectEqual(@as(u64, 51), reopened.getTip().block_no);
+    try std.testing.expectEqual(block1_hash, reopened.getTip().hash);
+    try std.testing.expectEqual(@as(u64, 1), result.immutable_blocks_replayed);
+    try std.testing.expectEqual(@as(?types.Coin, 7_000), reopened.ledger.lookupRewardBalance(reward_account));
+
+    const refreshed_anchor = (try loadLedgerCheckpointAnchor(allocator, path)).?;
+    try std.testing.expectEqual(@as(u64, 110), refreshed_anchor.point.slot);
+    try std.testing.expectEqual(block1_hash, refreshed_anchor.point.hash);
+    try std.testing.expectEqual(@as(u64, 51), refreshed_anchor.block_no);
 }
 
 test "runner: topology peers rotate by reconnect attempt" {

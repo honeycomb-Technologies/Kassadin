@@ -6,6 +6,7 @@ pub const KeyHash = types.KeyHash;
 pub const Coin = types.Coin;
 pub const EpochNo = types.EpochNo;
 pub const Credential = types.Credential;
+pub const Hash32 = types.Hash32;
 pub const RewardAccount = types.RewardAccount;
 pub const UnitInterval = types.UnitInterval;
 pub const PoolOwnerMembership = types.PoolOwnerMembership;
@@ -25,6 +26,7 @@ pub const PoolStake = struct {
     cost: Coin,
     margin: UnitInterval,
     reward_account: RewardAccount,
+    vrf_keyhash: ?Hash32,
     total_stake: Coin, // total active stake across all pools (for relative calc)
 
     /// Relative stake: pool_stake / total_active_stake
@@ -71,6 +73,29 @@ pub const StakeDistribution = struct {
         margin: UnitInterval,
         reward_account: RewardAccount,
     ) !void {
+        return self.setPoolStakeWithVrf(
+            pool_id,
+            active_stake,
+            self_delegated_owner_stake,
+            pledge,
+            cost,
+            margin,
+            reward_account,
+            null,
+        );
+    }
+
+    pub fn setPoolStakeWithVrf(
+        self: *StakeDistribution,
+        pool_id: KeyHash,
+        active_stake: Coin,
+        self_delegated_owner_stake: Coin,
+        pledge: Coin,
+        cost: Coin,
+        margin: UnitInterval,
+        reward_account: RewardAccount,
+        vrf_keyhash: ?Hash32,
+    ) !void {
         try self.pools.put(pool_id, .{
             .pool_id = pool_id,
             .active_stake = active_stake,
@@ -79,6 +104,7 @@ pub const StakeDistribution = struct {
             .cost = cost,
             .margin = margin,
             .reward_account = reward_account,
+            .vrf_keyhash = vrf_keyhash,
             .total_stake = 0, // updated in finalize
         });
     }
@@ -196,6 +222,16 @@ pub const StakeSnapshots = struct {
         if (self.go) |*g| return g;
         return null;
     }
+
+    /// Get the stake snapshot used for within-epoch consensus/forecast checks.
+    /// For a live epoch we prefer the `set` snapshot, falling back during early
+    /// bootstrap when only older snapshots are available.
+    pub fn getLeaderDistribution(self: *const StakeSnapshots) ?*const StakeDistribution {
+        if (self.set) |*s| return s;
+        if (self.go) |*g| return g;
+        if (self.mark) |*m| return m;
+        return null;
+    }
 };
 
 // ──────────────────────────────────── Tests ────────────────────────────────────
@@ -212,6 +248,7 @@ test "stake: pool relative stake" {
             .network = .testnet,
             .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x04} ** 28 },
         },
+        .vrf_keyhash = null,
         .total_stake = 20_000_000_000, // 20000 ADA total
     };
     const rel = pool.relativeStake();
@@ -305,4 +342,45 @@ test "stake: 2-epoch delay" {
     try std.testing.expectEqual(@as(EpochNo, 0), active.epoch);
     try std.testing.expect(active.getPool([_]u8{0xaa} ** 28) != null);
     try std.testing.expect(active.getPool([_]u8{0xbb} ** 28) == null); // was in epoch 1
+}
+
+test "stake: leader distribution prefers set snapshot" {
+    const allocator = std.testing.allocator;
+    var snaps = StakeSnapshots.init(allocator);
+    defer snaps.deinit();
+
+    snaps.onEpochBoundary(0);
+    if (snaps.mark) |*mark| {
+        try mark.setPoolStake(
+            [_]u8{0xaa} ** 28,
+            10_000_000,
+            0,
+            5_000_000,
+            340_000,
+            .{ .numerator = 0, .denominator = 1 },
+            .{ .network = .testnet, .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x0a} ** 28 } },
+        );
+        mark.finalize();
+    }
+
+    snaps.onEpochBoundary(1);
+    if (snaps.mark) |*mark| {
+        try mark.setPoolStake(
+            [_]u8{0xbb} ** 28,
+            20_000_000,
+            0,
+            10_000_000,
+            340_000,
+            .{ .numerator = 0, .denominator = 1 },
+            .{ .network = .testnet, .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0x0b} ** 28 } },
+        );
+        mark.finalize();
+    }
+
+    snaps.onEpochBoundary(2);
+
+    const leader = snaps.getLeaderDistribution().?;
+    try std.testing.expectEqual(@as(EpochNo, 1), leader.epoch);
+    try std.testing.expect(leader.getPool([_]u8{0xbb} ** 28) != null);
+    try std.testing.expect(leader.getPool([_]u8{0xaa} ** 28) == null);
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Decoder = @import("../cbor/decoder.zig").Decoder;
+const Encoder = @import("../cbor/encoder.zig").Encoder;
 const block_mod = @import("../ledger/block.zig");
 const certificates = @import("../ledger/certificates.zig");
 const ledger_apply = @import("../ledger/apply.zig");
@@ -25,6 +26,7 @@ pub const DRep = certificates.DRep;
 pub const MIRPot = certificates.MIRPot;
 
 const zero_margin = types.UnitInterval{ .numerator = 0, .denominator = 1 };
+const snapshot_diagnostics = false;
 
 pub const LocalLedgerSnapshot = struct {
     slot: SlotNo,
@@ -196,9 +198,11 @@ pub fn replayImmutableFromSlot(
     ledger: *LedgerDB,
     immutable_path: []const u8,
     from_slot: SlotNo,
+    raw_cbor_boundary: ?u32,
     pp: rules.ProtocolParams,
     epoch_length: ?u64,
     reward_params: rewards_mod.RewardParams,
+    era_start_epoch: u64,
     era_start_slot: u64,
 ) !ReplayResult {
     var result = ReplayResult{
@@ -211,7 +215,13 @@ pub fn replayImmutableFromSlot(
     const total_chunks = try countChunks(immutable_path);
     if (total_chunks == 0) return result;
 
-    result.start_chunk = try findReplayStartChunk(allocator, immutable_path, total_chunks, from_slot);
+    result.start_chunk = try findReplayStartChunk(
+        allocator,
+        immutable_path,
+        total_chunks,
+        from_slot,
+        raw_cbor_boundary,
+    );
 
     var last_slot = from_slot;
     var chunk_num = result.start_chunk;
@@ -221,14 +231,12 @@ pub fn replayImmutableFromSlot(
         const chunk_data = try readChunkData(allocator, immutable_path, chunk_num);
         defer allocator.free(chunk_data);
 
+        const raw_cbor_chunk = raw_cbor_boundary != null and chunk_num <= raw_cbor_boundary.?;
         var pos: usize = 0;
         while (pos < chunk_data.len) {
             if (runtime_control.stopRequested()) return error.Interrupted;
 
-            var dec = Decoder.init(chunk_data[pos..]);
-            const block_slice = dec.sliceOfNextValue() catch break;
-            const raw = chunk_data[pos .. pos + block_slice.len];
-            pos += block_slice.len;
+            const raw = nextChunkBlock(chunk_data, &pos, raw_cbor_chunk) orelse break;
 
             const block = block_mod.parseBlock(raw) catch continue;
             if (block.era == .byron) continue;
@@ -236,16 +244,12 @@ pub fn replayImmutableFromSlot(
 
             var ledger_diffs_applied: u32 = 0;
             if (epoch_length) |slots_per_epoch| {
-                // Use era-aware epoch calculation to match chaindb.zig
-                const eraSlotToEpoch = struct {
-                    fn f(slot: SlotNo, start: u64, len: u64) u64 {
-                        if (slot < start) return 0;
-                        return (slot - start) / len;
-                    }
-                }.f;
-                const current_epoch = eraSlotToEpoch(last_slot, era_start_slot, slots_per_epoch);
-                const target_epoch = eraSlotToEpoch(block.header.slot, era_start_slot, slots_per_epoch);
+                const current_epoch = replaySlotToEpoch(last_slot, era_start_epoch, era_start_slot, slots_per_epoch);
+                const target_epoch = replaySlotToEpoch(block.header.slot, era_start_epoch, era_start_slot, slots_per_epoch);
                 if (target_epoch > current_epoch) {
+                    std.debug.print("  REPLAY EPOCH BOUNDARY: epoch {}->{} (last_slot={} block_slot={} era_start={})\n", .{
+                        current_epoch, target_epoch, last_slot, block.header.slot, era_start_slot,
+                    });
                     if (block.era == .conway) {
                         ledger.setPointerInstantStakeEnabled(false);
                     }
@@ -311,6 +315,11 @@ pub fn replayImmutableFromSlot(
     }
 
     return result;
+}
+
+fn replaySlotToEpoch(slot: SlotNo, era_start_epoch: u64, era_start_slot: u64, epoch_length: u64) u64 {
+    if (slot < era_start_slot) return 0;
+    return era_start_epoch + (slot - era_start_slot) / epoch_length;
 }
 
 fn applyReplayEpochBoundaryEffects(
@@ -518,7 +527,18 @@ fn parseNewEpochState(
     try parseBlocksMade(ledger, dec, .previous);
     try parseBlocksMade(ledger, dec, .current);
     try parseEpochState(allocator, ledger, network, active_era, dec);
-    try dec.skipValue(); // nesRu
+    // nesRu: StrictMaybe (PulsingRewUpdate) — pending reward computation.
+    // We skip it and recompute at the next epoch boundary.
+    // Log whether it's SNothing (null) or SJust (has pending rewards).
+    if (snapshot_diagnostics and !builtin.is_test) {
+        const nesRu_major = try dec.peekMajorType();
+        const nesRu_slice = try dec.sliceOfNextValue();
+        if (nesRu_major == 7) {
+            std.debug.print("  nesRu: SNothing (no pending reward update)\n", .{});
+        } else {
+            std.debug.print("  nesRu: SJust ({} bytes) — pending reward update exists, will recompute\n", .{nesRu_slice.len});
+        }
+    }
     try dec.skipValue(); // nesPd
     try dec.skipValue(); // stashedAVVMAddresses
 }
@@ -661,6 +681,34 @@ fn parseSnapShots(
     parse_import_result.stake_snapshot_mark_pools_loaded = if (ledger.getStakeSnapshots().mark) |dist| dist.poolCount() else 0;
     parse_import_result.stake_snapshot_set_pools_loaded = if (ledger.getStakeSnapshots().set) |dist| dist.poolCount() else 0;
     parse_import_result.stake_snapshot_go_pools_loaded = if (ledger.getStakeSnapshots().go) |dist| dist.poolCount() else 0;
+
+    if (snapshot_diagnostics and !builtin.is_test) {
+        // Trace failing credentials across mark/set/go snapshot delegator sets
+        const trace_creds = [_][2]u8{ .{ 0x8b, 0x69 }, .{ 0x35, 0x23 } };
+        const snap_names = [_][]const u8{ "mark", "set", "go" };
+        const snap_dists = [_]?stake_mod.StakeDistribution{ ledger.getStakeSnapshots().mark, ledger.getStakeSnapshots().set, ledger.getStakeSnapshots().go };
+        for (trace_creds) |tc| {
+            for (snap_names, snap_dists) |name, maybe_dist| {
+                if (maybe_dist) |dist| {
+                    var found = false;
+                    var it = dist.delegators.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.key_ptr.hash[0] == tc[0] and entry.key_ptr.hash[1] == tc[1]) {
+                            const d = entry.value_ptr.*;
+                            std.debug.print("  SNAPSHOT DELEGATOR: cred={x:0>2}{x:0>2}... in {s} snapshot: pool={x:0>2}{x:0>2}{x:0>2}{x:0>2}... active_stake={}\n", .{
+                                tc[0], tc[1], name, d.pool_id[0], d.pool_id[1], d.pool_id[2], d.pool_id[3], d.active_stake,
+                            });
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        std.debug.print("  SNAPSHOT DELEGATOR: cred={x:0>2}{x:0>2}... NOT in {s} snapshot ({} delegators)\n", .{ tc[0], tc[1], name, dist.delegatorCount() });
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn parseStakeSnapshot(
@@ -733,6 +781,7 @@ fn importStakePoolSnapshotEntry(
     var pledge: Coin = 0;
     var cost: Coin = 0;
     var margin = zero_margin;
+    var vrf_keyhash: ?types.Hash32 = null;
     var reward_account = RewardAccount{
         .network = .testnet,
         .credential = .{ .cred_type = .key_hash, .hash = [_]u8{0} ** 28 },
@@ -744,7 +793,11 @@ fn importStakePoolSnapshotEntry(
         // Legacy StakePoolParams-shaped snapshot entries:
         // [poolId, vrf, pledge, cost, margin, rewardAcct, owners, relays, metadata]
         try dec.skipValue(); // poolId (redundant with map key)
-        try dec.skipValue(); // vrf
+        const vrf_bytes = try dec.decodeBytes();
+        if (vrf_bytes.len != 32) return error.InvalidSnapshotState;
+        var vrf_raw: types.Hash32 = undefined;
+        @memcpy(&vrf_raw, vrf_bytes);
+        vrf_keyhash = vrf_raw;
         pledge = try dec.decodeUint();
         cost = try dec.decodeUint();
         margin = try parseUnitInterval(dec);
@@ -753,7 +806,9 @@ fn importStakePoolSnapshotEntry(
         var reward_raw: [29]u8 = undefined;
         @memcpy(&reward_raw, reward_bytes);
         reward_account = try RewardAccount.fromBytes(reward_raw);
-        try dec.skipValue(); // owners
+        distribution.allocator.free(self_delegated_owners);
+        self_delegated_owners = try parseKeyHashSet(distribution.allocator, dec);
+        self_delegated_owner_stake = sumDelegatedOwnerStake(distribution, pool, self_delegated_owners);
         try dec.skipValue(); // relays
         try dec.skipValue(); // metadata
         active_stake = active_stake_by_pool.get(pool) orelse 0;
@@ -765,7 +820,11 @@ fn importStakePoolSnapshotEntry(
         distribution.allocator.free(self_delegated_owners);
         self_delegated_owners = try parseKeyHashSet(distribution.allocator, dec);
         self_delegated_owner_stake = try dec.decodeUint(); // spssSelfDelegatedOwnersStake
-        try dec.skipValue(); // spssVrf
+        const vrf_bytes = try dec.decodeBytes(); // spssVrf
+        if (vrf_bytes.len != 32) return error.InvalidSnapshotState;
+        var vrf_raw: types.Hash32 = undefined;
+        @memcpy(&vrf_raw, vrf_bytes);
+        vrf_keyhash = vrf_raw;
         pledge = try dec.decodeUint(); // spssPledge
         cost = try dec.decodeUint(); // spssCost
         margin = try parseUnitInterval(dec); // spssMargin
@@ -780,7 +839,7 @@ fn importStakePoolSnapshotEntry(
         return error.InvalidSnapshotState;
     }
 
-    try distribution.setPoolStake(
+    try distribution.setPoolStakeWithVrf(
         pool,
         active_stake,
         self_delegated_owner_stake,
@@ -788,10 +847,30 @@ fn importStakePoolSnapshotEntry(
         cost,
         margin,
         reward_account,
+        vrf_keyhash,
     );
     for (self_delegated_owners) |owner| {
         try distribution.setPoolOwnerMembership(pool, owner);
     }
+}
+
+fn sumDelegatedOwnerStake(
+    distribution: *const stake_mod.StakeDistribution,
+    pool: types.KeyHash,
+    owners: []const types.KeyHash,
+) Coin {
+    var total: Coin = 0;
+
+    for (owners) |owner| {
+        const delegated = distribution.getDelegatedStake(.{
+            .cred_type = .key_hash,
+            .hash = owner,
+        }) orelse continue;
+        if (!std.mem.eql(u8, &delegated.pool_id, &pool)) continue;
+        total += delegated.active_stake;
+    }
+
+    return total;
 }
 
 fn parseKeyHashSet(
@@ -998,7 +1077,7 @@ fn parseCertState(
             std.debug.print("Snapshot state: unexpected Conway CertState len {}\n", .{cert_state_len});
             return error.InvalidSnapshotState;
         }
-        try dec.skipValue(); // vstate
+        try parseVState(ledger, dec);
         try parsePState(allocator, ledger, dec);
         try parseDState(allocator, ledger, network, active_era, dec);
     } else {
@@ -1009,6 +1088,51 @@ fn parseCertState(
         try parsePState(allocator, ledger, dec);
         try parseDState(allocator, ledger, network, active_era, dec);
     }
+}
+
+fn parseVState(ledger: *LedgerDB, dec: *Decoder) !void {
+    const vstate_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (vstate_len != 3) {
+        std.debug.print("Snapshot state: unexpected Conway VState len {}\n", .{vstate_len});
+        return error.InvalidSnapshotState;
+    }
+
+    try parseDRepStateMap(ledger, dec);
+    try dec.skipValue(); // committee state
+    try dec.skipValue(); // num dormant epochs
+}
+
+fn parseDRepStateMap(ledger: *LedgerDB, dec: *Decoder) !void {
+    const map_len = try dec.decodeMapLen();
+    if (map_len) |count| {
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            const credential = try parseCredential(dec);
+            const deposit = try parseDRepStateDeposit(dec);
+            try ledger.importDRepDeposit(credential, deposit);
+        }
+    } else {
+        while (!dec.isBreak()) {
+            const credential = try parseCredential(dec);
+            const deposit = try parseDRepStateDeposit(dec);
+            try ledger.importDRepDeposit(credential, deposit);
+        }
+        try dec.decodeBreak();
+    }
+}
+
+fn parseDRepStateDeposit(dec: *Decoder) !Coin {
+    const drep_state_len = (try dec.decodeArrayLen()) orelse return error.InvalidSnapshotState;
+    if (drep_state_len != 4) {
+        std.debug.print("Snapshot state: unexpected DRepState len {}\n", .{drep_state_len});
+        return error.InvalidSnapshotState;
+    }
+
+    _ = try dec.decodeUint(); // expiry
+    try dec.skipValue(); // anchor
+    const deposit = try dec.decodeUint();
+    try dec.skipValue(); // reverse delegations
+    return deposit;
 }
 
 fn parsePState(
@@ -1495,12 +1619,22 @@ fn importAccountEntry(
         .pointer = account.pointer,
     });
 
-    // Trace specific credentials for debugging
-    if (credential.hash[0] == 0x8b and credential.hash[1] == 0x69) {
-        std.debug.print("  SNAPSHOT IMPORT: cred=8b69... balance={} deposit={} registered=true\n", .{ account.balance, account.deposit });
-    }
-    if (credential.hash[0] == 0x35 and credential.hash[1] == 0x23) {
-        std.debug.print("  SNAPSHOT IMPORT: cred=3523... balance={} deposit={} registered=true\n", .{ account.balance, account.deposit });
+    if (snapshot_diagnostics and !builtin.is_test) {
+        // Trace specific credentials for debugging reward balance divergence
+        if (credential.hash[0] == 0x8b and credential.hash[1] == 0x69) {
+            if (account.stake_pool) |pool| {
+                std.debug.print("  SNAPSHOT IMPORT: cred=8b69... balance={} deposit={} pool={x:0>2}{x:0>2}{x:0>2}{x:0>2}... registered=true\n", .{ account.balance, account.deposit, pool[0], pool[1], pool[2], pool[3] });
+            } else {
+                std.debug.print("  SNAPSHOT IMPORT: cred=8b69... balance={} deposit={} pool=null registered=true\n", .{ account.balance, account.deposit });
+            }
+        }
+        if (credential.hash[0] == 0x35 and credential.hash[1] == 0x23) {
+            if (account.stake_pool) |pool| {
+                std.debug.print("  SNAPSHOT IMPORT: cred=3523... balance={} deposit={} pool={x:0>2}{x:0>2}{x:0>2}{x:0>2}... registered=true\n", .{ account.balance, account.deposit, pool[0], pool[1], pool[2], pool[3] });
+            } else {
+                std.debug.print("  SNAPSHOT IMPORT: cred=3523... balance={} deposit={} pool=null registered=true\n", .{ account.balance, account.deposit });
+            }
+        }
     }
 
     if (account.balance > 0) {
@@ -1677,12 +1811,13 @@ fn findReplayStartChunk(
     immutable_path: []const u8,
     total_chunks: u32,
     from_slot: SlotNo,
+    raw_cbor_boundary: ?u32,
 ) !u32 {
     var chunk_num = total_chunks;
     while (chunk_num > 0) {
         chunk_num -= 1;
 
-        const range = try readChunkSlotRange(allocator, immutable_path, chunk_num);
+        const range = try readChunkSlotRange(allocator, immutable_path, chunk_num, raw_cbor_boundary);
         if (range == null) continue;
 
         if (range.?.first_slot <= from_slot and from_slot <= range.?.last_slot) {
@@ -1700,19 +1835,18 @@ fn readChunkSlotRange(
     allocator: Allocator,
     immutable_path: []const u8,
     chunk_num: u32,
+    raw_cbor_boundary: ?u32,
 ) !?struct { first_slot: SlotNo, last_slot: SlotNo } {
     const data = try readChunkData(allocator, immutable_path, chunk_num);
     defer allocator.free(data);
 
+    const raw_cbor_chunk = raw_cbor_boundary != null and chunk_num <= raw_cbor_boundary.?;
     var pos: usize = 0;
     var first_slot: ?SlotNo = null;
     var last_slot: ?SlotNo = null;
 
     while (pos < data.len) {
-        var dec = Decoder.init(data[pos..]);
-        const block_slice = dec.sliceOfNextValue() catch break;
-        const raw = data[pos .. pos + block_slice.len];
-        pos += block_slice.len;
+        const raw = nextChunkBlock(data, &pos, raw_cbor_chunk) orelse break;
 
         const block = block_mod.parseBlock(raw) catch continue;
         if (block.era == .byron) continue;
@@ -1722,6 +1856,27 @@ fn readChunkSlotRange(
 
     if (first_slot == null or last_slot == null) return null;
     return .{ .first_slot = first_slot.?, .last_slot = last_slot.? };
+}
+
+fn nextChunkBlock(data: []const u8, pos: *usize, raw_cbor_chunk: bool) ?[]const u8 {
+    if (pos.* >= data.len) return null;
+
+    if (raw_cbor_chunk) {
+        var dec = Decoder.init(data[pos.*..]);
+        const block_slice = dec.sliceOfNextValue() catch return null;
+        const raw = data[pos.* .. pos.* + block_slice.len];
+        pos.* += block_slice.len;
+        return raw;
+    }
+
+    if (data.len - pos.* < 4) return null;
+    const block_len = std.mem.readInt(u32, data[pos.*..][0..4], .big);
+    pos.* += 4;
+    if (block_len == 0 or block_len > data.len - pos.*) return null;
+
+    const raw = data[pos.* .. pos.* + block_len];
+    pos.* += block_len;
+    return raw;
 }
 
 fn readChunkData(allocator: Allocator, immutable_path: []const u8, chunk_num: u32) ![]u8 {
@@ -1910,6 +2065,47 @@ test "ledger_snapshot: parse packed txin and txout coin from real ancillary samp
     try std.testing.expectEqual(@as(Coin, 1_710_000), coin);
 }
 
+test "ledger_snapshot: replay slot to epoch uses absolute era offset" {
+    try std.testing.expectEqual(@as(u64, 0), replaySlotToEpoch(86_399, 4, 86_400, 432_000));
+    try std.testing.expectEqual(@as(u64, 4), replaySlotToEpoch(86_400, 4, 86_400, 432_000));
+    try std.testing.expectEqual(@as(u64, 278), replaySlotToEpoch(118_754_184, 4, 86_400, 432_000));
+    try std.testing.expectEqual(@as(u64, 279), replaySlotToEpoch(118_886_400, 4, 86_400, 432_000));
+}
+
+test "ledger_snapshot: parse Conway vstate imports DRep deposits" {
+    const allocator = std.testing.allocator;
+
+    std.fs.cwd().deleteTree("/tmp/kassadin-test-ledger-vstate") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/kassadin-test-ledger-vstate") catch {};
+
+    var ledger = try LedgerDB.init(allocator, "/tmp/kassadin-test-ledger-vstate");
+    defer ledger.deinit();
+
+    var enc = Encoder.init(allocator);
+    defer enc.deinit();
+
+    const drep_cred = Credential{
+        .cred_type = .key_hash,
+        .hash = [_]u8{0x44} ** 28,
+    };
+
+    try enc.encodeArrayLen(3);
+    try enc.encodeMapLen(1);
+    try encodeCredentialForTest(&enc, drep_cred);
+    try enc.encodeArrayLen(4);
+    try enc.encodeUint(274);
+    try enc.encodeNull();
+    try enc.encodeUint(500_000_000);
+    try enc.encodeArrayLen(0);
+    try enc.encodeArrayLen(0);
+    try enc.encodeUint(0);
+
+    var dec = Decoder.init(enc.getWritten());
+    try parseVState(&ledger, &dec);
+    try std.testing.expect(dec.isComplete());
+    try std.testing.expectEqual(@as(?Coin, 500_000_000), ledger.lookupDRepDeposit(drep_cred));
+}
+
 test "ledger_snapshot: import local preprod snapshot account state" {
     const allocator = std.testing.allocator;
 
@@ -1952,6 +2148,27 @@ test "ledger_snapshot: import local preprod snapshot account state" {
     );
 }
 
+test "ledger_snapshot: legacy pool snapshot recovers self delegated owner stake" {
+    const allocator = std.testing.allocator;
+    var distribution = stake_mod.StakeDistribution.init(allocator, 0);
+    defer distribution.deinit();
+
+    const pool = [_]u8{0x81} ** 28;
+    const owner = [_]u8{0x82} ** 28;
+    const other_owner = [_]u8{0x83} ** 28;
+    const outsider = Credential{ .cred_type = .key_hash, .hash = [_]u8{0x84} ** 28 };
+
+    try distribution.setDelegatedStake(.{ .cred_type = .key_hash, .hash = owner }, pool, 11);
+    try distribution.setDelegatedStake(.{ .cred_type = .key_hash, .hash = other_owner }, [_]u8{0x85} ** 28, 22);
+    try distribution.setDelegatedStake(outsider, pool, 33);
+
+    try std.testing.expectEqual(@as(Coin, 11), sumDelegatedOwnerStake(
+        &distribution,
+        pool,
+        &[_]types.KeyHash{ owner, other_owner },
+    ));
+}
+
 test "ledger_snapshot: parse packed txin uses little-endian tx index in ancillary tables" {
     const key = [_]u8{
         0x22, 0x91, 0x0c, 0x04, 0x02, 0x8d, 0x88, 0xf9,
@@ -1985,4 +2202,13 @@ test "ledger_snapshot: parse packed tag-2 txout coin from real ancillary sample"
     try std.testing.expectEqual(@as(Coin, 2_261_399), output.coin);
     const credential = output.stake_credential.?;
     try std.testing.expectEqual(types.CredentialType.key_hash, credential.cred_type);
+}
+
+fn encodeCredentialForTest(enc: *Encoder, credential: Credential) !void {
+    try enc.encodeArrayLen(2);
+    try enc.encodeUint(switch (credential.cred_type) {
+        .key_hash => 0,
+        .script_hash => 1,
+    });
+    try enc.encodeBytes(&credential.hash);
 }

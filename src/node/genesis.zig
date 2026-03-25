@@ -134,6 +134,11 @@ pub fn toLedgerProtocolParams(pp: ProtocolParams) ledger_rules.ProtocolParams {
         .key_deposit = pp.key_deposit,
         .pool_deposit = pp.pool_deposit,
         .max_block_body_size = pp.max_block_body_size,
+        .optimal_pool_count = pp.n_opt,
+        .pool_pledge_influence = toUnitInterval(pp.a0),
+        .monetary_expand_rate = toUnitInterval(pp.rho),
+        .treasury_growth_rate = toUnitInterval(pp.tau),
+        .min_pool_cost = pp.min_pool_cost,
     };
 }
 
@@ -173,6 +178,16 @@ pub fn loadLedgerProtocolParams(allocator: Allocator, path: []const u8) !ledger_
     var genesis = try parseShelleyGenesis(allocator, path);
     defer genesis.deinit(allocator);
     return toLedgerProtocolParams(genesis.protocol_params);
+}
+
+pub fn loadLedgerProtocolParamsWithOverride(allocator: Allocator, shelley_genesis_path: []const u8) !ledger_rules.ProtocolParams {
+    const base = try loadLedgerProtocolParams(allocator, shelley_genesis_path);
+    const dir = std.fs.path.dirname(shelley_genesis_path) orelse ".";
+    const override_path = try std.fmt.allocPrint(allocator, "{s}/protocol-params.json", .{dir});
+    defer allocator.free(override_path);
+
+    std.fs.cwd().access(override_path, .{}) catch return base;
+    return loadLedgerProtocolParams(allocator, override_path) catch base;
 }
 
 pub fn loadShelleyConsensusParams(allocator: Allocator, path: []const u8) !ConsensusParams {
@@ -497,6 +512,73 @@ test "genesis: load Shelley governance config" {
     try std.testing.expectEqual(@as(usize, 28), config.initial_genesis_delegations[0].genesis.len);
     try std.testing.expectEqual(@as(usize, 28), config.initial_genesis_delegations[0].delegate.len);
     try std.testing.expectEqual(@as(usize, 32), config.initial_genesis_delegations[0].vrf.len);
+}
+
+test "genesis: load protocol params with sibling override" {
+    const allocator = std.testing.allocator;
+    const base = "/tmp/kassadin-test-protocol-override";
+
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    try std.fs.cwd().makePath(base);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = "/tmp/kassadin-test-protocol-override/shelley.json",
+        .data =
+        \\{
+        \\  "activeSlotsCoeff": 0.05,
+        \\  "epochLength": 432000,
+        \\  "securityParam": 2160,
+        \\  "networkMagic": 1,
+        \\  "networkId": "Testnet",
+        \\  "systemStart": "2022-06-01T00:00:00Z",
+        \\  "maxLovelaceSupply": 45000000000000000,
+        \\  "protocolParams": {
+        \\    "minFeeA": 44,
+        \\    "minFeeB": 155381,
+        \\    "maxBlockBodySize": 65536,
+        \\    "maxTxSize": 16384,
+        \\    "keyDeposit": 2000000,
+        \\    "poolDeposit": 500000000,
+        \\    "eMax": 18,
+        \\    "nOpt": 150,
+        \\    "a0": 0.3,
+        \\    "rho": 0.003,
+        \\    "tau": 0.2,
+        \\    "minPoolCost": 340000000,
+        \\    "minUTxOValue": 1000000
+        \\  }
+        \\}
+        ,
+    });
+    try std.fs.cwd().writeFile(.{
+        .sub_path = "/tmp/kassadin-test-protocol-override/protocol-params.json",
+        .data =
+        \\{
+        \\  "protocolParams": {
+        \\    "minFeeA": 44,
+        \\    "minFeeB": 155381,
+        \\    "maxBlockBodySize": 90112,
+        \\    "maxTxSize": 16384,
+        \\    "keyDeposit": 2000000,
+        \\    "poolDeposit": 500000000,
+        \\    "minUTxOValue": 0,
+        \\    "minPoolCost": 170000000,
+        \\    "nOpt": 500,
+        \\    "a0": 0.3,
+        \\    "rho": 0.003,
+        \\    "tau": 0.2
+        \\  }
+        \\}
+        ,
+    });
+
+    const params = try loadLedgerProtocolParamsWithOverride(
+        allocator,
+        "/tmp/kassadin-test-protocol-override/shelley.json",
+    );
+    try std.testing.expectEqual(@as(u16, 500), params.optimal_pool_count);
+    try std.testing.expectEqual(@as(u64, 170_000_000), params.min_pool_cost);
+    try std.testing.expectEqual(@as(u64, 0), params.min_utxo_value);
 }
 
 test "genesis: default values when file missing" {

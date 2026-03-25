@@ -21,6 +21,18 @@ pub const TxIn = types.TxIn;
 pub const Coin = types.Coin;
 pub const HeaderHash = types.HeaderHash;
 
+fn debugPrintCertificateTags(tx: *const tx_mod.TxBody) void {
+    if (tx.certificates.len == 0) {
+        std.debug.print("none", .{});
+        return;
+    }
+
+    for (tx.certificates, 0..) |cert, idx| {
+        if (idx > 0) std.debug.print(", ", .{});
+        std.debug.print("{s}", .{@tagName(cert)});
+    }
+}
+
 fn freeOwnedEntries(allocator: Allocator, entries: []const UtxoEntry) void {
     for (entries) |entry| {
         allocator.free(entry.raw_cbor);
@@ -277,18 +289,17 @@ fn applyShelleyLikeBlock(
                 else => false,
             },
         ) catch |err| {
-            // InvalidWithdrawal/InvalidCertificate: track divergence count but
-            // skip the tx to gather data on how many fail (systemic vs edge case).
-            // Root cause investigation ongoing — reward/stake state divergence.
-            if (err == error.InvalidWithdrawal or err == error.InvalidCertificate) {
-                if (!builtin.is_test) {
-                    std.debug.print("    Tx {}: WARN skipped ({}) — ledger state divergence\n", .{ tx_idx, err });
-                }
-                result.txs_skipped += 1;
-                continue;
-            }
             if (!builtin.is_test) {
-                std.debug.print("    Tx {}: validation failed: {}\n", .{ tx_idx, err });
+                if (err == error.InvalidWithdrawal or err == error.InvalidCertificate) {
+                    std.debug.print(
+                        "    Tx {} in block {} slot {}: validation failed: {} (possible ledger state divergence); certs=",
+                        .{ tx_idx, block.header.block_no, block.header.slot, err },
+                    );
+                    debugPrintCertificateTags(&tx);
+                    std.debug.print("\n", .{});
+                } else {
+                    std.debug.print("    Tx {}: validation failed: {}\n", .{ tx_idx, err });
+                }
             }
             result.txs_failed += 1;
             continue;
