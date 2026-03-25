@@ -32,9 +32,11 @@ pub fn build(b: *std.Build) void {
 
     // --- Run command ---
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run kassadin node").dependOn(&run_cmd.step);
+
+    // --- Release alias ---
+    b.step("release", "Install kassadin release artifact").dependOn(b.getInstallStep());
 
     // --- Tests ---
     const lib_tests = b.addTest(.{
@@ -87,9 +89,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         addVrfSources(b, t.root_module);
-        b.installArtifact(t);
         const run = b.addRunArtifact(t);
-        run.step.dependOn(b.getInstallStep());
         b.step(entry[0], entry[2]).dependOn(&run.step);
     }
 }
