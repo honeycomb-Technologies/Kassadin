@@ -1,0 +1,6 @@
+{
+  "name": "Void",
+  "description": "Kassadin-backed Cardano preprod stake pool",
+  "ticker": "VOID",
+  "homepage": "https://github.com/honeycomb-Technologies/Kassadin"
+}
